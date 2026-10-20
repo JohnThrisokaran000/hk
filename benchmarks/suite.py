@@ -95,9 +95,11 @@ def hk_file(entry, kind):
         if not out.exists():
             subprocess.run([HK_BIN / "hk", "convert-gguf", entry["path"], out], check=True, capture_output=True)
         return out
-    out = Path(entry["path"]) / "model.f16.hk"
+    # A Hugging Face directory has no direct hk importer yet: llama.cpp's converter writes an f16 GGUF of the same
+    # weights, which hk and llama.cpp both load, and Transformers runs the original safetensors in the same dtype.
+    out = llama_gguf(entry).with_suffix(".hk")
     if not out.exists():
-        subprocess.run([HK_BIN / "hk", "convert-hf", entry["path"], out], check=True, capture_output=True)
+        subprocess.run([HK_BIN / "hk", "convert-gguf", llama_gguf(entry), out], check=True, capture_output=True)
     return out
 
 
