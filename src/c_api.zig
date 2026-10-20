@@ -807,10 +807,39 @@ pub export fn hk_appendix_append(
     data_ptr: ?[*]const u8,
     data_size: u64,
 ) c_int {
+    const io = std.Options.debug_io;
+    const cur_time_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const cur_time_sec: u64 = @intCast(@max(0, @divTrunc(cur_time_ns, 1_000_000_000)));
+    return hk_appendix_append_at(
+        file_path_c, entry_type, flags, name_c, target_c, generation, parent_hash_ptr,
+        metric_loss, metric_acc, metric_pass, metric_custom, data_ptr, data_size, cur_time_sec,
+    );
+}
+
+/// Same as `hk_appendix_append`, with a caller-chosen timestamp (seconds). Returns -1 for an unknown
+/// `entry_type` instead of casting the byte to an enum, and for any failure of the sealed, journaled append.
+pub export fn hk_appendix_append_at(
+    file_path_c: [*:0]const u8,
+    entry_type: u8,
+    flags: u8,
+    name_c: [*:0]const u8,
+    target_c: [*:0]const u8,
+    generation: u32,
+    parent_hash_ptr: ?[*]const u8,
+    metric_loss: f32,
+    metric_acc: f32,
+    metric_pass: f32,
+    metric_custom: f32,
+    data_ptr: ?[*]const u8,
+    data_size: u64,
+    timestamp: u64,
+) c_int {
     const file_path = std.mem.sliceTo(file_path_c, 0);
     const name = std.mem.sliceTo(name_c, 0);
     const target = std.mem.sliceTo(target_c, 0);
     const allocator = std.heap.page_allocator;
+
+    const kind = std.enums.fromInt(format.AppendixEntryType, entry_type) orelse return -1;
 
     var ph: [32]u8 = @as([32]u8, @splat(0));
     if (parent_hash_ptr != null) {
@@ -822,17 +851,13 @@ pub export fn hk_appendix_append(
     else
         &[_]u8{};
 
-    const io = std.Options.debug_io;
-    const cur_time_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
-    const cur_time_sec: u64 = @intCast(@max(0, @divTrunc(cur_time_ns, 1_000_000_000)));
-
     const record = format.AppendixRecord{
-        .entry_type = @enumFromInt(entry_type),
+        .entry_type = kind,
         .flags = flags,
         .name = name,
         .target = target,
         .generation = generation,
-        .timestamp = cur_time_sec,
+        .timestamp = timestamp,
         .parent_hash = ph,
         .metrics = .{
             .loss = metric_loss,
@@ -845,6 +870,18 @@ pub export fn hk_appendix_append(
 
     appendix_mod.appendRecordToFile(allocator, file_path, record) catch return -1;
     return 0;
+}
+
+/// Verifies the container's SHA-256 seal by streaming the file (bounded memory).
+/// Returns 0 = sealed and valid, 1 = legacy file with no seal, -1 = seal mismatch or the file cannot be read.
+pub export fn hk_verify_integrity(file_path_c: [*:0]const u8) c_int {
+    const file_path = std.mem.sliceTo(file_path_c, 0);
+    const status = @import("integrity.zig").verifyFile(file_path, std.heap.page_allocator) catch return -1;
+    return switch (status) {
+        .valid => 0,
+        .legacy_missing => 1,
+        .invalid => -1,
+    };
 }
 
 pub export fn hk_appendix_rollback(file_path_c: [*:0]const u8, target_generation: u32) c_int {

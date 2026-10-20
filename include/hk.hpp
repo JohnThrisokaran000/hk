@@ -279,6 +279,18 @@ public:
         return hk_metadata_patch_in_place(path.c_str(), key.c_str(), val.c_str()) == 0;
     }
 
+    /// Result of checking a container's SHA-256 seal.
+    enum class Integrity { Valid, LegacyUnsealed, Invalid };
+
+    /// Streams the file (bounded memory). Anything unreadable or mismatching is reported as Invalid.
+    static Integrity verify_integrity(const std::string& path) {
+        switch (hk_verify_integrity(path.c_str())) {
+            case 0: return Integrity::Valid;
+            case 1: return Integrity::LegacyUnsealed;
+            default: return Integrity::Invalid;
+        }
+    }
+
 private:
     explicit Model(hk_reader_t* reader) : m_reader(reader) {}
     hk_reader_t* m_reader;

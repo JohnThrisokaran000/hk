@@ -77,6 +77,9 @@ Notes:
 
 ```bash
 hk verify model.hk
+hk repair model.hk
 ```
 
-Checks the magic and version, that the payload offset and each tensor offset are 128-byte aligned, and that no tensor extends past the end of the file. It does not verify content checksums (the header `checksum` field is reserved and unused).
+Checks the magic and version, that the payload offset and each tensor offset are 128-byte aligned, that no tensor extends past the end of the file, and the optional SHA-256 container seal. Older v1 files without a seal remain readable and are reported as legacy.
+
+`repair` restores the bounded metadata journal left by an interrupted metadata update, then reports container integrity. It cannot reconstruct arbitrary corrupted tensor data or a corrupted file with no recovery journal.

@@ -644,6 +644,144 @@ test "Appendix cryptographic SHA-256 tamper detection" {
     try std.testing.expect(!app_reader.verifyLineage());
 }
 
+test "Appendix CRC-32 rejects a corrupted payload" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_appendix_crc.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    defer cwd.deleteFile(io, test_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{1.0};
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    try hk.appendix.appendRecordToFile(allocator, test_path, .{
+        .entry_type = .delta_patch,
+        .name = "patch.1",
+        .generation = 1,
+        .timestamp = 1,
+        .data = "checksum-protected payload",
+    });
+
+    var region = try hk.platform.mapOrReadFile(test_path, allocator);
+    const appendix_offset: usize = @intCast((@as(*const hk.FileHeader, @ptrCast(@alignCast(region.bytes.ptr)))).appendix_offset);
+    const payload_offset = appendix_offset + @sizeOf(hk.format.AppendixRecordHeader) + "patch.1".len;
+    region.deinit(allocator);
+
+    const corrupted = [_]u8{'X'};
+    try hk.platform.writeBytesAtOffset(test_path, &corrupted, payload_offset, allocator);
+
+    var corrupted_region = try hk.platform.mapOrReadFile(test_path, allocator);
+    defer corrupted_region.deinit(allocator);
+    try std.testing.expectError(
+        hk.appendix.AppendixError.ChecksumMismatch,
+        hk.appendix.AppendixReader.init(allocator, corrupted_region.bytes),
+    );
+}
+
+test "container SHA-256 seal detects tensor corruption" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_container_integrity.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    defer cwd.deleteFile(io, test_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{ 1.0, 2.0 };
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    var reader = try hk.HKReader.open(test_path, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try reader.verifyIntegrity());
+    const tensor_offset = reader.toc.entries.items[0].data_offset;
+    reader.deinit();
+
+    const corrupted = [_]u8{0xFF};
+    try hk.platform.writeBytesAtOffset(test_path, &corrupted, tensor_offset, allocator);
+
+    var corrupted_reader = try hk.HKReader.open(test_path, allocator);
+    defer corrupted_reader.deinit();
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try corrupted_reader.verifyIntegrity());
+}
+
+test "reader rejects an overflowing metadata range" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_overflowing_header.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    defer cwd.deleteFile(io, test_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{1.0};
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    var region = try hk.platform.mapOrReadFile(test_path, allocator);
+    const header_ptr: *const hk.FileHeader = @ptrCast(@alignCast(region.bytes.ptr));
+    var malformed = header_ptr.*;
+    malformed.metadata_size = std.math.maxInt(u64);
+    region.deinit(allocator);
+    try hk.platform.writeBytesAtOffset(test_path, std.mem.asBytes(&malformed), 0, allocator);
+
+    try std.testing.expectError(error.MetadataOutOfBounds, hk.HKReader.open(test_path, allocator));
+}
+
+test "metadata journal restores an interrupted mutation" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_metadata_journal.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    const journal_path = "test_metadata_journal.hk.hkmeta-journal";
+    defer cwd.deleteFile(io, test_path) catch {};
+    defer cwd.deleteFile(io, journal_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{1.0};
+    try writer.addMetadataString("name", "before");
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    try hk.transaction.begin(test_path, allocator, .metadata_prefix);
+    const invalid_magic = [_]u8{0};
+    try hk.platform.writeBytesAtOffset(test_path, &invalid_magic, 0, allocator);
+    try std.testing.expectEqual(hk.transaction.Recovery.restored, try hk.transaction.recover(test_path, allocator));
+
+    var reader = try hk.HKReader.open(test_path, allocator);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("before", reader.metadata_map.getString("name").?);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try reader.verifyIntegrity());
+    try std.testing.expectError(error.FileNotFound, cwd.openFile(io, journal_path, .{}));
+}
+
 test "Appendix all six entry types roundtrip" {
     const allocator = std.testing.allocator;
     const test_path = "test_all_types_appendix.hk";
@@ -1413,7 +1551,312 @@ test "raw BF16 and F16 GEMV mathematical correctness" {
     try std.testing.expectApproxEqAbs(@as(f32, -2.5), y[1], 1e-5);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Integrity / crash-safety suite. Each test names the guard it protects; the guard was disabled once
+// to confirm the test goes red (see HANDOFF log).
+// ---------------------------------------------------------------------------------------------
 
+const Fixture = struct {
+    path: []const u8,
+    journal: []const u8,
+    partial: []const u8,
 
+    fn init(comptime name: []const u8) Fixture {
+        return .{
+            .path = "test_" ++ name ++ ".hk",
+            .journal = "test_" ++ name ++ ".hk.hkmeta-journal",
+            .partial = "test_" ++ name ++ ".hk.partial",
+        };
+    }
 
+    fn cleanup(self: Fixture) void {
+        const io = std.Options.debug_io;
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteFile(io, self.path) catch {};
+        cwd.deleteFile(io, self.journal) catch {};
+        cwd.deleteFile(io, self.partial) catch {};
+    }
 
+    /// Creates the journal file with arbitrary (torn) content.
+    fn writeTornJournal(self: Fixture) !void {
+        const io = std.Options.debug_io;
+        var f = try std.Io.Dir.cwd().createFile(io, self.journal, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "HKMJ-torn");
+    }
+
+    fn partialExists(self: Fixture) bool {
+        std.Io.Dir.cwd().access(std.Options.debug_io, self.partial, .{}) catch return false;
+        return true;
+    }
+
+    /// Writes a sealed container holding one f32 tensor of `n_floats` values.
+    fn write(self: Fixture, allocator: std.mem.Allocator, n_floats: usize) !void {
+        const values = try allocator.alloc(f32, n_floats);
+        defer allocator.free(values);
+        for (values, 0..) |*v, i| v.* = @floatFromInt(i % 251);
+        var writer = hk.HKWriter.init(allocator);
+        defer writer.deinit();
+        try writer.addTensor(.{
+            .name = "base.weight",
+            .storage_type = .f32,
+            .ndim = 1,
+            .shape = .{ n_floats, 0, 0, 0, 0, 0, 0, 0 },
+            .data = std.mem.sliceAsBytes(values),
+        });
+        try writer.writeToFile(self.path);
+    }
+
+    fn bytes(self: Fixture, allocator: std.mem.Allocator) ![]u8 {
+        var region = try hk.platform.mapOrReadFile(self.path, allocator);
+        defer region.deinit(allocator);
+        return allocator.dupe(u8, region.bytes);
+    }
+
+    fn flipByte(self: Fixture, allocator: std.mem.Allocator, offset: u64) !void {
+        var region = try hk.platform.mapOrReadFile(self.path, allocator);
+        const original = region.bytes[offset];
+        region.deinit(allocator);
+        try hk.platform.writeBytesAtOffset(self.path, &[_]u8{original ^ 0xFF}, offset, allocator);
+    }
+
+    fn tensorOffset(self: Fixture, allocator: std.mem.Allocator) !u64 {
+        var reader = try hk.HKReader.open(self.path, allocator);
+        defer reader.deinit();
+        return reader.toc.entries.items[0].data_offset;
+    }
+
+    fn journalExists(self: Fixture) bool {
+        std.Io.Dir.cwd().access(std.Options.debug_io, self.journal, .{}) catch return false;
+        return true;
+    }
+};
+
+fn appendTestRecord(allocator: std.mem.Allocator, path: []const u8, generation: u32, parent: [32]u8) !void {
+    try hk.appendix.appendRecordToFile(allocator, path, .{
+        .entry_type = .lora_adapter,
+        .flags = hk.format.AppendixFlags.ACTIVE,
+        .name = "adapter",
+        .target = "base.weight",
+        .generation = generation,
+        .timestamp = 1000 + generation,
+        .parent_hash = parent,
+        .data = "payload-bytes",
+    });
+}
+
+test "seal streaming covers every chunk of a multi-chunk file" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("seal_chunks");
+    defer fx.cleanup();
+    // 700k floats = 2.8 MB: more than two 1 MiB chunks.
+    try fx.write(allocator, 700_000);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+
+    const tensor_offset = try fx.tensorOffset(allocator);
+    const probes = [_]u64{ 10, hk.integrity.chunk_len + 5, 2 * hk.integrity.chunk_len + 5, 2_800_000 - 1 };
+    for (probes) |delta| {
+        try fx.flipByte(allocator, tensor_offset + delta);
+        try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+        var reader = try hk.HKReader.open(fx.path, allocator);
+        defer reader.deinit();
+        // The mapped and streaming verifiers must agree.
+        try std.testing.expectEqual(hk.integrity.Verification.invalid, try reader.verifyIntegrity());
+        try fx.flipByte(allocator, tensor_offset + delta); // restore
+        try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    }
+}
+
+test "mutations refuse to re-seal an already corrupted container" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("refuse_reseal");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    try appendTestRecord(allocator, fx.path, 1, @splat(0));
+    try fx.flipByte(allocator, try fx.tensorOffset(allocator));
+
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    try std.testing.expectError(error.ChecksumMismatch, hk.metadata.patchFileMetadataInPlace(allocator, fx.path, "name", "x"));
+    try std.testing.expectError(error.ChecksumMismatch, appendTestRecord(allocator, fx.path, 2, @splat(1)));
+    try std.testing.expectError(error.ChecksumMismatch, hk.appendix.rollbackToFile(allocator, fx.path, 0));
+
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expect(!fx.journalExists());
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "a legacy unsealed container is sealed by its first mutation" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("legacy_seal");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+
+    var region = try hk.platform.mapOrReadFile(fx.path, allocator);
+    var legacy: hk.FileHeader = @as(*const hk.FileHeader, @ptrCast(@alignCast(region.bytes.ptr))).*;
+    region.deinit(allocator);
+    legacy.flags &= ~hk.format.HeaderFlags.HAS_SHA256_CHECKSUM;
+    legacy.checksum = 0;
+    @memset(legacy.reserved1[0..hk.integrity.digest_len], 0);
+    try hk.platform.writeBytesAtOffset(fx.path, std.mem.asBytes(&legacy), 0, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.legacy_missing, try hk.integrity.verifyFile(fx.path, allocator));
+
+    try hk.metadata.patchFileMetadataInPlace(allocator, fx.path, "name", "now-sealed");
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "interrupted append rolls back to the previous sealed file" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("append_crash");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    // Simulate a crash after the journal, the appended record and the header edit, but before the seal.
+    try hk.transaction.begin(fx.path, allocator, .header_only);
+    try hk.platform.writeBytesAtOffset(fx.path, "garbage-record-bytes-from-a-dead-process", before.len, allocator);
+    var hdr: hk.FileHeader = @as(*const hk.FileHeader, @ptrCast(@alignCast(before.ptr))).*;
+    hdr.appendix_offset = before.len;
+    hdr.flags |= hk.format.HeaderFlags.HAS_APPENDIX;
+    try hk.platform.writeBytesAtOffset(fx.path, std.mem.asBytes(&hdr), 0, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+
+    try std.testing.expectEqual(hk.transaction.Recovery.restored, try hk.transaction.recover(fx.path, allocator));
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    try std.testing.expect(!fx.journalExists());
+}
+
+test "interrupted rollback is completed to the requested state, not guessed" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("rollback_crash");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    try appendTestRecord(allocator, fx.path, 1, @splat(0));
+    const size_after_gen1 = blk: {
+        const gen1 = try fx.bytes(allocator);
+        defer allocator.free(gen1);
+        break :blk gen1.len;
+    };
+    try appendTestRecord(allocator, fx.path, 2, @splat(1));
+
+    const full = try fx.bytes(allocator);
+    defer allocator.free(full);
+    const header: hk.FileHeader = @as(*const hk.FileHeader, @ptrCast(@alignCast(full.ptr))).*;
+
+    // Crash after journaling and truncating, before the seal was refreshed.
+    try hk.transaction.beginRollForward(fx.path, allocator, header, size_after_gen1);
+    try hk.platform.truncateFile(fx.path, size_after_gen1, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+
+    try std.testing.expectEqual(hk.transaction.Recovery.completed, try hk.transaction.recover(fx.path, allocator));
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqual(size_after_gen1, after.len);
+    try std.testing.expect(!fx.journalExists());
+
+    // And the normal path leaves a sealed file too.
+    try hk.appendix.rollbackToFile(allocator, fx.path, 0);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "a torn journal is discarded only when the container's seal proves it untouched" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("torn_journal");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+
+    try fx.writeTornJournal();
+    try std.testing.expectEqual(hk.transaction.Recovery.discarded_torn_journal, try hk.transaction.recover(fx.path, allocator));
+    try std.testing.expect(!fx.journalExists());
+
+    // Same torn journal next to a damaged container: must stay flagged, journal kept for inspection.
+    try fx.writeTornJournal();
+    try fx.flipByte(allocator, try fx.tensorOffset(allocator));
+    try std.testing.expectError(error.InvalidJournal, hk.transaction.recover(fx.path, allocator));
+    try std.testing.expect(fx.journalExists());
+}
+
+test "a failed metadata patch rolls back immediately and leaves no journal" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("patch_failure");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    try appendTestRecord(allocator, fx.path, 1, @splat(0));
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    // Far larger than the alignment padding, and the appendix forbids relocating the metadata.
+    const huge = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(huge);
+    @memset(huge, 'x');
+    try std.testing.expectError(error.MetadataExceedsPaddingWithAppendix, hk.metadata.patchFileMetadataInPlace(allocator, fx.path, "big", huge));
+
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expect(!fx.journalExists());
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "streamed conversion output is sealed and leaves no partial file" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const fx = Fixture.init("stream_sealed");
+    defer fx.cleanup();
+
+    var meta = hk.metadata.MetadataMap.init(allocator);
+    defer meta.deinit();
+    const specs = [_]hk.convert.stream_writer.TensorSpec{.{
+        .name = "w",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 16, 0, 0, 0, 0, 0, 0, 0 },
+        .data_size = 64,
+    }};
+    var w = try hk.convert.stream_writer.StreamWriter.begin(allocator, io, fx.path, &meta, &specs, hk.format.DEFAULT_ALIGNMENT_BYTES);
+    defer w.deinit();
+    try w.write(0, 0, &([_]u8{7} ** 64));
+    try w.finish();
+
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    try std.testing.expect(!fx.partialExists());
+}
+
+test "HKWriter replaces its target atomically and leaves no partial file" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("writer_atomic");
+    defer fx.cleanup();
+    try fx.write(allocator, 8);
+    try fx.write(allocator, 16); // overwrite an existing container
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    try std.testing.expect(!fx.partialExists());
+}
+
+test "a failed HKWriter write leaves the existing container untouched" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    const fx = Fixture.init("writer_failure");
+    defer fx.cleanup();
+    try fx.write(allocator, 8);
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    // A directory squatting on `<path>.partial` makes the staged write fail. A writer that wrote to the
+    // destination directly would never notice and would overwrite the container.
+    try cwd.createDir(io, fx.partial, .default_dir);
+    defer cwd.deleteDir(io, fx.partial) catch {};
+    try std.testing.expectError(error.IsDir, fx.write(allocator, 16));
+
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}

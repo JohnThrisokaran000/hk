@@ -21,9 +21,9 @@ user-facing claims; if this file and the code disagree, **the code wins** — fi
 
 ## Baseline measurements (2026-10-06, this machine: Ryzen 7 7445HS, RTX 3050 6GB Laptop, Linux 7.2, Zig 0.16.0)
 
-- `zig build test` (Debug, kernels=fallback): **17/17 steps, 138/138 tests passed** in ~4 s, including the uncommitted integrity/transaction work.
+- `zig build test`: **148/148** in Debug, ReleaseFast, `-Dcpu=x86_64_v3` and `-Dcpu=x86_64` (2026-10-20); `test-e2e` 24/24; `tests/bindings/run.sh` 8 suites, 0 failed; `pytest tests` 97 passed, 3 skipped (no `openai`, `jax`, `tkinter`) using a scratch venv with CPU torch.
   The `hk-cuda-tests` (7) pass; **not checked** whether they exercised the real GPU or skipped.
-- Counts: ~158 Zig `test` blocks, ~100 Python `def test_`. **Python suite was not run in this session** (`numpy`/`torch` not installed in the system Python used here) — treat Python status as `unverified this session`.
+- Counts: ~158 Zig `test` blocks, ~100 Python `def test_`. The Python suite was run on 2026-10-20 (see above) in a scratch venv; the system Python has no `numpy`/`torch`.
 - Performance (from `benchmarks/results.md`, CPU, 6 threads, 2026-10-05): prefill 91–240 % of llama.cpp (faster on 8/10 models), decode 92–100 %, private memory 5–9× lower. Vulkan GPU: ~25–40 % of llama.cpp prefill, 65–80 % decode, one NVIDIA card only.
 
 ## Two kernel stacks — read before touching any kernel
@@ -49,14 +49,14 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 | 3 | Virtual: null_ref, shared_ref | DONE | writer handles both (tied weights) |
 | 3 | Virtual: lora_ref | STORAGE-ONLY | enum value exists; engine ignores appendix/adapters |
 | 3 | Virtual: delta_ref, external_ref | NOT STARTED | not in `StorageType` |
-| 4 | Container checksum | **PARTIAL — uncommitted** | `src/integrity.zig`: SHA-256 over whole file, header flag bit 9, sealed after every writer/mutation; `hk verify` reports it; Python mirror in `adaptive/appendix.py`. Legacy files without it stay readable (`legacy_missing`) |
-| 4 | Appendix record integrity | PARTIAL — uncommitted | CRC-32 per record payload; `0` = legacy record |
+| 4 | Container checksum | **DONE (checksum) — uncommitted; signatures NOT STARTED** | `src/integrity.zig`: streamed SHA-256, header flag bit 9, single-header-write seal; every producer seals (HKWriter, StreamWriter, metadata patch, appendix append/rollback); edits refuse a mismatching seal; `hk verify` exits non-zero, 13 MiB peak RSS on a 2.1 GiB file. Python goes through the C ABI (`hk_verify_integrity`). Legacy files verify as `legacy_missing`. 10 Zig tests + 5 e2e tests, each guard mutation-checked. Not run: Windows/macOS/ARM |
+| 4 | Appendix record integrity | DONE — uncommitted | CRC-32 per record payload; `0` = legacy record; unknown entry type rejected at the C ABI |
 | 4 | Reader bounds hardening | PARTIAL — uncommitted | overflow-safe section/tensor range checks in `reader.zig` (`checkedEnd`, `validateTensorRanges`) |
 | 4 | Version negotiation, capability negotiation, optional sections | PARTIAL | reader accepts `version_major == 1`; header feature flags exist; no negotiation protocol |
 | 4 | Per-tensor hash stored in file | NOT STARTED | `hk hash` computes per-tensor SHA-256 on demand only |
 | 4 | Signatures, trusted publishers, signed manifests | NOT STARTED | |
 | 4 | Compression | UNVERIFIED | `COMPRESSED` appendix flag bit is defined (`format.zig:205`); no compression code found |
-| 5 | Crash-safe metadata edit | **PARTIAL — uncommitted** | `src/transaction.zig`: journal of the pre-edit prefix (`.hkmeta-journal`), rollback on next mutation; `hk repair` |
+| 5 | Crash-safe edits | **DONE for in-place edits — uncommitted** | `src/transaction.zig`: restore journal (metadata patch, appendix append) and roll-forward journal (appendix rollback); torn journals discarded only if the seal proves the file untouched; `HKWriter`/StreamWriter write `.partial` + rename; `hk repair`. Crash is simulated by writing the journal and partial state by hand — no real kill-9/power-loss test, no fsync-ordering proof. No `hk compact`/`hk fsck` |
 | 5 | Atomic appendix writes, atomic full-file writes | NOT STARTED | `appendRecordToFile` is in-place; `HKWriter.write` creates the destination directly (no temp+rename) |
 | 5 | `hk compact`, `hk fsck` | NOT STARTED | |
 | 6 | Layout metadata | PARTIAL | `TileLayout` enum 0x00–0x07 and `hk retile`; **engine ignores pre-tiled layouts** (repacks per-thread at runtime). No 128x\*, no per-backend layouts, no multi-representation per logical tensor |
@@ -220,7 +220,7 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 | **2.1 HW Acceleration** | — | everything (no Tensor Cores, sparse TC, ROCm, Metal, coop matrices, XPU, DirectML, mobile) |
 | **2.2 Model Compat** | Llama/Mistral(no SWA)/Qwen2/Qwen3 execute | Gemma, Phi, SWA, MoE, SSM, multimodal, descriptor-driven registry |
 | **2.3 Server Runtime** | slot scheduler, shared prompt cache | continuous batching proper, paged KV, speculative decoding, distributed, multi-GPU |
-| **2.4 Universal Format** | checksum + metadata journal (uncommitted) | v2 spec, signatures, backend layouts, external refs, registry, atomic appendix writes |
+| **2.4 Universal Format** | checksum, crash-safe edits, atomic writes (uncommitted) | v2 spec, signatures, backend layouts, external refs, registry |
 | **2.5 Training** | PyTorch `HKTrainer`, LoRA/QLoRA (prototype) | native/distributed training, distillation, QAT, pruning-aware training |
 | **2.6 Adaptive Research** | Net2Wider/vocab (prototype), partial plasticity | Net2Deeper in Zig, autonomous growth validated, model evolution loop, branching/merging |
 | **2.7 Self-Improvement** | components exist | secure execution, validated loops, curriculum, failure mining, regression rollback proven |

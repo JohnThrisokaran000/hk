@@ -210,7 +210,28 @@ HK_API int hk_appendix_append(
     const void* data,
     uint64_t data_size
 );
+/* Like hk_appendix_append, with an explicit timestamp (seconds since the epoch). */
+HK_API int hk_appendix_append_at(
+    const char* file_path,
+    uint8_t entry_type,
+    uint8_t flags,
+    const char* name,
+    const char* target,
+    uint32_t generation,
+    const uint8_t parent_hash[32],
+    float metric_loss,
+    float metric_acc,
+    float metric_pass,
+    float metric_custom,
+    const void* data,
+    uint64_t data_size,
+    uint64_t timestamp
+);
 HK_API int hk_appendix_rollback(const char* file_path, uint32_t target_generation);
+
+/* Container integrity. Streams the file in bounded memory.
+ * Returns 0 = SHA-256 seal valid, 1 = legacy file without a seal, -1 = seal mismatch or unreadable file. */
+HK_API int hk_verify_integrity(const char* file_path);
 
 // Native SIMD Tensor Operations & Inference Kernels
 HK_API float hk_dot_product_f32(const float* a, const float* b, uint64_t count);

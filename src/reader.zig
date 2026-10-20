@@ -8,6 +8,7 @@ const quantization = @import("quantization.zig");
 const sparsity = @import("sparsity.zig");
 const tiling = @import("tiling.zig");
 const quant = @import("quant.zig");
+const integrity = @import("integrity.zig");
 
 pub const HKReader = struct {
     allocator: std.mem.Allocator,
@@ -31,17 +32,22 @@ pub const HKReader = struct {
             return error.InvalidMagicOrVersion;
         }
 
+        try validateHeaderLayout(&header, region.bytes.len);
+
         // Deserialize Metadata
-        const meta_end = header.metadata_offset + header.metadata_size;
-        if (meta_end > region.bytes.len) return error.MetadataOutOfBounds;
-        const meta_buf = region.bytes[header.metadata_offset..meta_end];
-        const meta_map = try metadata.MetadataMap.deserialize(meta_buf, header.metadata_kv_count, allocator);
+        const meta_start: usize = @intCast(header.metadata_offset);
+        const meta_end = try checkedEnd(header.metadata_offset, header.metadata_size, region.bytes.len, error.MetadataOutOfBounds);
+        const meta_buf = region.bytes[meta_start..meta_end];
+        var meta_map = try metadata.MetadataMap.deserialize(meta_buf, header.metadata_kv_count, allocator);
+        errdefer meta_map.deinit();
 
         // Deserialize TOC
-        const toc_end = header.tensor_toc_offset + header.tensor_toc_size;
-        if (toc_end > region.bytes.len) return error.TOCOutOfBounds;
-        const toc_buf = region.bytes[header.tensor_toc_offset..toc_end];
-        const toc = try tensor_toc.TensorTOC.deserialize(toc_buf, header.tensor_count, allocator);
+        const toc_start: usize = @intCast(header.tensor_toc_offset);
+        const toc_end = try checkedEnd(header.tensor_toc_offset, header.tensor_toc_size, region.bytes.len, error.TOCOutOfBounds);
+        const toc_buf = region.bytes[toc_start..toc_end];
+        var toc = try tensor_toc.TensorTOC.deserialize(toc_buf, header.tensor_count, allocator);
+        errdefer toc.deinit();
+        try validateTensorRanges(&toc, region.bytes.len);
 
         return HKReader{
             .allocator = allocator,
@@ -84,6 +90,14 @@ pub const HKReader = struct {
 
     pub fn getSplitCount(self: *const HKReader) u16 {
         return self.header.split_count;
+    }
+
+    /// Checks the optional container SHA-256 over the existing mapping. This faults every page of the file
+    /// into the process (RSS grows to the file size); prefer `integrity.verifyFile` for large models.
+    ///
+    /// Legacy v1 files report `.legacy_missing` rather than failing to open.
+    pub fn verifyIntegrity(self: *const HKReader) !integrity.Verification {
+        return integrity.verify(self.mmap_region.bytes);
     }
 
     /// Zero-copy raw byte slice for raw tensor storage
@@ -591,3 +605,35 @@ pub const HKReader = struct {
         return error.UnsupportedStorageType;
     }
 };
+
+fn checkedEnd(offset: u64, size: u64, file_len: usize, comptime bounds_error: anyerror) !usize {
+    const end = std.math.add(u64, offset, size) catch return bounds_error;
+    if (end > file_len) return bounds_error;
+    return @intCast(end);
+}
+
+fn validateHeaderLayout(header: *const format.FileHeader, file_len: usize) !void {
+    if (header.alignment == 0) return error.InvalidAlignment;
+    if (header.metadata_offset < @sizeOf(format.FileHeader)) return error.MetadataOutOfBounds;
+    _ = try checkedEnd(header.metadata_offset, header.metadata_size, file_len, error.MetadataOutOfBounds);
+    _ = try checkedEnd(header.tensor_toc_offset, header.tensor_toc_size, file_len, error.TOCOutOfBounds);
+    if (header.tensor_data_offset > file_len) return error.TensorDataOutOfBounds;
+    if (header.appendix_offset != 0 and header.appendix_offset >= file_len) return error.AppendixOutOfBounds;
+}
+
+fn validateTensorRanges(toc: *const tensor_toc.TensorTOC, file_len: usize) !void {
+    for (toc.entries.items) |entry| {
+        if (entry.ndim > format.MAX_DIMS) return error.InvalidTensorDimensions;
+        if (entry.storage_type == .null_ref) {
+            if (entry.data_offset != 0 or entry.data_size != 0) return error.InvalidNullReference;
+            continue;
+        }
+        _ = try checkedEnd(entry.data_offset, entry.data_size, file_len, error.TensorOutOfBounds);
+        if (entry.scale_size != 0) {
+            _ = try checkedEnd(entry.scale_offset, entry.scale_size, file_len, error.TensorScaleOutOfBounds);
+        }
+        if (entry.residual_size != 0) {
+            _ = try checkedEnd(entry.residual_offset, entry.residual_size, file_len, error.TensorResidualOutOfBounds);
+        }
+    }
+}

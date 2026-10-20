@@ -27,6 +27,17 @@
 
 Section offsets are not implied by the layout; readers must use the offsets stored in the header. The writer emits metadata directly after the header, then the TOC, then pads to the first aligned offset for tensor data.
 
+Readers validate every declared section and tensor payload range with overflow-safe arithmetic before exposing mapped bytes. A malformed offset, length, appendix position, scale buffer, or residual buffer is rejected instead of being allowed to wrap into another region.
+
+### Integrity and crash safety
+
+- **Seal.** When header flag bit 9 is set, `checksum` and `reserved1[0..32]` hold a SHA-256 over the whole file, computed with the seal flag treated as set and the checksum and digest slots treated as zero. Sealing is therefore one 128-byte header write. Every producer in this repository seals: `HKWriter`, the streaming converters (`hk pull`, `convert-gguf`, `convert-hf`), `hk metadata set`, and appendix append/rollback. Files without the flag (written before this change) stay readable and verify as *legacy*. A legacy file is sealed by its first edit, which records its current contents; that cannot prove it was intact before.
+- **Cost.** Hashing and sealing stream the file in 1 MiB chunks, so memory is bounded; time is O(file). An edit costs two passes (verify the existing seal, then re-seal). Converters add one pass after writing. Measured on one machine (Ryzen 7 7445HS, 2.1 GiB f32 container, warm page cache, ReleaseFast, 3 runs each): `hk verify` 1.27 s and `hk metadata set` 2.50 s, both at 13 MiB peak RSS. Cold-cache and slower-disk numbers were not measured; time scales with file size, so a 70 GB model is minutes, not milliseconds.
+- **Verify before edit.** An edit of a file whose seal does not match is refused (`ChecksumMismatch`); re-sealing would hide the damage.
+- **Atomic writes.** `HKWriter` and the streaming converters write `<path>.partial`, seal it, and rename it into place, so an interrupted write never leaves a truncated file under the final name.
+- **Journal.** In-place edits use an adjacent `.hkmeta-journal`, written and synced before the first container byte changes and deleted only after the edit and its re-seal. Two kinds: *restore* (metadata patch: the prefix up to `tensor_data_offset`; appendix append: the header only) puts the saved bytes back and truncates to the original size; *roll-forward* (appendix rollback, whose cut-off bytes are not saved) re-applies the recorded header and size and re-seals. Weight payloads are never copied. A torn journal is discarded only when the container's own seal proves the file untouched; otherwise recovery fails and says so. `hk repair` runs recovery; the next edit also does.
+- **Limits.** The journal protects against a crash of the writing process. It is not a defence against an attacker, who can recompute the seal; signatures are not implemented. Verified on Linux only; the Windows code paths have not been run.
+
 ---
 
 ## 2. File header (128 bytes)
@@ -47,9 +58,9 @@ Section offsets are not implied by the layout; readers must use the offsets stor
 | `0x38` | `tensor_toc_size` | `u64` | TOC byte length |
 | `0x40` | `tensor_data_offset` | `u64` | Absolute offset of the first aligned payload |
 | `0x48` | `appendix_offset` | `u64` | Offset of the first appendix record, `0` if none |
-| `0x50` | `checksum` | `u64` | Reserved. **Currently always written as `0` and not verified.** |
+| `0x50` | `checksum` | `u64` | First eight bytes, interpreted little-endian, of the canonical SHA-256 container digest when bit 9 is set |
 | `0x58` | `split_count` | `u16` | Total shards, `>= 1` |
-| `0x5A` | `reserved1` | `[38]u8` | Zero |
+| `0x5A` | `reserved1` | `[38]u8` | First 32 bytes hold the full canonical SHA-256 digest when bit 9 is set; remaining six bytes are zero |
 
 ### Flags
 
@@ -64,6 +75,7 @@ Section offsets are not implied by the layout; readers must use the offsets stor
 | 6 | `IS_SHARDED` | File is one shard of a multi-file model |
 | 7 | `RAW_WEIGHT_STORAGE` | Informational: raw unquantized storage |
 | 8 | `UNIVERSAL_PAGE_ALIGNED` | Set when `alignment >= 4096` |
+| 9 | `HAS_SHA256_CHECKSUM` | `checksum` and `reserved1[0..32]` store a SHA-256 over the complete file with those digest fields zeroed |
 
 Alignment presets in `format.zig`: 128 B (default), 4096 B (page), 16384 B (Apple Silicon page size) and 65536 B (64 KiB granularity). The alignment only affects where payloads start; it does not change how they are read. The inference engine memory-maps payloads in place, so a page-aligned file lets the OS map tensors without copies, but nothing in the engine requires a particular value.
 
@@ -182,7 +194,7 @@ Header layout:
 | 48 | `metric_loss, metric_acc, metric_pass, metric_custom` | `4 × f32` |
 | 64 | `target_len` | `u16` |
 | 66 | `reserved` | `u16` |
-| 68 | `data_crc32` | `u32`, currently always `0` |
+| 68 | `data_crc32` | `u32`, CRC-32/ISO-HDLC of the record payload; `0` denotes a legacy record without a checksum |
 | 72 | `data_size` | `u64` |
 
 Entry types: `0x01 lora_adapter`, `0x02 delta_patch`, `0x03 new_layer`, `0x04 code_eval`, `0x05 kv_cache_sink`, `0x06 topology_head`.

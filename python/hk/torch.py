@@ -418,128 +418,20 @@ def metadata_set(
     path_str = str(filename)
     val_str = json.dumps(val) if isinstance(val, (dict, list)) else str(val)
 
-    if is_native_available():
-        from .native import native_metadata_patch_in_place
-        if native_metadata_patch_in_place(path_str, key, val_str):
-            return
+    from .native import native_metadata_patch_in_place
 
-    _patch_metadata_in_place_py(path_str, key, val)
-
-
-def _patch_metadata_in_place_py(
-    filename: str,
-    key: str,
-    val: Union[str, int, float, bool, dict, list],
-) -> None:
-    """Pure-Python in-place metadata patcher."""
-    import json
-    with open(filename, "r+b") as f:
-        header_bytes = f.read(128)
-        if len(header_bytes) < 128:
-            raise ValueError("File too small to be a valid HK container")
-
-        (
-            magic, v_maj, v_min, flags, alignment, split_index,
-            n_tensors, n_meta, meta_off, meta_sz,
-            toc_off, toc_sz, data_off, app_off, chk, split_count, res1
-        ) = struct.unpack("<4s H H I H H Q Q Q Q Q Q Q Q Q H 38s", header_bytes)
-
-        if magic != MAGIC:
-            raise ValueError("Invalid magic bytes in HK file")
-
-        f.seek(meta_off)
-        m_data = f.read(meta_sz)
-        m_pos = 0
-        existing_items = []
-
-        for _ in range(n_meta):
-            if m_pos + 2 > len(m_data):
-                break
-            klen = struct.unpack_from("<H", m_data, m_pos)[0]
-            m_pos += 2
-            k = m_data[m_pos:m_pos + klen].decode("utf-8", errors="ignore")
-            m_pos += klen
-            tag = m_data[m_pos]
-            m_pos += 1
-            vlen = struct.unpack_from("<I", m_data, m_pos)[0]
-            m_pos += 4
-            raw_val = m_data[m_pos:m_pos + vlen]
-            m_pos += vlen
-            existing_items.append((k, tag, raw_val))
-
-        if isinstance(val, bool):
-            new_tag = 0x04
-            new_val_bytes = b"\x01" if val else b"\x00"
-        elif isinstance(val, int):
-            new_tag = 0x02
-            new_val_bytes = struct.pack("<q", val)
-        elif isinstance(val, float):
-            new_tag = 0x03
-            new_val_bytes = struct.pack("<d", val)
-        elif isinstance(val, (dict, list)):
-            new_tag = 0x05
-            new_val_bytes = json.dumps(val).encode("utf-8")
-        else:
-            new_tag = 0x01
-            new_val_bytes = str(val).encode("utf-8")
-
-        updated_items = []
-        found = False
-        for k, tag, raw in existing_items:
-            if k == key:
-                updated_items.append((k, new_tag, new_val_bytes))
-                found = True
-            else:
-                updated_items.append((k, tag, raw))
-        if not found:
-            updated_items.append((key, new_tag, new_val_bytes))
-
-        new_meta_buf = bytearray()
-        for k, tag, raw in updated_items:
-            k_bytes = k.encode("utf-8")
-            new_meta_buf.extend(struct.pack("<H", len(k_bytes)))
-            new_meta_buf.extend(k_bytes)
-            new_meta_buf.append(tag)
-            new_meta_buf.extend(struct.pack("<I", len(raw)))
-            new_meta_buf.extend(raw)
-
-        f.seek(toc_off)
-        toc_data = f.read(toc_sz)
-
-        new_meta_sz = len(new_meta_buf)
-        needed = 128 + new_meta_sz + toc_sz
-        available = data_off - 128
-
-        if needed <= available:
-            new_meta_off = 128
-            new_toc_off = 128 + new_meta_sz
-            f.seek(0)
-            new_header = struct.pack(
-                "<4s H H I H H Q Q Q Q Q Q Q Q Q H 38s",
-                magic, v_maj, v_min, flags, alignment, split_index,
-                n_tensors, len(updated_items), new_meta_off, new_meta_sz,
-                new_toc_off, toc_sz, data_off, app_off, chk, split_count, res1
-            )
-            f.write(new_header)
-            f.write(new_meta_buf)
-            f.write(toc_data)
-            pad = data_off - (new_toc_off + toc_sz)
-            if pad > 0:
-                f.write(b"\x00" * pad)
-        else:
-            f.seek(0, os.SEEK_END)
-            new_meta_off = f.tell()
-            f.write(new_meta_buf)
-            f.seek(0)
-            new_header = struct.pack(
-                "<4s H H I H H Q Q Q Q Q Q Q Q Q H 38s",
-                magic, v_maj, v_min, flags, alignment, split_index,
-                n_tensors, len(updated_items), new_meta_off, new_meta_sz,
-                toc_off, toc_sz, data_off, app_off, chk, split_count, res1
-            )
-            f.write(new_header)
-
-        f.flush()
+    # The seal, edit journal and crash recovery live in Zig only; there is deliberately no second
+    # implementation here to drift out of sync with it.
+    if not is_native_available():
+        raise RuntimeError(
+            "metadata_set needs the native hk library (in-place edits must keep the container seal valid)."
+        )
+    if not native_metadata_patch_in_place(path_str, key, val_str):
+        raise RuntimeError(
+            f"metadata_set({path_str!r}, {key!r}) was refused by the native patcher and the file was left "
+            "unchanged (failed seal check, no room next to an appendix, or an I/O error). "
+            "Run `hk verify` / `hk repair` on it for details."
+        )
 
 
 def load_hk(

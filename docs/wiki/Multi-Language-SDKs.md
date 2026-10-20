@@ -17,7 +17,8 @@ Link against the shared library produced by `zig build -Doptimize=ReleaseFast` (
 | Reader | `hk_open`, `hk_close`, `hk_get_tensor_count`, `hk_get_tensor_info`, `hk_get_all_tensor_infos`, `hk_get_tensor_data` / `_residual` / `_scales`, `hk_dequantize_f32`, `hk_get_metadata_{string,int,float,bool}`, `hk_reader_is_sharded`, `hk_reader_get_split_{index,count}` |
 | Writer | `hk_writer_create`, `hk_writer_add_metadata_*`, `hk_writer_add_tensor`, `hk_writer_set_sharding`, `hk_writer_set_raw_storage`, `hk_writer_write_to_file`, `hk_writer_destroy` |
 | Metadata edit | `hk_metadata_patch_in_place` |
-| Appendix | `hk_appendix_get_count`, `hk_appendix_get_entry`, `hk_appendix_append`, `hk_appendix_rollback` |
+| Appendix | `hk_appendix_get_count`, `hk_appendix_get_entry`, `hk_appendix_append`, `hk_appendix_append_at` (explicit timestamp), `hk_appendix_rollback` |
+| Integrity | `hk_verify_integrity` (0 valid, 1 legacy/unsealed, -1 mismatch or unreadable); wrapped in C++ (`Model::verify_integrity`) and Python only — the other language bindings do not expose it yet |
 | Quantization helpers | block quantize/dequantize for NF4, DQ8, DQT, Q4_0, Q8_0, Q4_K, Q8_K, Q6_K, Q2_K, IQ4_NL, MXFP4, NVFP4; 2:4 pack/unpack; 16x16 tiling |
 | Math helpers | `hk_dot_product_f32`, `hk_gemv_*`, `hk_gemm_f32`, fused NF4/DQ8 GEMV, SwiGLU/RMSNorm/SiLU forward pieces |
 | Growth | `hk_net2wider`, `hk_net2deeper`, `hk_net2wider_swiglu`, `hk_expand_vocab`, plasticity masks |

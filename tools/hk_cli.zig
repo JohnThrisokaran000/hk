@@ -120,6 +120,12 @@ pub fn main(init: std.process.Init) !void {
             return error.BadUsage;
         };
         try cmdVerify(file_path, allocator);
+    } else if (std.mem.eql(u8, command, "repair")) {
+        const file_path = it.next() orelse {
+            std.debug.print("Error: Missing file path for 'repair'\nUsage: hk repair <model.hk>\n", .{});
+            return error.BadUsage;
+        };
+        try cmdRepair(file_path, allocator);
     } else if (std.mem.eql(u8, command, "benchmark")) {
         const file_path = it.next() orelse {
             std.debug.print("Error: Missing file path for 'benchmark'\nUsage: hk benchmark <model.hk>\n", .{});
@@ -320,6 +326,7 @@ fn printUsage() void {
         \\  convert-endian <in.hk> <out.hk>              Convert endianness (Little <-> Big Endian)
         \\  gui            [file.hk]                     Launch visual HK model editor GUI
         \\  verify         <file.hk>                     Verify header magic, 128-byte alignment, and bounds
+        \\  repair         <file.hk>                     Restore an interrupted metadata transaction, if present
         \\  eval           <file.hk>                     Inspect model weights, parameter counts, and integrity
         \\  expand         <in.hk> <out.hk> [options]    Natively expand vocab (--vocab N) and width (--width R)
         \\  benchmark      <file.hk>                     Benchmark mmap loading and dequantization throughput
@@ -437,7 +444,7 @@ fn cmdExport(fmt: []const u8, input_path: []const u8, output_path: []const u8, a
 fn cmdMetadataSet(file_path: []const u8, key: []const u8, val: []const u8, allocator: std.mem.Allocator) !void {
     hk.metadata.patchFileMetadataInPlace(allocator, file_path, key, val) catch |err| {
         std.debug.print("Error: Failed to patch metadata in '{s}': {}\n", .{ file_path, err });
-        return;
+        return err;
     };
     std.debug.print("[SUCCESS] In-place metadata updated in '{s}':\n  {s} = \"{s}\"\n(Tensor payload untouched, zero copy)\n", .{
         file_path, key, val,
@@ -576,7 +583,7 @@ fn cmdInspect(path: []const u8, allocator: std.mem.Allocator) !void {
 fn cmdVerify(path: []const u8, allocator: std.mem.Allocator) !void {
     var reader = hk.HKReader.open(path, allocator) catch |err| {
         std.debug.print("VERIFY FAILED: Could not open file: {}\n", .{err});
-        return;
+        return err;
     };
     defer reader.deinit();
 
@@ -609,10 +616,56 @@ fn cmdVerify(path: []const u8, allocator: std.mem.Allocator) !void {
         }
     }
 
+    // Streamed in bounded chunks: hashing through the reader's mapping would fault the whole file into RSS.
+    const integrity_status = hk.integrity.verifyFile(path, allocator) catch |err| blk: {
+        std.debug.print("[FAIL] Could not verify container checksum: {}\n", .{err});
+        passed = false;
+        break :blk null;
+    };
+    if (integrity_status) |status| switch (status) {
+        .valid => std.debug.print("[PASS] SHA-256 container checksum verified\n", .{}),
+        .legacy_missing => std.debug.print("[WARN] No container checksum (legacy v1 file)\n", .{}),
+        .invalid => {
+            std.debug.print("[FAIL] SHA-256 container checksum mismatch!\n", .{});
+            passed = false;
+        },
+    };
+
+    const journal_path = try std.fmt.allocPrint(allocator, "{s}.hkmeta-journal", .{path});
+    defer allocator.free(journal_path);
+    if (std.Io.Dir.cwd().access(std.Options.debug_io, journal_path, .{})) |_| {
+        std.debug.print("[FAIL] An interrupted edit left '{s}' behind; run `hk repair {s}`\n", .{ journal_path, path });
+        passed = false;
+    } else |_| {}
+
     if (passed) {
         std.debug.print("\n===> ALL CHECKS PASSED: File is a compliant, high-performance HK binary container.\n\n", .{});
     } else {
         std.debug.print("\n===> VERIFICATION FAILED: Violations found.\n\n", .{});
+        return error.VerificationFailed;
+    }
+}
+
+fn cmdRepair(path: []const u8, allocator: std.mem.Allocator) !void {
+    const recovery = hk.transaction.recover(path, allocator) catch |err| {
+        std.debug.print("REPAIR FAILED: the edit journal for '{s}' cannot be applied safely ({}). The file was left untouched.\n", .{ path, err });
+        return err;
+    };
+    switch (recovery) {
+        .none => std.debug.print("No interrupted edit found.\n", .{}),
+        .restored => std.debug.print("Rolled back an interrupted edit; the file is back at its last committed state.\n", .{}),
+        .completed => std.debug.print("Completed an interrupted appendix rollback and re-sealed the file.\n", .{}),
+        .discarded_torn_journal => std.debug.print("Discarded an incomplete edit journal; the file's seal confirms it was never modified.\n", .{}),
+    }
+
+    switch (try hk.integrity.verifyFile(path, allocator)) {
+        .valid => std.debug.print("REPAIR COMPLETE: SHA-256 seal is valid.\n", .{}),
+        .legacy_missing => std.debug.print("REPAIR COMPLETE: legacy file with no SHA-256 seal (nothing to check it against).\n", .{}),
+        .invalid => {
+            std.debug.print("REPAIR INCOMPLETE: the SHA-256 seal does not match the file contents and no journal explains it.\n" ++
+                "The file is damaged or was edited outside hk; it is NOT re-sealed, because that would hide the damage.\n", .{});
+            return error.ChecksumMismatch;
+        },
     }
 }
 
@@ -925,7 +978,7 @@ fn cmdRollback(path: []const u8, target_gen: u32, allocator: std.mem.Allocator) 
     std.debug.print("Rolling back '{s}' to generation {}...\n", .{ path, target_gen });
     hk.appendix.rollbackToFile(allocator, path, target_gen) catch |err| {
         std.debug.print("Rollback failed: {}\n", .{err});
-        return;
+        return err;
     };
     std.debug.print("[SUCCESS] Successfully rolled back '{s}' to generation {}\n", .{ path, target_gen });
 }
@@ -2025,6 +2078,4 @@ fn cmdConvertSafeTensors(in_path: []const u8, out_path: []const u8, target_st_st
     try hk.safetensors.transcodeSafeTensorsToHK(allocator, in_path, out_path, st);
     std.debug.print("Transcoding completed successfully.\n", .{});
 }
-
-
 

@@ -21,18 +21,18 @@ scope; it is staged by the dependency order in plan §151.
 
 Repo: `github.com/harshitkhandelwal208/hk` · Apache-2.0 · packages: PyPI `hknt`, npm `hkntf`.
 
-## 2. Where things stand (verified 2026-10-06)
+## 2. Where things stand (verified 2026-10-20)
 
 | | |
 |:--|:--|
-| Version | 1.1.1 (tag `v1.1.1`); `HEAD` = `43cf891` on `main`. **Uncommitted work in tree** — see HANDOFF |
+| Version | 1.1.1 released (tag `v1.1.1`). Next release is **2.0** (plan §150); no 3.0.0 until the last milestone. **Uncommitted work in tree** — see HANDOFF |
 | Engine runs | Llama / Mistral (no sliding window) / Qwen2 / Qwen3 dense decoders — **3 architecture families** |
 | Formats | 26 weight storage formats decoded; CPU kernel for every one; Vulkan decodes a subset |
 | CPU perf | prefill 91–240 % of llama.cpp (faster on 8/10 models), decode 92–100 %, private RSS 5–9× lower |
 | GPU | Vulkan whole-model-on-one-device; one NVIDIA card tested; slower than llama.cpp's Vulkan |
 | Not present | CUDA in the engine, Metal, ROCm, NPU, MoE, SWA, multimodal, grammar, speculative decoding, distributed, sparse execution, signatures, `hk quantize` |
 | Research half | Python prototypes (Net2Net growth, lineage, 2:4 storage, LoRA/QLoRA, SPIN, self-training) — unit-tested on small models only |
-| Tests | `zig build test`: 138/138 pass (Debug, this machine). Python suite not run in the last session |
+| Tests | `zig build test`: 148/148 (Debug, ReleaseFast, v3, baseline); e2e 24/24; bindings 8 suites; `pytest` 97 passed / 3 skipped (verified 2026-10-20) |
 
 Do **not** quote "137+ architectures" as support. It is a Python name-mapping registry (169 aliases → 79
 canonical names). The engine executes 3 families. Details and every other gap: STATUS.md.
@@ -43,7 +43,7 @@ canonical names). The engine executes 3 families. Details and every other gap: S
 src/                    Zig core (library + C ABI)
   format.zig reader.zig writer.zig metadata.zig tensor_toc.zig   .hk container
   appendix.zig                                                   in-file version lineage (hash chain)
-  integrity.zig transaction.zig                                  SHA-256 seal + metadata journal (NEW, uncommitted)
+  integrity.zig transaction.zig                                  SHA-256 seal + edit journal (uncommitted)
   platform.zig                                                   mmap / file mapping / in-place IO
   engine/        model, config(Arch enum), weights, kv, attention, ops, matmul, session   ← live inference path
   quant/         per-format dequant, vecdot, gemm, unpack, isa                           ← live kernels

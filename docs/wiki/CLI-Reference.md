@@ -58,7 +58,8 @@ Tensor names are kept as they are in the container, so a model converted from GG
 |:---|:---|
 | `hk inspect <file.hk>` | header, metadata and the tensor table |
 | `hk dump <file.hk>` | the header field by field, with offsets |
-| `hk verify <file.hk>` | check the magic, version and the alignment of the payload |
+| `hk verify <file.hk>` | check the magic, version, payload alignment, tensor bounds and the SHA-256 seal; exits non-zero on any failure, including a leftover edit journal. Files without a seal are reported as legacy (warning, not failure) |
+| `hk repair <file.hk>` | finish or roll back an interrupted in-place edit (metadata, appendix), then re-check the seal. It never re-seals a file whose contents do not match its seal |
 | `hk hash <file.hk>` | SHA-256 of the container and of every tensor |
 | `hk eval <file.hk>` | parameter count, value range, NaN and Inf count |
 | `hk tokenize <file.hk> "text"` | token ids using the vocabulary stored in the file |

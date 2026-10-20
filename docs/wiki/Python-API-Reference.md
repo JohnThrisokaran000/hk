@@ -41,7 +41,7 @@ A `safetensors`-style API over `.hk` files.
 - `save_model(model, filename, metadata=None)` / `load_model(model, filename, strict=True)`.
 - `save_sharded_file(tensors, filename_pattern, max_shard_size=..., ...)` / `load_sharded_file(...)`: multi-file checkpoints with a `*.hk.index.json` manifest.
 - `safe_open(filename, framework="pt")`: lazy reader (`keys()`, `metadata()`, `get_tensor(name)`, `get_slice(name)`).
-- `metadata_set(filename, key, value)`: in-place metadata edit (same limits as `hk metadata set`, see [Storage and Sparsity](Storage-and-Sparsity)).
+- `metadata_set(filename, key, value)`: in-place metadata edit (same limits as `hk metadata set`, see [Storage and Sparsity](Storage-and-Sparsity)). It runs in the native library, which verifies, journals and re-seals the file; there is no pure-Python fallback, and it raises if the native library is not loaded or refuses the edit.
 - `hk.remote`: `read_remote_hk_header`, `safe_open_remote` (reads a remote file's header/tensors over HTTP range requests).
 
 ## 3. Raw store (`hk.raw`)
@@ -69,7 +69,7 @@ For producing GGUF-style quantized models that the engine can run, prefer the Zi
 ## 6. Adaptive tooling (`hk.adaptive`)
 
 - Growth: `GrowthGovernor`, `net2wider_linear`, `net2wider_swiglu`, `net2deeper_linear`, `expand_vocab(model, new_vocab_size, init_std)`, `expand_model_width(model, expansion_ratio, ...)`, `protect_base_capacity(model, ...)`. See [Dynamic Architecture Growth](Dynamic-Architecture-Growth).
-- Appendix: `AppendixManager(path)` with `get_records()`, `append_lora_checkpoint(...)`, `rollback(generation)`, `verify()`; module functions `read_appendix`, `append_record`, `rollback_appendix`, `verify_lineage`, `compute_parent_hash`. See [In-Container Version Lineage](In-Container-Version-Lineage).
+- Appendix: `AppendixManager(path)` with `get_records()`, `append_lora_checkpoint(...)`, `rollback(generation)`, `verify()`; module functions `read_appendix`, `append_record`, `rollback_appendix` (the two writers run in the native library, which verifies, journals and re-seals the file, and raise if it is not loaded or refuses the edit), `verify_lineage`, `compute_parent_hash`. See [In-Container Version Lineage](In-Container-Version-Lineage).
 - Self-training: `SelfTrainingPipeline`, `SelfTrainingCurriculum`, `SelfConversationalEngine`, `ExpansionEvaluator`, `CodeSandbox`, `SPINLoss`. See [Self-Training Toolkit](Autonomous-Self-Training); note the sandbox is not a security boundary by default.
 
 ## 7. Misc

@@ -6,7 +6,7 @@
   "curated_nodes": 79,
   "curated_edges": 153,
   "file_nodes": 167,
-  "import_edges": 368,
+  "import_edges": 371,
   "unowned_files": 0,
   "status_counts": {
    "done": 8,
@@ -1152,7 +1152,7 @@
    "type": "file",
    "label": "python/hk/adaptive/appendix.py",
    "lang": "python",
-   "loc": 341,
+   "loc": 268,
    "owner": "appendix-lineage"
   },
   {
@@ -1320,7 +1320,7 @@
    "type": "file",
    "label": "python/hk/native.py",
    "lang": "python",
-   "loc": 2659,
+   "loc": 2721,
    "owner": "python-sdk"
   },
   {
@@ -1392,7 +1392,7 @@
    "type": "file",
    "label": "python/hk/torch.py",
    "lang": "python",
-   "loc": 1181,
+   "loc": 1073,
    "owner": "python-sdk"
   },
   {
@@ -1504,7 +1504,7 @@
    "type": "file",
    "label": "src/appendix.zig",
    "lang": "zig",
-   "loc": 275,
+   "loc": 301,
    "owner": "appendix-lineage"
   },
   {
@@ -1528,7 +1528,7 @@
    "type": "file",
    "label": "src/c_api.zig",
    "lang": "zig",
-   "loc": 1879,
+   "loc": 1916,
    "owner": "c-abi"
   },
   {
@@ -1616,7 +1616,7 @@
    "type": "file",
    "label": "src/convert/stream_writer.zig",
    "lang": "zig",
-   "loc": 193,
+   "loc": 197,
    "owner": "converters"
   },
   {
@@ -1808,7 +1808,7 @@
    "type": "file",
    "label": "src/integrity.zig",
    "lang": "zig",
-   "loc": 77,
+   "loc": 126,
    "owner": "integrity"
   },
   {
@@ -1856,7 +1856,7 @@
    "type": "file",
    "label": "src/metadata.zig",
    "lang": "zig",
-   "loc": 446,
+   "loc": 462,
    "owner": "format-core"
   },
   {
@@ -1968,7 +1968,7 @@
    "type": "file",
    "label": "src/reader.zig",
    "lang": "zig",
-   "loc": 637,
+   "loc": 639,
    "owner": "format-core"
   },
   {
@@ -2096,7 +2096,7 @@
    "type": "file",
    "label": "src/transaction.zig",
    "lang": "zig",
-   "loc": 89,
+   "loc": 207,
    "owner": "transaction"
   },
   {
@@ -2128,7 +2128,7 @@
    "type": "file",
    "label": "src/writer.zig",
    "lang": "zig",
-   "loc": 293,
+   "loc": 305,
    "owner": "format-core"
   },
   {
@@ -2144,7 +2144,7 @@
    "type": "file",
    "label": "tests/cli_tests.zig",
    "lang": "zig",
-   "loc": 186,
+   "loc": 349,
    "owner": "cli"
   },
   {
@@ -2168,7 +2168,7 @@
    "type": "file",
    "label": "tests/roundtrip_tests.zig",
    "lang": "zig",
-   "loc": 1552,
+   "loc": 1862,
    "owner": "tests-suite"
   },
   {
@@ -2424,7 +2424,7 @@
    "type": "file",
    "label": "tools/hk_cli.zig",
    "lang": "zig",
-   "loc": 2064,
+   "loc": 2081,
    "owner": "cli"
   },
   {
@@ -4223,6 +4223,11 @@
    "type": "imports"
   },
   {
+   "s": "file:python/hk/adaptive/appendix.py",
+   "t": "file:python/hk/native.py",
+   "type": "imports"
+  },
+  {
    "s": "file:python/hk/adaptive/expansion_evaluator.py",
    "t": "file:python/hk/adaptive/growth.py",
    "type": "imports"
@@ -4538,6 +4543,11 @@
    "type": "imports"
   },
   {
+   "s": "file:src/appendix.zig",
+   "t": "file:src/transaction.zig",
+   "type": "imports"
+  },
+  {
    "s": "file:src/c_api.zig",
    "t": "file:src/adaptive.zig",
    "type": "imports"
@@ -4575,6 +4585,11 @@
   {
    "s": "file:src/c_api.zig",
    "t": "file:src/hf_mapper.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/c_api.zig",
+   "t": "file:src/integrity.zig",
    "type": "imports"
   },
   {
@@ -4775,6 +4790,11 @@
   {
    "s": "file:src/convert/stream_writer.zig",
    "t": "file:src/format.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/convert/stream_writer.zig",
+   "t": "file:src/integrity.zig",
    "type": "imports"
   },
   {
@@ -5085,11 +5105,6 @@
   {
    "s": "file:src/integrity.zig",
    "t": "file:src/format.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/integrity.zig",
-   "t": "file:src/platform.zig",
    "type": "imports"
   },
   {
@@ -5729,7 +5744,7 @@
   },
   {
    "s": "file:src/transaction.zig",
-   "t": "file:src/platform.zig",
+   "t": "file:src/integrity.zig",
    "type": "imports"
   },
   {
@@ -5930,6 +5945,16 @@
    "imports": 1
   },
   {
+   "s": "appendix-lineage",
+   "t": "python-sdk",
+   "imports": 1
+  },
+  {
+   "s": "appendix-lineage",
+   "t": "transaction",
+   "imports": 1
+  },
+  {
    "s": "backend-cuda-standalone",
    "t": "format-core",
    "imports": 1
@@ -5981,6 +6006,11 @@
   },
   {
    "s": "c-abi",
+   "t": "integrity",
+   "imports": 1
+  },
+  {
+   "s": "c-abi",
    "t": "kernels-legacy",
    "imports": 2
   },
@@ -6023,6 +6053,11 @@
    "s": "converters",
    "t": "format-core",
    "imports": 20
+  },
+  {
+   "s": "converters",
+   "t": "integrity",
+   "imports": 1
   },
   {
    "s": "converters",
@@ -6122,11 +6157,6 @@
   {
    "s": "integrity",
    "t": "format-core",
-   "imports": 1
-  },
-  {
-   "s": "integrity",
-   "t": "platform-mmap",
    "imports": 1
   },
   {
@@ -6291,7 +6321,7 @@
   },
   {
    "s": "transaction",
-   "t": "platform-mmap",
+   "t": "integrity",
    "imports": 1
   }
  ],

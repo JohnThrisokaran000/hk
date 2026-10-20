@@ -319,10 +319,32 @@ pub const MetadataMap = struct {
 };
 
 const platform = @import("platform.zig");
+const integrity = @import("integrity.zig");
+const transaction = @import("transaction.zig");
 
 /// Updates or inserts a key-value pair directly in the file's metadata table in-place
 /// without rewriting the multi-gigabyte tensor payload.
+///
+/// The edit is crash-safe and sealed: an existing seal must verify first (a mutation must not re-seal
+/// corruption that was already there), the metadata prefix is journaled, and the container seal is
+/// refreshed before the journal is dropped. The seal pass hashes the whole file in bounded memory, so
+/// the cost is O(file) time, not O(file) RAM.
 pub fn patchFileMetadataInPlace(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    key: []const u8,
+    val_str: []const u8,
+) !void {
+    _ = try transaction.recover(file_path, allocator);
+    try integrity.requireIntactSeal(file_path, allocator);
+    try transaction.begin(file_path, allocator, .metadata_prefix);
+    errdefer _ = transaction.recover(file_path, allocator) catch {};
+    try patchMetadataUnsealed(allocator, file_path, key, val_str);
+    try integrity.sealFile(file_path, allocator);
+    try transaction.commit(file_path, allocator);
+}
+
+fn patchMetadataUnsealed(
     allocator: std.mem.Allocator,
     file_path: []const u8,
     key: []const u8,

@@ -184,3 +184,166 @@ test "misuse exits non zero except bare help" {
         }
     }
 }
+
+// -- container integrity: `hk verify`, `hk repair`, sealed metadata edits -------------------------
+
+fn exists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn fileSize(path: []const u8) !u64 {
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    return (try f.stat(io)).size;
+}
+
+/// Applies `mask`/`value` to one byte: new = (old & ~clear) ^ flip.
+fn editByte(path: []const u8, offset: u64, clear: u8, flip: u8) !void {
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer f.close(io);
+    var b: [1]u8 = undefined;
+    if (try f.readPositionalAll(io, &b, offset) != 1) return error.UnexpectedEof;
+    b[0] = (b[0] & ~clear) ^ flip;
+    try f.writePositionalAll(io, &b, offset);
+}
+
+fn tamper(path: []const u8) !void {
+    try editByte(path, (try fileSize(path)) - 1, 0, 0xFF);
+}
+
+/// Clears header flag bit 9 (the SHA-256 seal) to make a file look like a pre-seal v1 container.
+fn makeLegacy(path: []const u8) !void {
+    try editByte(path, 9, 0x02, 0);
+}
+
+fn writeJournal(path: []const u8) !void {
+    const journal = try std.fmt.allocPrint(gpa, "{s}.hkmeta-journal", .{path});
+    defer gpa.free(journal);
+    var f = try std.Io.Dir.cwd().createFile(io, journal, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, "HKMJ-torn");
+}
+
+fn journalExists(path: []const u8) !bool {
+    const journal = try std.fmt.allocPrint(gpa, "{s}.hkmeta-journal", .{path});
+    defer gpa.free(journal);
+    return exists(journal);
+}
+
+test "converted models are sealed and verify cleanly" {
+    var m = try Models.make();
+    defer m.deinit();
+    const r = try hk(&.{ "verify", m.plain }, null);
+    defer r.deinit(gpa);
+    try std.testing.expect(r.ok());
+    try std.testing.expect(contains(r.stderr, "SHA-256 container checksum verified"));
+}
+
+test "verify exits non zero on a tampered file and metadata set refuses to bless it" {
+    var m = try Models.make();
+    defer m.deinit();
+    try tamper(m.plain);
+
+    const v = try hk(&.{ "verify", m.plain }, null);
+    defer v.deinit(gpa);
+    try std.testing.expect(!v.ok());
+    try std.testing.expect(contains(v.stderr, "container checksum mismatch"));
+
+    const set = try hk(&.{ "metadata", "set", m.plain, "k", "v" }, null);
+    defer set.deinit(gpa);
+    try std.testing.expect(!set.ok());
+
+    // The refused edit must not have re-sealed the damage.
+    const again = try hk(&.{ "verify", m.plain }, null);
+    defer again.deinit(gpa);
+    try std.testing.expect(!again.ok());
+    try std.testing.expect(!(try journalExists(m.plain)));
+}
+
+test "a legacy unsealed file verifies with a warning and is sealed by its first edit" {
+    var m = try Models.make();
+    defer m.deinit();
+    try makeLegacy(m.plain);
+
+    const v = try hk(&.{ "verify", m.plain }, null);
+    defer v.deinit(gpa);
+    try std.testing.expect(v.ok());
+    try std.testing.expect(contains(v.stderr, "legacy v1 file"));
+
+    const set = try hk(&.{ "metadata", "set", m.plain, "owner", "me" }, null);
+    defer set.deinit(gpa);
+    try std.testing.expect(set.ok());
+
+    const sealed = try hk(&.{ "verify", m.plain }, null);
+    defer sealed.deinit(gpa);
+    try std.testing.expect(sealed.ok());
+    try std.testing.expect(contains(sealed.stderr, "SHA-256 container checksum verified"));
+}
+
+test "metadata set keeps the seal valid" {
+    var m = try Models.make();
+    defer m.deinit();
+    const set = try hk(&.{ "metadata", "set", m.plain, "general.description", "a much longer description than before" }, null);
+    defer set.deinit(gpa);
+    try std.testing.expect(set.ok());
+    const v = try hk(&.{ "verify", m.plain }, null);
+    defer v.deinit(gpa);
+    try std.testing.expect(v.ok());
+    try std.testing.expect(contains(v.stderr, "SHA-256 container checksum verified"));
+}
+
+test "repair reports honestly in every state" {
+    var m = try Models.make();
+    defer m.deinit();
+
+    // Healthy and nothing to do.
+    {
+        const r = try hk(&.{ "repair", m.plain }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(r.ok());
+        try std.testing.expect(contains(r.stderr, "No interrupted edit found"));
+        try std.testing.expect(contains(r.stderr, "REPAIR COMPLETE"));
+    }
+
+    // A journal is left behind: verify flags it, repair discards it only because the seal proves the file intact.
+    try writeJournal(m.plain);
+    {
+        const v = try hk(&.{ "verify", m.plain }, null);
+        defer v.deinit(gpa);
+        try std.testing.expect(!v.ok());
+        try std.testing.expect(contains(v.stderr, "hk repair"));
+    }
+    {
+        const r = try hk(&.{ "repair", m.plain }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(r.ok());
+        try std.testing.expect(contains(r.stderr, "Discarded an incomplete edit journal"));
+        try std.testing.expect(!(try journalExists(m.plain)));
+    }
+
+    // Damaged file plus a torn journal: repair must refuse to guess and must keep the journal.
+    try tamper(m.plain);
+    try writeJournal(m.plain);
+    {
+        const r = try hk(&.{ "repair", m.plain }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(!r.ok());
+        try std.testing.expect(contains(r.stderr, "cannot be applied safely"));
+        try std.testing.expect(try journalExists(m.plain));
+    }
+
+    // Damaged file, no journal: repair says so and does not re-seal.
+    {
+        const j = try std.fmt.allocPrint(gpa, "{s}.hkmeta-journal", .{m.plain});
+        defer gpa.free(j);
+        try std.Io.Dir.cwd().deleteFile(io, j);
+        const r = try hk(&.{ "repair", m.plain }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(!r.ok());
+        try std.testing.expect(contains(r.stderr, "REPAIR INCOMPLETE"));
+        const v = try hk(&.{ "verify", m.plain }, null);
+        defer v.deinit(gpa);
+        try std.testing.expect(!v.ok());
+    }
+}

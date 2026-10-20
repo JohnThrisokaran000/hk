@@ -20,6 +20,7 @@ pub const HeaderFlags = struct {
     pub const IS_SHARDED: u32 = 1 << 6; // Multi-file sharding flag
     pub const RAW_WEIGHT_STORAGE: u32 = 1 << 7; // Raw unquantized IEEE weights for zero compute headroom
     pub const UNIVERSAL_PAGE_ALIGNED: u32 = 1 << 8; // Super-coalesced hardware page aligned (4KB / 16KB / 64KB)
+    pub const HAS_SHA256_CHECKSUM: u32 = 1 << 9; // checksum and reserved1[0..32] hold the container SHA-256
 };
 
 pub const StorageType = enum(u8) {
@@ -145,6 +146,7 @@ pub const FileHeader = extern struct {
     tensor_toc_size: u64 = 0,
     tensor_data_offset: u64 = 0,
     appendix_offset: u64 = 0,
+    /// First eight bytes of the SHA-256 digest when HAS_SHA256_CHECKSUM is set.
     checksum: u64 = 0,
     split_count: u16 = 1, // Sharding: total number of shards (>= 1)
     reserved1: [38]u8 = @as([38]u8, @splat(0)),
@@ -244,4 +246,3 @@ pub const AppendixRecord = struct {
     metrics: AppendixMetrics = .{},
     data: []const u8,
 };
-

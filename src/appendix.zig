@@ -1,18 +1,22 @@
 const std = @import("std");
 const format = @import("format.zig");
 const platform = @import("platform.zig");
+const integrity = @import("integrity.zig");
+const transaction = @import("transaction.zig");
 const FileHeader = format.FileHeader;
 const AppendixRecordHeader = format.AppendixRecordHeader;
 const AppendixRecord = format.AppendixRecord;
 const AppendixEntryType = format.AppendixEntryType;
 const AppendixMetrics = format.AppendixMetrics;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Crc32 = std.hash.Crc32;
 
 pub const AppendixError = error{
     InvalidMagic,
     InvalidAppendixOffset,
     InvalidRecordHeader,
     TruncatedRecord,
+    ChecksumMismatch,
     LineageMismatch,
     GenerationNotFound,
     FileNotFound,
@@ -69,6 +73,13 @@ pub const AppendixReader = struct {
             const data_payload = self.data[offset..data_end];
             offset = data_end;
 
+            // v1 writers historically stored zero in this reserved field.  Keep those
+            // records readable, while requiring an exact CRC-32 match for records
+            // written by checksum-aware producers.
+            if (rec_hdr.data_crc32 != 0 and Crc32.hash(data_payload) != rec_hdr.data_crc32) {
+                return AppendixError.ChecksumMismatch;
+            }
+
             // Align offset to 8 bytes for next record
             offset = std.mem.alignForward(usize, offset, 8);
 
@@ -124,8 +135,26 @@ pub const AppendixReader = struct {
     }
 };
 
-/// Append a new record directly to an existing HK file on disk (O(1) memory and O(record_size) I/O)
+/// Append a new record directly to an existing HK file on disk (O(record) memory and write I/O).
+///
+/// Crash-safe and sealed: an existing seal must verify first, the header is journaled so an interrupted
+/// append is rolled back to the previous sealed file, and the seal is refreshed before the journal is
+/// dropped. The seal pass hashes the whole file (bounded memory, O(file) read time).
 pub fn appendRecordToFile(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    record: AppendixRecord,
+) !void {
+    _ = try transaction.recover(file_path, allocator);
+    try integrity.requireIntactSeal(file_path, allocator);
+    try transaction.begin(file_path, allocator, .header_only);
+    errdefer _ = transaction.recover(file_path, allocator) catch {};
+    try appendRecordUnsealed(allocator, file_path, record);
+    try integrity.sealFile(file_path, allocator);
+    try transaction.commit(file_path, allocator);
+}
+
+fn appendRecordUnsealed(
     allocator: std.mem.Allocator,
     file_path: []const u8,
     record: AppendixRecord,
@@ -165,7 +194,7 @@ pub fn appendRecordToFile(
         .metric_custom = record.metrics.custom,
         .target_len = @intCast(record.target.len),
         .reserved = 0,
-        .data_crc32 = 0,
+        .data_crc32 = Crc32.hash(record.data),
         .data_size = record.data.len,
     };
 
@@ -201,12 +230,17 @@ pub fn appendRecordToFile(
     }
 }
 
-/// Rollback an HK file by truncating appendix records beyond target_generation in-place (O(1))
+/// Rollback an HK file by truncating appendix records beyond target_generation in-place.
+///
+/// The cut-off bytes cannot be restored cheaply, so the intended header and size are journaled and a crash
+/// is completed (rolled forward and re-sealed) rather than guessed at. An existing seal must verify first.
 pub fn rollbackToFile(
     allocator: std.mem.Allocator,
     file_path: []const u8,
     target_generation: u32,
 ) !void {
+    _ = try transaction.recover(file_path, allocator);
+    try integrity.requireIntactSeal(file_path, allocator);
     var region = try platform.mapOrReadFile(file_path, allocator);
     if (region.bytes.len < @sizeOf(FileHeader)) {
         region.deinit(allocator);
@@ -255,9 +289,13 @@ pub fn rollbackToFile(
     // Release mapping handle prior to truncating/writing
     region.deinit(allocator);
 
+    try transaction.beginRollForward(file_path, allocator, hdr_copy, truncate_size);
+    errdefer _ = transaction.recover(file_path, allocator) catch {};
     if (needs_header_reset) {
         try platform.writeBytesAtOffset(file_path, std.mem.asBytes(&hdr_copy), 0, allocator);
     }
 
     try platform.truncateFile(file_path, truncate_size, allocator);
+    try integrity.sealFile(file_path, allocator);
+    try transaction.commit(file_path, allocator);
 }

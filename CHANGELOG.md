@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+Work toward HK 2.0 (plan §150). Not released; no version number has been assigned.
+
+### Container integrity and crash safety (plan §4, §5)
+- **SHA-256 container seal** (header flag bit 9). Every producer seals: `HKWriter`, the streaming converters, `hk metadata set`, and appendix append/rollback. Older files stay readable and verify as *legacy*; a legacy file is sealed by its first edit.
+- **Edits verify first.** Modifying a file whose seal does not match is refused instead of re-sealing the damage.
+- **Crash-safe in-place edits.** A journal (`<file>.hkmeta-journal`) is synced before the first byte changes. Metadata patches and appendix appends roll back to the previous sealed file; appendix rollback is completed to the requested state. A torn journal is discarded only when the file's seal proves it untouched.
+- **Atomic writes.** `HKWriter` and the streaming converters write `<path>.partial`, seal, then rename.
+- **Bounded memory.** Sealing and verifying stream in 1 MiB chunks. Measured on a 2.1 GiB container: `hk verify` 1.27 s and `hk metadata set` 2.50 s at 13 MiB peak RSS (one machine, warm cache). Time is O(file).
+- Per-record CRC-32 on appendix payloads (`0` = legacy record); overflow-safe range validation in the reader.
+- New `hk repair`. **`hk verify`, `hk metadata set` and `hk rollback` now exit non-zero on failure** (they exited 0 before, so scripts could not detect a tampered file). `hk verify` also fails while an interrupted-edit journal is present.
+- C ABI additions: `hk_verify_integrity`, `hk_appendix_append_at` (explicit timestamp). `hk_appendix_append` now rejects an unknown entry type instead of casting the byte to an enum.
+- **Python:** `metadata_set`, `append_record` and `rollback_appendix` now run in the native library. The pure-Python implementations are removed (the metadata patcher left a stale seal and could corrupt an appendix; the appendix writers read the whole file into memory and rewrote it non-atomically). Without the native library they raise instead of falling back. `read_appendix` no longer loads the whole file when the native library is present.
+
+### Verification
+Unit tests 148/148 in Debug, ReleaseFast, `-Dcpu=x86_64_v3` and `-Dcpu=x86_64`; e2e 24/24; bindings 8 suites, 0 failed; Python 97 passed, 3 skipped (missing optional `openai`, `jax`, `tkinter`). Each new guard was disabled once to confirm its test fails. Not run: Windows, macOS, ARM.
+
+---
+
 ## [1.1.1] - 2026-10-05 - Engine rewrite: portable kernels, tiled prefill, Vulkan backend, Zig tooling, verified language bindings
 
 ### Engine and performance

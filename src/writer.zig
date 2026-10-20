@@ -3,6 +3,7 @@ const format = @import("format.zig");
 const metadata = @import("metadata.zig");
 const tensor_toc = @import("tensor_toc.zig");
 const platform = @import("platform.zig");
+const integrity = @import("integrity.zig");
 const buf = @import("buf.zig");
 
 pub const TensorPayload = struct {
@@ -86,13 +87,27 @@ pub const HKWriter = struct {
         try self.tensors.append(self.allocator, payload);
     }
 
-    /// Writes the complete .hk file to the specified path with 128-byte alignment
+    /// Writes the complete .hk file to the specified path with 128-byte alignment.
+    /// Output goes to `<path>.partial`, is sealed, then renamed into place, so an interrupted write never
+    /// leaves a truncated file under the final name. The seal pass re-reads the file (bounded memory).
     pub fn writeToFile(self: *HKWriter, path: []const u8) !void {
+        const io = std.Options.debug_io;
+        const cwd = std.Io.Dir.cwd();
+        const partial_path = try std.fmt.allocPrint(self.allocator, "{s}.partial", .{path});
+        defer self.allocator.free(partial_path);
+        errdefer cwd.deleteFile(io, partial_path) catch {};
+
+        try self.writeUnsealed(partial_path);
+        try integrity.sealFile(partial_path, self.allocator);
+        try cwd.rename(partial_path, cwd, path, io);
+    }
+
+    fn writeUnsealed(self: *HKWriter, path: []const u8) !void {
         const io = std.Options.debug_io;
         const cwd = std.Io.Dir.cwd();
 
         var file = try cwd.createFile(io, path, .{});
-        defer file.close(io);
+        errdefer file.close(io);
 
         var meta_writer = buf.BufferWriter.init(self.allocator);
         defer meta_writer.deinit();
@@ -273,6 +288,9 @@ pub const HKWriter = struct {
                 write_pos += r.len;
             }
         }
+
+        // Close before the caller re-opens the file to seal it (a second handle conflicts on Windows).
+        file.close(io);
     }
 };
 
