@@ -347,3 +347,49 @@ test "repair reports honestly in every state" {
         try std.testing.expect(!v.ok());
     }
 }
+
+// -- backend selection ---------------------------------------------------------------------------
+
+test "backend flag: cpu runs, an unknown value and a missing backend are refused with a reason" {
+    var m = try Models.make();
+    defer m.deinit();
+
+    {
+        const r = try hk(&.{ "run", m.plain, "hi", "-n", "2", "--temp", "0", "--backend", "cpu" }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(r.ok());
+        try std.testing.expect(!contains(r.stderr, "[gpu]"));
+    }
+    {
+        const r = try hk(&.{ "run", m.plain, "hi", "--backend", "bogus" }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(!r.ok());
+        try std.testing.expect(contains(r.stderr, "takes auto, cpu, vulkan or cuda"));
+    }
+    {
+        // Naming a device means "use it or fail"; this build has no CUDA backend, and it must say so.
+        const r = try hk(&.{ "run", m.plain, "hi", "-n", "2", "--backend", "cuda" }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(!r.ok());
+        try std.testing.expect(contains(r.stderr, "this build has no CUDA backend"));
+    }
+}
+
+test "HK_BACKEND is validated and overridden by the flag" {
+    var m = try Models.make();
+    defer m.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("HK_BACKEND", "nonsense");
+    {
+        const r = try proc.runEnv(gpa, io, &env, &.{ "run", m.plain, "hi", "-n", "2" }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(!r.ok());
+        try std.testing.expect(contains(r.stderr, "HK_BACKEND takes"));
+    }
+    {
+        const r = try proc.runEnv(gpa, io, &env, &.{ "run", m.plain, "hi", "-n", "2", "--temp", "0", "--backend", "cpu" }, null);
+        defer r.deinit(gpa);
+        try std.testing.expect(r.ok());
+    }
+}

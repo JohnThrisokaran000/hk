@@ -6,7 +6,7 @@
   "curated_nodes": 79,
   "curated_edges": 153,
   "file_nodes": 171,
-  "import_edges": 389,
+  "import_edges": 391,
   "unowned_files": 0,
   "status_counts": {
    "done": 8,
@@ -1522,7 +1522,7 @@
    "type": "file",
    "label": "src/backend/backend.zig",
    "lang": "zig",
-   "loc": 85,
+   "loc": 124,
    "owner": "backend-abstraction"
   },
   {
@@ -1538,7 +1538,7 @@
    "type": "file",
    "label": "src/backend/select.zig",
    "lang": "zig",
-   "loc": 222,
+   "loc": 245,
    "owner": "backend-abstraction"
   },
   {
@@ -2178,7 +2178,7 @@
    "type": "file",
    "label": "tests/cli_tests.zig",
    "lang": "zig",
-   "loc": 349,
+   "loc": 395,
    "owner": "cli"
   },
   {
@@ -2458,7 +2458,7 @@
    "type": "file",
    "label": "tools/hk_cli.zig",
    "lang": "zig",
-   "loc": 2081,
+   "loc": 2121,
    "owner": "cli"
   },
   {
@@ -4613,12 +4613,27 @@
   },
   {
    "s": "file:src/backend/backend.zig",
+   "t": "file:src/engine/config.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/backend.zig",
    "t": "file:src/engine/kv.zig",
    "type": "imports"
   },
   {
    "s": "file:src/backend/backend.zig",
+   "t": "file:src/engine/weights.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/backend.zig",
    "t": "file:src/vk/engine.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/backend.zig",
+   "t": "file:src/vk/vk.zig",
    "type": "imports"
   },
   {
@@ -5124,11 +5139,6 @@
   {
    "s": "file:src/engine/model.zig",
    "t": "file:src/vk/engine.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/engine/model.zig",
-   "t": "file:src/vk/vk.zig",
    "type": "imports"
   },
   {
@@ -6101,12 +6111,12 @@
   {
    "s": "backend-abstraction",
    "t": "backend-vulkan",
-   "imports": 2
+   "imports": 3
   },
   {
    "s": "backend-abstraction",
    "t": "engine",
-   "imports": 1
+   "imports": 3
   },
   {
    "s": "backend-abstraction",
@@ -6251,7 +6261,7 @@
   {
    "s": "engine",
    "t": "backend-vulkan",
-   "imports": 2
+   "imports": 1
   },
   {
    "s": "engine",

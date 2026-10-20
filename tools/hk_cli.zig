@@ -1738,10 +1738,37 @@ const usage_gen =
     \\      --threads N       compute threads (default: the number of physical cores)
     \\  -ngl, --gpu-layers N  run on a GPU (Vulkan) when N > 0 and the model fits; the whole model
     \\                        goes to the device, so any N above 0 means all layers. Also HK_GPU=1.
+    \\      --backend B       auto | cpu | vulkan | cuda (also HK_BACKEND). auto uses a device when the model
+    \\                        fits and says why when it does not; naming a device fails if it cannot be used.
     \\
 ;
 
 const GenMode = enum { run, chat };
+
+const BackendChoice = hk.backend.select.Choice;
+
+/// Parses a `--backend` / HK_BACKEND value, or says what is accepted.
+fn parseBackend(text: []const u8, what: []const u8) !BackendChoice {
+    return std.meta.stringToEnum(BackendChoice, text) orelse {
+        std.debug.print("Error: {s} takes auto, cpu, vulkan or cuda, not '{s}'\n", .{ what, text });
+        return error.BadUsage;
+    };
+}
+
+/// GPU settings from `-ngl`, `--backend` and the environment. An explicit device (`--backend vulkan`/`cuda`) means
+/// the load must fail if that device cannot be used; `auto` tries a device and quietly stays on the CPU otherwise.
+fn gpuSettings(gpu_layers: ?usize, backend: ?BackendChoice) !struct { gpu: hk.engine.model.GpuMode, backend: BackendChoice } {
+    var choice = backend;
+    if (choice == null) if (g_env) |e| if (e.get("HK_BACKEND")) |t| {
+        choice = try parseBackend(t, "HK_BACKEND");
+    };
+    const c = choice orelse return .{ .gpu = gpuMode(gpu_layers), .backend = .auto };
+    return switch (c) {
+        .cpu => .{ .gpu = .off, .backend = .cpu },
+        .auto => .{ .gpu = .auto, .backend = .auto },
+        .vulkan, .cuda => .{ .gpu = .on, .backend = c },
+    };
+}
 
 /// Whether to use a GPU: `-ngl N` with N above 0, or HK_GPU=1 in the environment.
 fn gpuMode(gpu_layers: ?usize) hk.engine.model.GpuMode {
@@ -1757,6 +1784,7 @@ const GenArgs = struct {
     chat_prompt: bool = false,
     max_tokens: usize = 128,
     gpu_layers: ?usize = null,
+    backend: ?BackendChoice = null,
     threads: usize = 0,
     params: hk.sampler.Params = .{},
 };
@@ -1807,6 +1835,8 @@ fn parseGenArgs(it: *std.process.Args.Iterator, mode: GenMode) error{BadUsage}!G
             g.max_tokens = try parseUint(it, flag, 1);
         } else if (std.mem.eql(u8, flag, "-ngl") or std.mem.eql(u8, flag, "--gpu-layers")) {
             g.gpu_layers = try parseUint(it, flag, 0);
+        } else if (std.mem.eql(u8, flag, "--backend")) {
+            g.backend = try parseBackend(try needValue(it, flag), "--backend");
         } else if (std.mem.eql(u8, flag, "--threads")) {
             g.threads = try parseUint(it, flag, 1);
         } else if (std.mem.eql(u8, flag, "--temp")) {
@@ -1849,7 +1879,8 @@ fn cmdRun(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !voi
         return error.BadUsage;
     };
 
-    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gpuMode(g.gpu_layers) });
+    const gs = try gpuSettings(g.gpu_layers, g.backend);
+    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend });
     defer l.close(allocator);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1887,7 +1918,8 @@ fn cmdRun(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !voi
 }
 
 fn cmdChat(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !void {
-    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gpuMode(g.gpu_layers) });
+    const gs = try gpuSettings(g.gpu_layers, g.backend);
+    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend });
     defer l.close(allocator);
 
     const io = std.Options.debug_io;
@@ -1970,6 +2002,7 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
     var slots: usize = 4;
     var opts = hk.engine.Options{};
     var alias: ?[]const u8 = null;
+    var backend_flag: ?BackendChoice = null;
     cfg.api_key = env.get("HK_API_KEY");
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--host")) {
@@ -1988,6 +2021,8 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
         } else if (std.mem.eql(u8, a, "-ngl") or std.mem.eql(u8, a, "--gpu-layers")) {
             const n = std.fmt.parseInt(usize, args.next() orelse return usageServe(), 10) catch return usageServe();
             opts.gpu = if (n > 0) .auto else .off;
+        } else if (std.mem.eql(u8, a, "--backend")) {
+            backend_flag = try parseBackend(args.next() orelse return usageServe(), "--backend");
         } else if (std.mem.eql(u8, a, "--api-key")) {
             cfg.api_key = args.next() orelse return usageServe();
         } else if (std.mem.eql(u8, a, "--alias")) {
@@ -2006,7 +2041,12 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
     // A batch has to hold at least one token per slot or decoding would starve.
     opts.n_batch = @max(opts.n_batch, slots);
     opts.gpu_slots = slots;
-    if (opts.gpu == .off and gpuMode(null) != .off) opts.gpu = .auto;
+    {
+        // `-ngl N` already set opts.gpu; --backend or the environment can still decide the target.
+        const gs = try gpuSettings(if (opts.gpu != .off) @as(?usize, 1) else null, backend_flag);
+        opts.gpu = gs.gpu;
+        opts.backend = gs.backend;
+    }
     const l = try Loaded.open(allocator, path, opts);
     defer l.close(allocator);
 

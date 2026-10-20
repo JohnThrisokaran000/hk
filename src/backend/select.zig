@@ -102,8 +102,10 @@ const headroom_tenths: u64 = 9;
 
 pub fn plan(in: Inputs) Plan {
     var p = Plan{ .n_ctx = in.n_ctx };
+    var asked_target_present = false;
     for (in.candidates) |c| {
         if (c.target == .cpu or !in.choice.wants(c.target)) continue;
+        asked_target_present = true;
         if (c.unusable) |why| {
             p.reject(c.target, .{ .unavailable = why });
             continue;
@@ -124,18 +126,31 @@ pub fn plan(in: Inputs) Plan {
         p.device_name = c.device_name;
         return p;
     }
+    // An explicit request for a device this build has no backend for must say so rather than fall to the CPU quietly.
+    if (!asked_target_present) switch (in.choice) {
+        .vulkan => p.reject(.vulkan, .{ .unavailable = "this build has no Vulkan backend" }),
+        .cuda => p.reject(.cuda, .{ .unavailable = "this build has no CUDA backend" }),
+        .auto, .cpu => {},
+    };
     return p;
+}
+
+/// The reason alone, e.g. "a weight format (q5_k) has no CUDA kernel yet".
+pub fn writeReason(r: Rejection, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    const api = caps.apiName(r.target);
+    switch (r.why) {
+        .unavailable => |msg| try w.writeAll(msg),
+        .unsupported_format => |t| try w.print("a weight format ({s}) has no {s} kernel yet", .{ @tagName(t), api }),
+        .does_not_fit => |f| try w.print("the model needs {d} MiB and only {d} MiB are free", .{ f.needed >> 20, f.free >> 20 }),
+    }
 }
 
 /// Writes one human-readable line per rejection, e.g. "CUDA: a weight format (q5_k) has no CUDA kernel yet".
 pub fn describe(p: *const Plan, w: *std.Io.Writer) std.Io.Writer.Error!void {
     for (p.rejected()) |r| {
-        const api = caps.apiName(r.target);
-        switch (r.why) {
-            .unavailable => |msg| try w.print("{s}: {s}\n", .{ api, msg }),
-            .unsupported_format => |t| try w.print("{s}: a weight format ({s}) has no {s} kernel yet\n", .{ api, @tagName(t), api }),
-            .does_not_fit => |f| try w.print("{s}: the model needs {d} MiB and only {d} MiB are free\n", .{ api, f.needed >> 20, f.free >> 20 }),
-        }
+        try w.print("{s}: ", .{caps.apiName(r.target)});
+        try writeReason(r, w);
+        try w.writeByte('\n');
     }
 }
 
@@ -197,6 +212,14 @@ test "an explicit choice restricts the search" {
     const none = plan(.{ .choice = .cpu, .n_ctx = 4096, .candidates = &cs });
     try std.testing.expectEqual(Target.cpu, none.target);
     try std.testing.expectEqual(@as(usize, 0), none.n_rejections);
+}
+
+test "asking for a device the build has no backend for is a recorded rejection" {
+    const cs = [_]Candidate{cand(.vulkan, 6000, 1000, 100)};
+    const p = plan(.{ .choice = .cuda, .n_ctx = 4096, .candidates = &cs });
+    try std.testing.expectEqual(Target.cpu, p.target);
+    try std.testing.expectEqual(@as(usize, 1), p.n_rejections);
+    try std.testing.expectEqual(Target.cuda, p.rejected()[0].target);
 }
 
 test "the exact fit boundary uses 90 percent of free memory" {

@@ -33,6 +33,8 @@ pub const Options = struct {
     gpu_slots: usize = 1,
     /// Which Vulkan device, or null for the best one.
     gpu_device: ?usize = null,
+    /// Which target may run the network. Only consulted when `gpu` is not `.off`.
+    backend: backend_mod.select.Choice = .auto,
 };
 
 pub const GpuMode = enum {
@@ -77,7 +79,7 @@ pub const Model = struct {
     cpu: cpu_mod.Cpu,
     /// The device backend, when the network runs on one (the CPU path lives in this struct).
     gpu: ?backend_mod.Device = null,
-    /// Why the GPU is not in use, when it was asked for and could not be.
+    /// Why the GPU is not in use, when it was asked for and could not be. Owned by the model.
     gpu_note: ?[]const u8 = null,
 
     pub fn init(
@@ -125,53 +127,50 @@ pub const Model = struct {
         if (opts.gpu != .off) m.tryGpu(opts, diag) catch |e| {
             if (opts.gpu == .on) {
                 diag.set("GPU requested but not usable: {s}", .{m.gpu_note orelse @errorName(e)});
+                m.setNote(null);
                 return error.GpuFailed;
             }
         };
         return m;
     }
 
-    /// Starts the GPU engine. On failure `gpu_note` says why and the model stays on the CPU.
+    fn setNote(self: *Model, text: ?[]const u8) void {
+        if (self.gpu_note) |old| self.allocator.free(old);
+        self.gpu_note = if (text) |t| self.allocator.dupe(u8, t) catch null else null;
+    }
+
+    /// Plans and starts the device engine. On failure `gpu_note` says why and the model stays on the CPU.
     fn tryGpu(self: *Model, opts: Options, diag: *Diag) !void {
         _ = diag;
-        // Reserve a context window that fits next to the weights.
-        var ctx = self.n_ctx;
-        const free: u64 = blk: {
-            var probe = @import("../vk/vk.zig").Context.init(self.allocator, opts.gpu_device) catch |e| {
-                self.gpu_note = switch (e) {
-                    error.NoVulkan => "no Vulkan driver found",
-                    error.NoDevice => "no Vulkan device found",
-                    error.MissingFeature => "the Vulkan device lacks a feature the kernels need",
-                    else => "the Vulkan device could not be opened",
-                };
-                return e;
-            };
-            defer probe.deinit();
-            if (probe.caps.is_cpu) {
-                self.gpu_note = "only a software Vulkan device exists";
-                return error.NoDevice;
-            }
-            break :blk probe.freeDeviceBytes();
+        const gopts = gpu_mod.Options{ .n_batch = self.n_batch, .n_ctx = self.n_ctx, .slots = opts.gpu_slots, .device = opts.gpu_device };
+        const candidates = [_]backend_mod.select.Candidate{
+            backend_mod.probeVulkan(self.allocator, &self.weights, self.cfg, gopts),
         };
-        const gopts = gpu_mod.Options{ .n_batch = self.n_batch, .n_ctx = ctx, .slots = opts.gpu_slots, .device = opts.gpu_device };
+        const plan = backend_mod.select.plan(.{ .choice = opts.backend, .n_ctx = self.n_ctx, .candidates = &candidates });
+
+        if (plan.target == .cpu) {
+            var buf: [320]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            if (plan.rejected().len > 0) {
+                backend_mod.select.writeReason(plan.rejected()[0], &w) catch {};
+            } else {
+                w.writeAll("the CPU was requested") catch {};
+            }
+            self.setNote(w.buffered());
+            return error.NoDevice;
+        }
+
         var go = gopts;
-        while (gpu_mod.Engine.bytesNeeded(&self.weights, self.cfg, go) > free / 10 * 9 and ctx > 512) {
-            ctx /= 2;
-            go.n_ctx = ctx;
-        }
-        if (gpu_mod.Engine.bytesNeeded(&self.weights, self.cfg, go) > free / 10 * 9) {
-            self.gpu_note = "the model does not fit in device memory";
-            return error.OutOfDeviceMemory;
-        }
+        go.n_ctx = plan.n_ctx;
         const eng = try self.allocator.create(gpu_mod.Engine);
         errdefer self.allocator.destroy(eng);
         eng.* = gpu_mod.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
-            self.gpu_note = switch (e) {
+            self.setNote(switch (e) {
                 error.UnsupportedType => "a weight format has no GPU kernel yet",
                 error.UnsupportedShape => "a tensor shape is not supported on the GPU",
                 error.OutOfDeviceMemory => "the model does not fit in device memory",
                 else => "the GPU engine failed to start",
-            };
+            });
             return e;
         };
         self.gpu = .{ .vulkan = eng };
@@ -185,6 +184,7 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         if (self.gpu) |g| g.destroy(self.allocator);
+        self.setNote(null);
         self.cpu.deinit();
         self.allocator.free(self.inv_freq);
         self.kv.deinit();

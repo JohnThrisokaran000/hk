@@ -15,6 +15,9 @@
 const std = @import("std");
 const kv_mod = @import("../engine/kv.zig");
 const vk_engine = @import("../vk/engine.zig");
+const vk = @import("../vk/vk.zig");
+const weights_mod = @import("../engine/weights.zig");
+const config_mod = @import("../engine/config.zig");
 
 pub const caps = @import("caps.zig");
 pub const select = @import("select.zig");
@@ -24,6 +27,42 @@ pub const Kind = enum { vulkan };
 pub const Error = vk_engine.Error;
 
 pub const Item = kv_mod.Item;
+
+/// Probes the Vulkan device for the planner: usability, free memory, whether the model's formats have kernels, and
+/// what the model needs (linear in the context, so two engine queries give the exact slope).
+pub fn probeVulkan(
+    allocator: std.mem.Allocator,
+    w: *const weights_mod.Weights,
+    cfg: config_mod.Config,
+    opts: vk_engine.Options,
+) select.Candidate {
+    var cand = select.Candidate{
+        .target = .vulkan,
+        .need = .{ .base = 0, .per_ctx = 0 },
+        .unsupported = caps.firstUnsupported(.vulkan, w),
+    };
+    var probe = vk.Context.init(allocator, opts.device) catch |e| {
+        cand.unusable = switch (e) {
+            error.NoVulkan => "no Vulkan driver found",
+            error.NoDevice => "no Vulkan device found",
+            error.MissingFeature => "the Vulkan device lacks a feature the kernels need",
+            else => "the Vulkan device could not be opened",
+        };
+        return cand;
+    };
+    defer probe.deinit();
+    if (probe.caps.is_cpu) {
+        cand.unusable = "only a software Vulkan device exists";
+        return cand;
+    }
+    cand.free_bytes = probe.freeDeviceBytes();
+    var o = opts;
+    o.n_ctx = 0;
+    const base = vk_engine.Engine.bytesNeeded(w, cfg, o);
+    o.n_ctx = 1;
+    cand.need = .{ .base = base, .per_ctx = vk_engine.Engine.bytesNeeded(w, cfg, o) - base };
+    return cand;
+}
 
 pub const Device = union(Kind) {
     vulkan: *vk_engine.Engine,

@@ -26,6 +26,7 @@ Generates text. Text goes to standard output, statistics to standard error, so t
 | `--seed N` | random seed, `0` uses the clock | 0 |
 | `--threads N` | compute threads | physical cores |
 | `-ngl, --gpu-layers N` | run on a GPU (Vulkan) when N > 0; also `HK_GPU=1` | CPU |
+| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda` (also `HK_BACKEND`). `auto` uses a device when the model fits and prints why when it does not. Naming `vulkan` or `cuda` means *use it or fail*: an unusable device is an error, never a silent CPU run. **`cuda` is not implemented yet**; it fails with "this build has no CUDA backend" | follows `-ngl` |
 
 Every flag is checked before the model is opened, and an unknown or malformed one is an error, never a silent default. With `--temp 0` the output is deterministic.
 
@@ -89,6 +90,7 @@ Tensor names are kept as they are in the container, so a model converted from GG
 | `HK_HOME` | model cache directory |
 | `HF_TOKEN`, `HF_ENDPOINT`, `HK_HTTP_BACKOFF_MS` | downloads, see [Downloading Models](Downloading-Models.md) |
 | `HK_GPU=1` | use the GPU when possible, without `-ngl` |
+| `HK_BACKEND` | same values as `--backend`; the flag wins |
 | `HK_KERNELS=<level>` | force an instruction set level (for example `avx2` or `generic`); useful for testing and measuring |
 | `HK_THREADS=N` | thread count for the developer tools |
 | `HK_API_KEY` | API key for `hk serve` |

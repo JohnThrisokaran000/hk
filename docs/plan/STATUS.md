@@ -163,10 +163,10 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 | 64–66 | Android, iOS, macOS | NOT STARTED / cross-compile only | macOS and Windows targets cross-compile in CI; never run. Java JNI glue exists (`bindings/java/jni`), not an Android package |
 | 67–69 | Linux / Windows / BSD | PARTIAL | Linux is the only run platform; Windows/macOS cross-compiled |
 | 70–71 | WASM/WebGPU, embedded | NOT STARTED | |
-| 72 | Backend auto-selection | PARTIAL | CPU vs Vulkan by `-ngl`/`HK_GPU` and free-VRAM check; no capability/benchmark-driven selection |
+| 72 | Backend auto-selection | PARTIAL — uncommitted-branch `feat/hk-2.0-backends` | `backend/select.zig`: pure planner (candidates in preference order, rejection reasons, context shrinks to fit 90 % of free memory); `--backend auto|cpu|vulkan|cuda` / `HK_BACKEND`, explicit device = use-or-fail. 8 planner tests + 2 e2e, guards mutation-checked. Only Vulkan is probed (no CUDA engine yet); no benchmark-driven choice |
 | 73 | Heterogeneous / partial offload | PARTIAL | Python `offload.py` planner (torch-based); **Vulkan engine does not support partial layer offload** |
 | 74–75 | Multi-GPU, distributed inference | NOT STARTED | |
-| 137 | Automatic fallback | PARTIAL | GPU→CPU fallback with a printed reason when format/VRAM doesn't fit; no tiered fallback |
+| 137 | Automatic fallback | PARTIAL | GPU→CPU fallback with a printed reason when format/VRAM doesn't fit (reasons now come from the planner and carry numbers); `backend/caps.zig` is the capability table (formats per target); no per-operator table, no tiered fallback |
 
 ### Runtime services (§76–§84, §131–§136, §141–§142)
 
@@ -216,7 +216,7 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 
 | Milestone | Done | Not done |
 |:--|:--|:--|
-| **2.0 Unified Runtime** | CPU backend largely finalized for 3 arch families; Vulkan runs under `-ngl` | backend abstraction (engine calls `gpu_mod` directly), CUDA engine/prefill/decode/attention, unified memory planner, auto device selection |
+| **2.0 Unified Runtime** | CPU executor extracted (`engine/cpu_backend.zig`); `backend.Device` seam with Vulkan under it; capability table; device planner + `--backend` | CUDA engine/prefill/decode/attention (Zig-authored kernels via nvptx64 — spike passed), memory planner beyond fit-or-shrink (no partial offload), kernel-stack unification, §148 compatibility contract |
 | **2.1 HW Acceleration** | — | everything (no Tensor Cores, sparse TC, ROCm, Metal, coop matrices, XPU, DirectML, mobile) |
 | **2.2 Model Compat** | Llama/Mistral(no SWA)/Qwen2/Qwen3 execute | Gemma, Phi, SWA, MoE, SSM, multimodal, descriptor-driven registry |
 | **2.3 Server Runtime** | slot scheduler, shared prompt cache | continuous batching proper, paged KV, speculative decoding, distributed, multi-GPU |
