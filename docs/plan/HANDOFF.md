@@ -17,11 +17,14 @@ points at `030ba32`. The release workflow (run `39485175463`) finished green: na
 Release, PyPI `hknt` 2.0.0 (confirmed with `pip index versions hknt`), npm `hkntf`, crates.io `hknt`, NuGet and GitHub Packages. Not checked by installing each package.
 CI on the PR head `16f765e` was green on all jobs; CI on `main` after the merge: see the Actions tab.
 
-`main` requires signed commits and PRs, so every later change needs a PR the owner merges. Branch `docs/readme-landing` (this change) cleans the repository root
-(removed `PERFORMANCE_REPORT_KERNELS.md`, the four `run_*_demo.py` scripts, `install.sh`/`install.ps1` (pinned to v1.0.0 and to asset names the release does not
-publish), `models/.gitkeep`; `CONTEXT.md` moved to `docs/plan/`), commits `graphify-out/` (graph, report, html, manifest; the cache stays ignored), and
-rewrites README/CONTRIBUTING. Docs-only: no new tag. **Open decision for the owner:** the GitHub "About" blurb and topics still describe the old project ("137+ architecture support");
-changing them is a repository setting (`gh repo edit`), not done.
+`main` requires signed commits and PRs. The owner authorised signed commits on their behalf (2026-10-21): an SSH signing key (`~/.ssh/github_signing_ed25519`, no passphrase,
+registered on their GitHub account) signs every commit and tag in this clone (`gpg.format=ssh`, `commit.gpgsign`); GitHub shows them as verified. The owner also allowed `--admin` for PR #6 only;
+ask before bypassing the ruleset again.
+
+PR #6 (merged 2026-10-21, `cf4ca26`, docs only, no new tag, its CI had not finished when it was merged) cleaned the repository root (removed `PERFORMANCE_REPORT_KERNELS.md`, the four `run_*_demo.py` scripts,
+`install.sh`/`install.ps1` (pinned to v1.0.0 and to asset names the release does not publish), `models/.gitkeep`; `CONTEXT.md` moved to `docs/plan/`), committed `graphify-out/`
+(graph, report, html, manifest; cache ignored), and rewrote README/CONTRIBUTING. The GitHub About blurb and topics were updated with `gh repo edit` (no more "137+ architecture support").
+Rebuild the graphs after code or doc moves: `graphify update .` and `python3 docs/graph/gen_graph.py`.
 
 **Next: 2.1 hardware acceleration** (branch `feat/hk-2.1-hardware`, off `16f765e`, no commits yet). Candidates: ROCm/HIP (Zig can emit amdgcn code objects: `zig build-lib -dynamic
 -target amdgcn-amdhsa -mcpu gfx1100` gives a valid object; `cuda_device.zig` primitives need an arch abstraction and wave-size handling), Metal, Intel XPU/DirectML (probably documented as
@@ -149,3 +152,4 @@ Plan: `~/.claude/plans/snug-foraging-quasar.md` (approved 2026-10-20). Checklist
 ### 2026-10-21 — 2.0.0 released; root cleanup
 - Owner merged PR #5 (override), I tagged `v2.0.0` on `030ba32`; release workflow green (see Now §0). Verified before tagging: `origin/main` tree equals the tested tree; Debug/ReleaseFast/v3/baseline 196/196, e2e 26/26, bindings 8 suites, pytest 97 passed / 3 skipped.
 - Branch `docs/readme-landing`: repo root cleaned, `graphify-out/` committed, README/CONTRIBUTING/HANDOFF rewritten; `gen_graph.py --check` is run before the commit. Not run: a fresh `pip install hknt==2.0.0` / `npm install hkntf` smoke test.
+- Merged PR #6 (admin bypass, owner-authorised for that PR) and updated the About blurb. Refreshed both graphs (`graphify update .`: 5,742 nodes, 11,135 edges; `gen_graph.py --check` 0 errors). CI on `main` after the merge was still running when this was written.
