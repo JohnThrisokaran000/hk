@@ -8,9 +8,11 @@ import os
 import struct
 import hashlib
 import time
+import zlib
 from enum import IntEnum
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Union
+
 
 class AppendixEntryType(IntEnum):
     LORA_ADAPTER = 0x01
@@ -44,8 +46,33 @@ class AppendixRecord:
     metrics: AppendixMetrics = field(default_factory=AppendixMetrics)
 
 HEADER_SIZE = 128
+HEADER_FLAGS_OFFSET = 8
+HEADER_CHECKSUM_OFFSET = 80
+HEADER_SHA256_OFFSET = 90
+HEADER_SHA256_SIZE = 32
+FLAG_HAS_SHA256_CHECKSUM = 1 << 9
 REC_HEADER_FORMAT = "<BBHIQ32sffffHHIQ" # 80 bytes (entry_type, flags, name_len, generation, timestamp, parent_hash[32], loss, acc, pass, custom, target_len, reserved, crc32, data_size)
 REC_HEADER_SIZE = 80
+
+def verify_container_integrity(file_bytes: bytes) -> Optional[bool]:
+    """Returns True/False for a sealed container, or None for legacy files."""
+    if len(file_bytes) < HEADER_SIZE:
+        raise ValueError("File is smaller than HK header size")
+    flags = struct.unpack_from("<I", file_bytes, HEADER_FLAGS_OFFSET)[0]
+    if not flags & FLAG_HAS_SHA256_CHECKSUM:
+        return None
+
+    expected_compact = struct.unpack_from("<Q", file_bytes, HEADER_CHECKSUM_OFFSET)[0]
+    expected_full = file_bytes[HEADER_SHA256_OFFSET : HEADER_SHA256_OFFSET + HEADER_SHA256_SIZE]
+    h = hashlib.sha256()
+    h.update(file_bytes[:HEADER_CHECKSUM_OFFSET])
+    h.update(b"\x00" * 8)
+    h.update(file_bytes[HEADER_CHECKSUM_OFFSET + 8 : HEADER_SHA256_OFFSET])
+    h.update(b"\x00" * HEADER_SHA256_SIZE)
+    h.update(file_bytes[HEADER_SHA256_OFFSET + HEADER_SHA256_SIZE :])
+    computed = h.digest()
+    return (expected_compact == int.from_bytes(computed[:8], "little")
+            and expected_full == computed)
 
 def compute_parent_hash(data: bytes, name: str = "", target: str = "") -> bytes:
     """Computes SHA-256 digest of record payload, including optional name and target."""
@@ -58,26 +85,41 @@ def compute_parent_hash(data: bytes, name: str = "", target: str = "") -> bytes:
     return h.digest()
 
 def read_appendix(file_path: str) -> List[AppendixRecord]:
-    """Parses all appendix records from an HK container."""
+    """Parses all appendix records from an HK container.
+
+    Only the appendix region is held in memory; the seal (if present) is checked by streaming the file.
+    """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"HK file not found: {file_path}")
 
+    from ..native import is_native_available, native_verify_integrity
+
     with open(file_path, "rb") as f:
+        header = f.read(HEADER_SIZE)
+        if len(header) < HEADER_SIZE:
+            raise ValueError("File is smaller than HK header size")
+        if header[:4] != b"HKNT":
+            raise ValueError(f"Invalid HK magic: {header[:4]!r}")
+    if is_native_available():
+        # Streamed in Zig: bounded memory regardless of model size.
+        if native_verify_integrity(file_path) is False:
+            raise ValueError("Container checksum mismatch")
+    else:
+        # No native library: verify in Python, which holds the whole file in memory (flagged limitation).
+        with open(file_path, "rb") as f:
+            if verify_container_integrity(f.read()) is False:
+                raise ValueError("Container checksum mismatch")
+
+    with open(file_path, "rb") as f:
+        appendix_offset = struct.unpack_from("<Q", header, 72)[0]
+        f.seek(0, os.SEEK_END)
+        if appendix_offset == 0 or appendix_offset >= f.tell():
+            return []
+        f.seek(appendix_offset)
         file_bytes = f.read()
 
-    if len(file_bytes) < HEADER_SIZE:
-        raise ValueError("File is smaller than HK header size")
-
-    magic = file_bytes[0:4]
-    if magic != b"HKNT":
-        raise ValueError(f"Invalid HK magic: {magic}")
-
-    appendix_offset = struct.unpack_from("<Q", file_bytes, 72)[0]
-    if appendix_offset == 0 or appendix_offset >= len(file_bytes):
-        return []
-
     records = []
-    offset = appendix_offset
+    offset = 0
 
     while offset + REC_HEADER_SIZE <= len(file_bytes):
         hdr_tuple = struct.unpack_from(REC_HEADER_FORMAT, file_bytes, offset)
@@ -92,6 +134,12 @@ def read_appendix(file_path: str) -> List[AppendixRecord]:
         offset += target_len
 
         payload = file_bytes[offset : offset + data_size]
+        if len(payload) != data_size:
+            raise ValueError("Truncated appendix record payload")
+        # A zero CRC is the legacy v1 representation and deliberately remains
+        # readable. New writers always emit CRC-32/ISO-HDLC for the payload.
+        if crc32 != 0 and (zlib.crc32(payload) & 0xFFFFFFFF) != crc32:
+            raise ValueError("Appendix record payload checksum mismatch")
         offset += data_size
 
         # Align to 8 bytes
@@ -113,110 +161,46 @@ def read_appendix(file_path: str) -> List[AppendixRecord]:
     return records
 
 def append_record(file_path: str, record: AppendixRecord) -> None:
-    """Appends an evolutionary record directly to an HK container."""
+    """Appends an evolutionary record to an HK container in place, in Zig.
+
+    The native routine verifies the existing seal first, journals the edit so a crash rolls back to the
+    previous sealed file (``hk repair``), appends O(record) bytes, and re-seals with one streamed hash pass.
+    """
+    from ..native import is_native_available, native_appendix_append
+
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"HK file not found: {file_path}")
+    if not is_native_available():
+        raise RuntimeError("append_record needs the native hk library (it owns the container seal and edit journal).")
 
-    with open(file_path, "rb") as f:
-        file_bytes = bytearray(f.read())
-
-    if len(file_bytes) < HEADER_SIZE:
-        raise ValueError("File is smaller than HK header size")
-
-    magic = file_bytes[0:4]
-    if magic != b"HKNT":
-        raise ValueError(f"Invalid HK magic: {magic}")
-
-    flags = struct.unpack_from("<I", file_bytes, 8)[0]
-    appendix_offset = struct.unpack_from("<Q", file_bytes, 72)[0]
-
-    # If first appendix record, position at end of file (8-byte aligned)
-    file_size = len(file_bytes)
-    if appendix_offset == 0:
-        aligned_append = (file_size + 7) & ~7
-        if aligned_append > file_size:
-            file_bytes.extend(b"\x00" * (aligned_append - file_size))
-        appendix_offset = len(file_bytes)
-        struct.pack_into("<Q", file_bytes, 72, appendix_offset)
-        flags |= 0x02  # HAS_APPENDIX
-        struct.pack_into("<I", file_bytes, 8, flags)
-    else:
-        # Align end of existing file to 8 bytes
-        aligned_end = (file_size + 7) & ~7
-        if aligned_end > file_size:
-            file_bytes.extend(b"\x00" * (aligned_end - file_size))
-
-    name_bytes = record.name.encode("utf-8")
-    target_bytes = record.target.encode("utf-8")
     ts = record.timestamp if record.timestamp > 0 else int(time.time())
-
-    hdr = struct.pack(
-        REC_HEADER_FORMAT,
-        int(record.entry_type),
-        record.flags,
-        len(name_bytes),
-        record.generation,
-        ts,
-        record.parent_hash if len(record.parent_hash) == 32 else b"\x00" * 32,
-        record.metrics.loss,
-        record.metrics.accuracy,
-        record.metrics.pass_rate,
-        record.metrics.custom,
-        len(target_bytes),
-        0,
-        0,
-        len(record.data),
+    ok = native_appendix_append(
+        file_path, int(record.entry_type), record.flags, record.name, record.target, record.generation,
+        record.parent_hash,
+        (record.metrics.loss, record.metrics.accuracy, record.metrics.pass_rate, record.metrics.custom),
+        record.data, ts,
     )
-
-    file_bytes.extend(hdr)
-    file_bytes.extend(name_bytes)
-    file_bytes.extend(target_bytes)
-    file_bytes.extend(record.data)
-
-    # 8-byte padding
-    rem = len(file_bytes) % 8
-    if rem != 0:
-        file_bytes.extend(b"\x00" * (8 - rem))
-
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
+    if not ok:
+        raise RuntimeError(
+            f"append_record({file_path!r}) was refused by the native appendix writer; the file was left "
+            "unchanged (failed seal check or I/O error). Run `hk verify` / `hk repair` on it."
+        )
 
 write_appendix_record = append_record
 
 def rollback_appendix(file_path: str, target_generation: int) -> None:
-    """Rolls back the HK container to target_generation."""
-    records = read_appendix(file_path)
-    with open(file_path, "rb") as f:
-        file_bytes = bytearray(f.read())
+    """Rolls back the HK container to target_generation (truncates later records in place), in Zig."""
+    from ..native import is_native_available, native_appendix_rollback
 
-    appendix_offset = struct.unpack_from("<Q", file_bytes, 72)[0]
-    if appendix_offset == 0:
-        return
-
-    if target_generation <= 0:
-        # Clear all appendix entries
-        struct.pack_into("<Q", file_bytes, 72, 0)
-        flags = struct.unpack_from("<I", file_bytes, 8)[0]
-        flags &= ~0x02
-        struct.pack_into("<I", file_bytes, 8, flags)
-        with open(file_path, "wb") as f:
-            f.write(file_bytes[:appendix_offset])
-        return
-
-    # Find truncation boundary
-    offset = appendix_offset
-    truncate_pos = offset
-    for r in records:
-        if r.generation <= target_generation:
-            rec_len = REC_HEADER_SIZE + len(r.name.encode("utf-8")) + len(r.target.encode("utf-8")) + len(r.data)
-            rec_len_aligned = (rec_len + 7) & ~7
-            offset += rec_len_aligned
-            truncate_pos = offset
-        else:
-            break
-
-    with open(file_path, "wb") as f:
-        f.write(file_bytes[:truncate_pos])
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"HK file not found: {file_path}")
+    if not is_native_available():
+        raise RuntimeError("rollback_appendix needs the native hk library (it owns the container seal and edit journal).")
+    if not native_appendix_rollback(file_path, max(int(target_generation), 0)):
+        raise RuntimeError(
+            f"rollback_appendix({file_path!r}) was refused by the native appendix writer; the file was left "
+            "unchanged (failed seal check or I/O error). Run `hk verify` / `hk repair` on it."
+        )
 
 def verify_lineage(records_or_path: Union[List[AppendixRecord], str]) -> bool:
     """Cryptographically validates SHA-256 parent hash chaining across generations."""
@@ -282,4 +266,3 @@ class AppendixManager:
 
     def verify(self) -> bool:
         return verify_lineage(self.get_records())
-

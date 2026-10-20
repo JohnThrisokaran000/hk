@@ -60,3 +60,4 @@ Thumbs.db
 
 # Fixtures written by the binding tests
 test_*.hk
+graphify-out/

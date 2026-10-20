@@ -20,7 +20,7 @@ pub const Session = struct {
         return .{
             .allocator = allocator,
             .model = model,
-            .kv = try model_mod.KvCache.init(allocator, model.cfg, @min(n_ctx, model.n_ctx)),
+            .kv = try model.newKv(allocator, n_ctx),
         };
     }
 

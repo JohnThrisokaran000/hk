@@ -6,7 +6,7 @@
 Yes. The CPU engine is the main one. It picks the fastest kernels your processor supports when it starts (see [Hardware and Kernels](Hardware-and-Kernels.md)).
 
 ### How do I use the GPU?
-Pass `-ngl 99` (any number above 0) or set `HK_GPU=1`. hk prints either `[gpu] running on <device> (Vulkan)` or why it did not: no Vulkan driver, no usable device, a format the GPU cannot decode yet, or a model that does not fit in device memory. Partial offload is not implemented, so a model larger than your VRAM runs on the CPU.
+Nothing to do: hk uses a CUDA or Vulkan device when there is one that takes the model and prints `[gpu] running on <device> (CUDA)` (or Vulkan). If a device exists but could not take the model it prints why (a format the device cannot decode yet, or not enough memory) and runs on the CPU; with no device it says nothing. A model larger than your video memory runs its leading layers on the device and the rest on the CPU; `-ngl N` sets the number of layers yourself, `-ngl 0` or `--backend cpu` forces the CPU, and `--backend cuda|vulkan` means "use it or fail".
 
 ### Does it work on Apple Silicon?
 It builds for macOS on ARM and uses the NEON kernels (with the dot product extension when the chip has it). That path has been cross compiled and its portable logic tested, but **not run on a Mac**. There is no Metal backend. If you try it, `zig build test -Doptimize=ReleaseFast` and `hk run model.hk "hi" --temp 0` are the two commands that tell us whether it works; please report what they print.

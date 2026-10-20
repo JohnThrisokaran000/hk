@@ -201,8 +201,7 @@ test "exact fallback dot kernels match decode then float dot" {
 
 test "every type the loaders accept has a dot kernel" {
     // Guards against adding a storage type to `supported` without handling it in `dotRow`.
-    inline for (@typeInfo(format.StorageType).@"enum".fields) |f| {
-        const t: format.StorageType = @enumFromInt(f.value);
+    inline for (comptime std.enums.values(format.StorageType)) |t| {
         if (vecdot.supported(t)) try std.testing.expect(quant.info(t) != null);
     }
 }

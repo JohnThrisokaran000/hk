@@ -1,6 +1,6 @@
 # HK — Plan vs. Reality (STATUS)
 
-**Measured against:** commit `43cf891` (v1.1.1 + fixes) **plus the uncommitted working tree** as of 2026-10-06.
+**Measured against:** HK **2.0.0** (2026-10-21). Rows not touched by the 2.0 work still describe v1.1.1 + fixes as measured on 2026-10-06.
 **Target:** [MASTER_PLAN.md](MASTER_PLAN.md) (§N below = plan section).
 **Rule for this file:** every row is backed by code or a measurement someone looked at. Where a claim
 was *not* verified, the row says `unverified`. Update a row in the same change that changes its truth.
@@ -21,9 +21,9 @@ user-facing claims; if this file and the code disagree, **the code wins** — fi
 
 ## Baseline measurements (2026-10-06, this machine: Ryzen 7 7445HS, RTX 3050 6GB Laptop, Linux 7.2, Zig 0.16.0)
 
-- `zig build test` (Debug, kernels=fallback): **17/17 steps, 138/138 tests passed** in ~4 s, including the uncommitted integrity/transaction work.
+- `zig build test`: **148/148** in Debug, ReleaseFast, `-Dcpu=x86_64_v3` and `-Dcpu=x86_64` (2026-10-20); `test-e2e` 24/24; `tests/bindings/run.sh` 8 suites, 0 failed; `pytest tests` 97 passed, 3 skipped (no `openai`, `jax`, `tkinter`) using a scratch venv with CPU torch.
   The `hk-cuda-tests` (7) pass; **not checked** whether they exercised the real GPU or skipped.
-- Counts: ~158 Zig `test` blocks, ~100 Python `def test_`. **Python suite was not run in this session** (`numpy`/`torch` not installed in the system Python used here) — treat Python status as `unverified this session`.
+- Counts: ~158 Zig `test` blocks, ~100 Python `def test_`. The Python suite was run on 2026-10-20 (see above) in a scratch venv; the system Python has no `numpy`/`torch`.
 - Performance (from `benchmarks/results.md`, CPU, 6 threads, 2026-10-05): prefill 91–240 % of llama.cpp (faster on 8/10 models), decode 92–100 %, private memory 5–9× lower. Vulkan GPU: ~25–40 % of llama.cpp prefill, 65–80 % decode, one NVIDIA card only.
 
 ## Two kernel stacks — read before touching any kernel
@@ -31,7 +31,7 @@ user-facing claims; if this file and the code disagree, **the code wins** — fi
 | Stack | Path | Used by | Notes |
 |:--|:--|:--|:--|
 | **Engine** (live) | `src/engine/*` → `src/quant/*` + `src/kernels/*` (ISA-dispatched, `kernels_impl.zig` compiled per level) → `src/vk/*` | `hk run/chat/serve`, Zig tests | Integer-dot-product design, register-tiled prefill, split-KV decode attention |
-| **Legacy** | `src/c_api.zig` → `src/tensor_ops.zig` + `src/quantization.zig` | Python `native.py`, all language bindings, converters, `reader.dequantizeToF32` | Holds the v1.1.0 optimizations (`gemmF32` zero-skip, RoPE angle table, FP8 E4M3 LUT, 4-row tiled GEMV). Not what the engine executes. |
+| **C ABI** (was a second "legacy" stack until 2026-10-20) | `src/c_api.zig` → `src/engine/abi_ops.zig` (engine kernels) + `src/quant/{compat,encode,research}.zig` + `src/ops.zig` | Python `native.py`, all language bindings, converters, `reader.dequantizeToF32` | Same CPU kernels as the engine. The old `tensor_ops.zig`/`quantization.zig` were deleted; their single-threaded gemv/gemm are replaced (Q8_0 gemv 1.7x and f32 gemm 3x faster in a one-run check, f32 gemv equal). |
 | **Standalone CUDA** | `src/cuda.zig`, `src/cuda/*.cu`, `*.ptx` | `tools/hk_gpu_bench.zig`, `tests/test_cuda.zig` only | **Not wired into the engine or the C API.** Docs say "no CUDA-in-engine". |
 
 Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20) mostly refer to the *legacy* stack. Whether they should be re-expressed in the engine stack is an open design question — see HANDOFF.
@@ -49,14 +49,14 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 | 3 | Virtual: null_ref, shared_ref | DONE | writer handles both (tied weights) |
 | 3 | Virtual: lora_ref | STORAGE-ONLY | enum value exists; engine ignores appendix/adapters |
 | 3 | Virtual: delta_ref, external_ref | NOT STARTED | not in `StorageType` |
-| 4 | Container checksum | **PARTIAL — uncommitted** | `src/integrity.zig`: SHA-256 over whole file, header flag bit 9, sealed after every writer/mutation; `hk verify` reports it; Python mirror in `adaptive/appendix.py`. Legacy files without it stay readable (`legacy_missing`) |
-| 4 | Appendix record integrity | PARTIAL — uncommitted | CRC-32 per record payload; `0` = legacy record |
+| 4 | Container checksum | **DONE (checksum) — uncommitted; signatures NOT STARTED** | `src/integrity.zig`: streamed SHA-256, header flag bit 9, single-header-write seal; every producer seals (HKWriter, StreamWriter, metadata patch, appendix append/rollback); edits refuse a mismatching seal; `hk verify` exits non-zero, 13 MiB peak RSS on a 2.1 GiB file. Python goes through the C ABI (`hk_verify_integrity`). Legacy files verify as `legacy_missing`. 10 Zig tests + 5 e2e tests, each guard mutation-checked. Not run: Windows/macOS/ARM |
+| 4 | Appendix record integrity | DONE — uncommitted | CRC-32 per record payload; `0` = legacy record; unknown entry type rejected at the C ABI |
 | 4 | Reader bounds hardening | PARTIAL — uncommitted | overflow-safe section/tensor range checks in `reader.zig` (`checkedEnd`, `validateTensorRanges`) |
 | 4 | Version negotiation, capability negotiation, optional sections | PARTIAL | reader accepts `version_major == 1`; header feature flags exist; no negotiation protocol |
 | 4 | Per-tensor hash stored in file | NOT STARTED | `hk hash` computes per-tensor SHA-256 on demand only |
 | 4 | Signatures, trusted publishers, signed manifests | NOT STARTED | |
 | 4 | Compression | UNVERIFIED | `COMPRESSED` appendix flag bit is defined (`format.zig:205`); no compression code found |
-| 5 | Crash-safe metadata edit | **PARTIAL — uncommitted** | `src/transaction.zig`: journal of the pre-edit prefix (`.hkmeta-journal`), rollback on next mutation; `hk repair` |
+| 5 | Crash-safe edits | **DONE for in-place edits — uncommitted** | `src/transaction.zig`: restore journal (metadata patch, appendix append) and roll-forward journal (appendix rollback); torn journals discarded only if the seal proves the file untouched; `HKWriter`/StreamWriter write `.partial` + rename; `hk repair`. Crash is simulated by writing the journal and partial state by hand — no real kill-9/power-loss test, no fsync-ordering proof. No `hk compact`/`hk fsck` |
 | 5 | Atomic appendix writes, atomic full-file writes | NOT STARTED | `appendRecordToFile` is in-place; `HKWriter.write` creates the destination directly (no temp+rename) |
 | 5 | `hk compact`, `hk fsck` | NOT STARTED | |
 | 6 | Layout metadata | PARTIAL | `TileLayout` enum 0x00–0x07 and `hk retile`; **engine ignores pre-tiled layouts** (repacks per-thread at runtime). No 128x\*, no per-backend layouts, no multi-representation per logical tensor |
@@ -157,16 +157,16 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 
 | § | Item | Status | Evidence / gap |
 |:--|:--|:--|:--|
-| 57 | CUDA | **LEGACY / standalone** | driver-API wrapper loaded via `dlopen`, embedded PTX, own tests and bench; **not in engine**. Commit history has conflicting remarks ("untested", "97 tok/s") — neither reproduced in current docs. No Tensor Cores/graphs/FP8 |
-| 60 | Vulkan | PARTIAL | whole-model-on-one-device, SPIR-V checked in, `-ngl`; **only one NVIDIA card tested**; no cooperative matrices, no async queues/timeline semaphores |
+| 57 | CUDA | **PARTIAL** (engine, 2.0 branch) + legacy standalone module | **Engine** (`feat/hk-2.0-backends`): `src/cuda/engine.zig` + device code `src/cuda_device.zig` (Zig → PTX by `zig build`, no toolkit; built for sm_70 and sm_80). All 26 formats run (f16 tensor cores `gemm_tc_*`); **integer tensor cores** (`mma.s8`) and `dp4a` GEMVs for Q8_0, Q4_0/1, Q5_0/1, Q4_K, Q5_K, Q6_K; flash-attention prompt kernel (`attention_tc_*`, head 64/128), warp split-KV decode attention, CUDA graphs for decode, partial offload. Parity vs CPU on the RTX 3050 (llama/qwen2/qwen3 × f32/Q8_0, head sizes 16/64/128, all formats against f64); perplexity within 0.3 % of llama.cpp. Measured against llama.cpp CUDA (4 real models, `benchmarks/results/2026-10-21-four-models.md`): prefill 96 % (Q8_0) to 67 % (K-quants), decode 91-94 % (Q8_0/Q4_K_M 1B) to 89 %. **Gaps:** one device; below sm_80 only portable kernels (untested); K-quant prompts ~30 % behind; no kernel fusion; formats outside the eight use f16 tensor cores. **Legacy** `src/cuda.zig` kernels (f32/q8_0/q4_0 GEMV from `hk_kernels.cu`) are kept only for `hk-gpu-bench` and `test-cuda`. |
+| 60 | Vulkan | PARTIAL | whole-model or partial (leading layers) on one device, SPIR-V checked in, `-ngl N`; **cooperative-matrix prompt GEMM and attention** (`VK_KHR_cooperative_matrix`, 32-wide subgroups), split-KV decode attention; one NVIDIA card tested. Against llama.cpp Vulkan: prefill 69 % (Q8_0) to 44 % (K-quants), decode 83 % (Q8_0) to 59 % (K-quants). No integer-dot/int8 matrix path, no async queues; AMD/Intel not run |
 | 58, 59, 61–63 | ROCm, Metal, DirectML/D3D12, Intel XPU/oneAPI/OpenVINO, Qualcomm QNN | NOT STARTED | Metal docs: would need Apple hardware |
 | 64–66 | Android, iOS, macOS | NOT STARTED / cross-compile only | macOS and Windows targets cross-compile in CI; never run. Java JNI glue exists (`bindings/java/jni`), not an Android package |
 | 67–69 | Linux / Windows / BSD | PARTIAL | Linux is the only run platform; Windows/macOS cross-compiled |
 | 70–71 | WASM/WebGPU, embedded | NOT STARTED | |
-| 72 | Backend auto-selection | PARTIAL | CPU vs Vulkan by `-ngl`/`HK_GPU` and free-VRAM check; no capability/benchmark-driven selection |
-| 73 | Heterogeneous / partial offload | PARTIAL | Python `offload.py` planner (torch-based); **Vulkan engine does not support partial layer offload** |
+| 72 | Backend auto-selection | PARTIAL | `backend/select.zig`: pure planner (candidates in preference order, rejection reasons, 90 % of free memory, partial offload of the largest fitting layer prefix, `--gpu-layers`), `--backend auto|cpu|vulkan|cuda` / `HK_BACKEND`. Order is fixed by one measurement (CUDA first with tensor cores, else Vulkan), not benchmarked per run |
+| 73 | Heterogeneous / partial offload | PARTIAL | Leading layers on a Vulkan or CUDA device, the rest + embedding + output on the CPU (hidden state crosses once per pass); parity tests on both devices. Not done: choosing which layers (always a prefix), multi-device, KV offload |
 | 74–75 | Multi-GPU, distributed inference | NOT STARTED | |
-| 137 | Automatic fallback | PARTIAL | GPU→CPU fallback with a printed reason when format/VRAM doesn't fit; no tiered fallback |
+| 137 | Automatic fallback | PARTIAL | GPU→CPU fallback with a printed reason when format/VRAM doesn't fit (reasons now come from the planner and carry numbers); `backend/caps.zig` is the capability table (formats per target); no per-operator table, no tiered fallback |
 
 ### Runtime services (§76–§84, §131–§136, §141–§142)
 
@@ -216,11 +216,11 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 
 | Milestone | Done | Not done |
 |:--|:--|:--|
-| **2.0 Unified Runtime** | CPU backend largely finalized for 3 arch families; Vulkan runs under `-ngl` | backend abstraction (engine calls `gpu_mod` directly), CUDA engine/prefill/decode/attention, unified memory planner, auto device selection |
+| **2.0 Unified Runtime** | CPU executor peer struct; `backend.Device` (Vulkan, CUDA); capability table; planner with partial offload; `--backend`; CUDA engine (tensor/integer cores, graphs); Vulkan cooperative matrices; kernel-stack unification; §148 contract | release cut (CI on all three OSes, version bump); measured per-run device choice; fusion; Vulkan K-quant speed |
 | **2.1 HW Acceleration** | — | everything (no Tensor Cores, sparse TC, ROCm, Metal, coop matrices, XPU, DirectML, mobile) |
 | **2.2 Model Compat** | Llama/Mistral(no SWA)/Qwen2/Qwen3 execute | Gemma, Phi, SWA, MoE, SSM, multimodal, descriptor-driven registry |
 | **2.3 Server Runtime** | slot scheduler, shared prompt cache | continuous batching proper, paged KV, speculative decoding, distributed, multi-GPU |
-| **2.4 Universal Format** | checksum + metadata journal (uncommitted) | v2 spec, signatures, backend layouts, external refs, registry, atomic appendix writes |
+| **2.4 Universal Format** | checksum, crash-safe edits, atomic writes (uncommitted) | v2 spec, signatures, backend layouts, external refs, registry |
 | **2.5 Training** | PyTorch `HKTrainer`, LoRA/QLoRA (prototype) | native/distributed training, distillation, QAT, pruning-aware training |
 | **2.6 Adaptive Research** | Net2Wider/vocab (prototype), partial plasticity | Net2Deeper in Zig, autonomous growth validated, model evolution loop, branching/merging |
 | **2.7 Self-Improvement** | components exist | secure execution, validated loops, curriculum, failure mining, regression rollback proven |
@@ -228,9 +228,9 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 
 ## Known doc/code discrepancies to fix (found while building this file)
 
-1. `hk` CLI banner prints **v1.2.0** (`tools/hk_cli.zig` `printUsage`) while `build.zig.zon` and `pyproject.toml` say **1.1.1**.
-2. `SECURITY.md` lists **1.0.x** as the supported version.
+1. ~~`hk` CLI banner version mismatch~~ — fixed in 2.0.0 (banner, `build.zig.zon`, `pyproject.toml` and the bindings all say 2.0.0).
+2. ~~`SECURITY.md` listed 1.0.x~~ — fixed in 2.0.0.
 3. `CONTRIBUTING.md` describes an older layout (`tensor_ops.zig` as "the kernels") and says Python **3.10+** while `pyproject.toml` says `>=3.9`.
 4. `docs/wiki/Architecture-and-Ideology.md` is accurate; the commit message of `623718d` ("97 tok/s" CUDA) is not corroborated by current docs.
 5. `python/hk/models.py` docstring says "137+ distinct model architectures" — it is 79 canonical names (169 aliases), conversion-mapping only.
-6. `build.zig` defaults `-Dcuda` to **on** for non-macOS targets, though CUDA is not on the engine path (it builds `hk-gpu-bench` and `test-cuda` and links `dl`).
+6. ~~`-Dcuda` default-on while CUDA was off the engine path~~ — CUDA is now an engine backend; the default stays on (the device code is embedded PTX, no toolkit needed).

@@ -1,6 +1,6 @@
 {
   "name": "hkntf",
-  "version": "1.1.1",
+  "version": "2.0.0",
   "description": "TypeScript / JavaScript reader and writer for the HK neural tensor format.",
   "type": "module",
   "main": "dist/hk.js",

@@ -147,7 +147,7 @@ from .adaptive import (
 AutoModelForCausalLM = AutoModel
 AutoModelForSequenceClassification = AutoModel
 
-__version__ = "1.1.1"
+__version__ = "2.0.0"
 
 __all__ = [
     "HKConfig",

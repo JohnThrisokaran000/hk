@@ -1,0 +1,40 @@
+{
+  "args": {
+    "gguf": "/home/harshit/hk-bench/models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "hk": "/home/harshit/hk-bench/models/Llama-3.2-1B-Instruct-Q4_K_M.hk",
+    "tokenizer": "/home/harshit/hk-bench/models/unsloth__Llama-3.2-1B-Instruct",
+    "text": "/home/harshit/hk-bench/data/wikitext-2-raw/wiki.test.raw",
+    "ctx": 512,
+    "chunks": 20,
+    "bos": 128000,
+    "hf": false,
+    "hf_dtype": "float32",
+    "out": "benchmarks/results/2026-10-21-ppl-llama3.2-1b-q4_k_m.json"
+  },
+  "results": {
+    "llama.cpp cpu": {
+      "ppl": 16.2291,
+      "stderr": 0.66308
+    },
+    "llama.cpp vulkan": {
+      "ppl": 16.2124,
+      "stderr": 0.66263
+    },
+    "llama.cpp cuda": {
+      "ppl": 16.2091,
+      "stderr": 0.66247
+    },
+    "hk cpu": {
+      "ppl": 16.2183,
+      "scored_tokens": 5100
+    },
+    "hk vulkan": {
+      "ppl": 16.203,
+      "scored_tokens": 5100
+    },
+    "hk cuda": {
+      "ppl": 16.1971,
+      "scored_tokens": 5100
+    }
+  }
+}

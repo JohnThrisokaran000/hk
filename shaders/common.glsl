@@ -40,6 +40,8 @@ void sm4(uint s, uint j, out uint sc, out uint mn) {
     }
 }
 
+const uint M0F4 = 0x0f0f0f0fu;
+
 #if defined(TYPE_F32)
 #define ELEMS 8u
 #define BYTES 32u
@@ -311,6 +313,16 @@ float dq(uint o, uint i) {
     uint nib = half_ == 0u ? (qb & 15u) : (qb >> 4);
     return h16(o) * float(sc) * float(nib) - h16(o + 2u) * float(mn);
 }
+// Four consecutive weights starting at a multiple of four: they share a sub-block, so the scale is unpacked once.
+vec4 dq4(uint o, uint i) {
+    uint c = i >> 6;
+    uint half_ = (i >> 5) & 1u;
+    uint l = i & 31u;
+    uint sc, mn;
+    sm4(o + 4u, 2u * c + half_, sc, mn);
+    uint w = w32[(o + 16u + 32u * c + l) >> 2] >> (half_ * 4u);
+    return h16(o) * float(sc) * vec4(w & 15u, (w >> 8) & 15u, (w >> 16) & 15u, (w >> 24) & 15u) - h16(o + 2u) * float(mn);
+}
 float dotpart(uint o, uint xo, uint part) {
     uint wb = o >> 2;
     float d = h16(o);
@@ -352,6 +364,18 @@ float dq(uint o, uint i) {
     uint nib = half_ == 0u ? (qb & 15u) : (qb >> 4);
     uint hb = (b8(o + 16u + l) >> (2u * c + half_)) & 1u;
     return h16(o) * float(sc) * float(nib | (hb << 4)) - h16(o + 2u) * float(mn);
+}
+vec4 dq4(uint o, uint i) {
+    uint c = i >> 6;
+    uint half_ = (i >> 5) & 1u;
+    uint l = i & 31u;
+    uint sc, mn;
+    sm4(o + 4u, 2u * c + half_, sc, mn);
+    uint w = w32[(o + 48u + 32u * c + l) >> 2] >> (half_ * 4u);
+    uint hq = w32[(o + 16u + l) >> 2] >> (2u * c + half_);
+    uvec4 nib = uvec4(w & 15u, (w >> 8) & 15u, (w >> 16) & 15u, (w >> 24) & 15u);
+    uvec4 hb = uvec4(hq & 1u, (hq >> 8) & 1u, (hq >> 16) & 1u, (hq >> 24) & 1u);
+    return h16(o) * float(sc) * vec4(nib | (hb << 4)) - h16(o + 2u) * float(mn);
 }
 float dotpart(uint o, uint xo, uint part) {
     uint wb = o >> 2;
@@ -400,6 +424,20 @@ float dq(uint o, uint i) {
     int q = int(lo | (hi << 4)) - 32;
     int sc = s8(o + 192u + 8u * n + is + 2u * part);
     return h16(o + 208u) * float(sc * q);
+}
+vec4 dq4(uint o, uint i) {
+    uint n = i >> 7;
+    uint r = i & 127u;
+    uint part = r >> 5;
+    uint l = r & 31u;
+    uint is = l >> 4;
+    uint ql = w32[(o + 64u * n + l + ((part & 1u) != 0u ? 32u : 0u)) >> 2];
+    uint lo = part < 2u ? (ql & M0F4) : ((ql >> 4) & M0F4);
+    uint qh = (w32[(o + 128u + 32u * n + l) >> 2] >> (2u * part)) & 0x03030303u;
+    uint v = lo | (qh << 4);
+    int sc = s8(o + 192u + 8u * n + is + 2u * part);
+    vec4 q = vec4(float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u), float(v >> 24)) - 32.0;
+    return h16(o + 208u) * float(sc) * q;
 }
 float dotpart(uint o, uint xo, uint part) {
     uint wb = o >> 2;
@@ -461,4 +499,9 @@ float dotpart(uint o, uint xo, uint part) {
 
 #else
 #error "select a weight format with -DTYPE_<NAME>"
+#endif
+
+#if !defined(TYPE_Q4_K) && !defined(TYPE_Q5_K) && !defined(TYPE_Q6_K)
+// Formats without a specialised version decode four weights one at a time.
+vec4 dq4(uint o, uint i) { return vec4(dq(o, i), dq(o, i + 1u), dq(o, i + 2u), dq(o, i + 3u)); }
 #endif

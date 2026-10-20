@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 pub const c = @import("c.zig");
+const envvar = @import("../envvar.zig");
 
 pub const Error = error{
     NoVulkan,
@@ -133,6 +134,12 @@ pub const Caps = struct {
     timestamp_period: f32 = 1.0,
     /// Memory that lives on the device (VRAM, or the shared pool on integrated parts), in bytes.
     device_local_bytes: u64 = 0,
+    /// `VK_KHR_cooperative_matrix` offers a subgroup scope 16x16x16 f16 x f16 -> f32 product on this device (and
+    /// the subgroup is 32 wide, which the cooperative matrix shaders assume); `HK_NO_COOPMAT` switches it off.
+    coopmat: bool = false,
+    /// `VK_KHR_shader_integer_dot_product` with the feature on: the packed 4 x int8 dot (`OpSDot`) the integer decode
+    /// kernels use. `HK_NO_INTDOT` switches it off.
+    int_dot: bool = false,
 
     pub fn deviceName(self: *const Caps) []const u8 {
         return self.name[0..self.name_len];
@@ -166,9 +173,50 @@ pub const Pipeline = struct {
     push_bytes: u32 = 0,
 };
 
+/// The loader and the instance, created once per process and never destroyed: see the test at the end of this file.
+const Shared = struct {
+    lib: DynLib,
+    get_inst: std.meta.Child(c.PFN_vkGetInstanceProcAddr),
+    instance: c.VkInstance,
+};
+
+var shared: ?Shared = null;
+var shared_lock: std.atomic.Value(u32) = .init(0);
+
+fn sharedInstance() Error!Shared {
+    while (shared_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    defer shared_lock.store(0, .release);
+    if (shared) |s| return s;
+
+    var lib: DynLib = undefined;
+    var opened = false;
+    for (loader_names) |name| {
+        if (DynLib.open(name)) |l| {
+            lib = l;
+            opened = true;
+            break;
+        } else |_| {}
+    }
+    if (!opened) return error.NoVulkan;
+    errdefer lib.close();
+
+    const get_inst = lib.lookup(std.meta.Child(c.PFN_vkGetInstanceProcAddr), "vkGetInstanceProcAddr") orelse return error.NoVulkan;
+    const create_instance: std.meta.Child(c.PFN_vkCreateInstance) = @ptrCast(get_inst(null, "vkCreateInstance") orelse return error.NoVulkan);
+    var app = std.mem.zeroes(c.VkApplicationInfo);
+    app.sType = c.VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "hk";
+    app.apiVersion = makeApiVersion(0, 1, 2, 0);
+    var ici = std.mem.zeroes(c.VkInstanceCreateInfo);
+    ici.sType = c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+    var instance: c.VkInstance = null;
+    check(create_instance(&ici, null, &instance)) catch return error.NoVulkan;
+    shared = .{ .lib = lib, .get_inst = get_inst, .instance = instance };
+    return shared.?;
+}
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
-    lib: DynLib,
     instance: c.VkInstance,
     phys: c.VkPhysicalDevice,
     device: c.VkDevice,
@@ -183,41 +231,15 @@ pub const Context = struct {
     xfer_cb: c.VkCommandBuffer,
     /// Host visible staging memory for uploads, created on first use.
     stage: ?Buffer = null,
-    destroyInstance: std.meta.Child(c.PFN_vkDestroyInstance),
     getMemoryBudget: ?std.meta.Child(c.PFN_vkGetPhysicalDeviceMemoryProperties2),
 
     /// Opens the loader, picks a device and creates the compute queue. `pick` selects the n-th
     /// device when several are present (HK_VK_DEVICE in the engine); otherwise a discrete GPU
     /// wins over an integrated one and software rasterizers are skipped.
     pub fn init(allocator: std.mem.Allocator, pick: ?usize) !Context {
-        var lib: DynLib = undefined;
-        var opened = false;
-        for (loader_names) |name| {
-            if (DynLib.open(name)) |l| {
-                lib = l;
-                opened = true;
-                break;
-            } else |_| {}
-        }
-        if (!opened) return error.NoVulkan;
-        errdefer lib.close();
-
-        const get_inst = lib.lookup(std.meta.Child(c.PFN_vkGetInstanceProcAddr), "vkGetInstanceProcAddr") orelse return error.NoVulkan;
-        const create_instance: std.meta.Child(c.PFN_vkCreateInstance) = @ptrCast(get_inst(null, "vkCreateInstance") orelse return error.NoVulkan);
-
-        var app = std.mem.zeroes(c.VkApplicationInfo);
-        app.sType = c.VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        app.pApplicationName = "hk";
-        app.apiVersion = makeApiVersion(0, 1, 2, 0);
-        var ici = std.mem.zeroes(c.VkInstanceCreateInfo);
-        ici.sType = c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        ici.pApplicationInfo = &app;
-        var instance: c.VkInstance = null;
-        check(create_instance(&ici, null, &instance)) catch return error.NoVulkan;
-        errdefer {
-            const d: std.meta.Child(c.PFN_vkDestroyInstance) = @ptrCast(get_inst(instance, "vkDestroyInstance").?);
-            d(instance, null);
-        }
+        const sh = try sharedInstance();
+        const get_inst = sh.get_inst;
+        const instance = sh.instance;
 
         const enumerate: std.meta.Child(c.PFN_vkEnumeratePhysicalDevices) = @ptrCast(get_inst(instance, "vkEnumeratePhysicalDevices") orelse return error.NoVulkan);
         const get_props: std.meta.Child(c.PFN_vkGetPhysicalDeviceProperties) = @ptrCast(get_inst(instance, "vkGetPhysicalDeviceProperties").?);
@@ -228,7 +250,6 @@ pub const Context = struct {
         const enum_ext: std.meta.Child(c.PFN_vkEnumerateDeviceExtensionProperties) = @ptrCast(get_inst(instance, "vkEnumerateDeviceExtensionProperties").?);
         const create_device: std.meta.Child(c.PFN_vkCreateDevice) = @ptrCast(get_inst(instance, "vkCreateDevice").?);
         const get_dev_proc: std.meta.Child(c.PFN_vkGetDeviceProcAddr) = @ptrCast(get_inst(instance, "vkGetDeviceProcAddr").?);
-        const destroy_instance: std.meta.Child(c.PFN_vkDestroyInstance) = @ptrCast(get_inst(instance, "vkDestroyInstance").?);
 
         var n_dev: u32 = 0;
         try check(enumerate(instance, &n_dev, null));
@@ -329,6 +350,8 @@ pub const Context = struct {
 
         // Memory budget, when the driver reports it, tells how much VRAM is really free.
         var has_budget = false;
+        var has_coopmat_ext = false;
+        var has_intdot_ext = false;
         var n_ext: u32 = 0;
         _ = enum_ext(phys, null, &n_ext, null);
         if (n_ext > 0) {
@@ -336,10 +359,65 @@ pub const Context = struct {
             defer allocator.free(exts);
             _ = enum_ext(phys, null, &n_ext, exts.ptr);
             for (exts[0..n_ext]) |e| {
-                if (std.mem.eql(u8, std.mem.sliceTo(&e.extensionName, 0), "VK_EXT_memory_budget")) has_budget = true;
+                const en = std.mem.sliceTo(&e.extensionName, 0);
+                if (std.mem.eql(u8, en, "VK_EXT_memory_budget")) has_budget = true;
+                if (std.mem.eql(u8, en, "VK_KHR_cooperative_matrix")) has_coopmat_ext = true;
+                if (std.mem.eql(u8, en, "VK_KHR_shader_integer_dot_product")) has_intdot_ext = true;
             }
         }
-        const dev_exts = [_][*:0]const u8{"VK_EXT_memory_budget"};
+
+        // Cooperative matrices: the feature bit and a 16x16x16 f16 x f16 -> f32 subgroup shape must both be reported.
+        var coopmat = false;
+        if (has_coopmat_ext and sg.subgroupSize == 32 and !envvar.isSet("HK_NO_COOPMAT")) probe: {
+            var cm_feat = c.VkPhysicalDeviceCooperativeMatrixFeaturesKHR{};
+            var feats_cm = std.mem.zeroes(c.VkPhysicalDeviceFeatures2);
+            feats_cm.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            feats_cm.pNext = &cm_feat;
+            get_feat2(phys, &feats_cm);
+            if (cm_feat.cooperativeMatrix == 0) break :probe;
+            const get_cm = get_inst(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR") orelse break :probe;
+            const get_cm_props: std.meta.Child(c.PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) = @ptrCast(get_cm);
+            var n_cm: u32 = 0;
+            if (get_cm_props(phys, &n_cm, null) != c.VK_SUCCESS or n_cm == 0) break :probe;
+            const cm = try allocator.alloc(c.VkCooperativeMatrixPropertiesKHR, n_cm);
+            defer allocator.free(cm);
+            for (cm) |*e| e.* = .{};
+            if (get_cm_props(phys, &n_cm, cm.ptr) != c.VK_SUCCESS) break :probe;
+            for (cm[0..n_cm]) |e| {
+                if (e.scope == c.VK_SCOPE_SUBGROUP_KHR and e.MSize == 16 and e.NSize == 16 and e.KSize == 16 and
+                    e.AType == c.VK_COMPONENT_TYPE_FLOAT16_KHR and e.BType == c.VK_COMPONENT_TYPE_FLOAT16_KHR and
+                    e.CType == c.VK_COMPONENT_TYPE_FLOAT32_KHR and e.ResultType == c.VK_COMPONENT_TYPE_FLOAT32_KHR)
+                {
+                    coopmat = true;
+                }
+            }
+        }
+        caps.coopmat = coopmat;
+
+        var int_dot = false;
+        if (has_intdot_ext and !envvar.isSet("HK_NO_INTDOT")) {
+            var dp_feat = c.VkPhysicalDeviceShaderIntegerDotProductFeatures{};
+            var feats_dp = std.mem.zeroes(c.VkPhysicalDeviceFeatures2);
+            feats_dp.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            feats_dp.pNext = &dp_feat;
+            get_feat2(phys, &feats_dp);
+            int_dot = dp_feat.shaderIntegerDotProduct != 0;
+        }
+        caps.int_dot = int_dot;
+        var dev_exts: [3][*:0]const u8 = undefined;
+        var n_dev_exts: u32 = 0;
+        if (has_budget) {
+            dev_exts[n_dev_exts] = "VK_EXT_memory_budget";
+            n_dev_exts += 1;
+        }
+        if (coopmat) {
+            dev_exts[n_dev_exts] = "VK_KHR_cooperative_matrix";
+            n_dev_exts += 1;
+        }
+        if (int_dot) {
+            dev_exts[n_dev_exts] = "VK_KHR_shader_integer_dot_product";
+            n_dev_exts += 1;
+        }
 
         // Enable exactly the features that were checked.
         var en12 = std.mem.zeroes(c.VkPhysicalDeviceVulkan12Features);
@@ -354,6 +432,12 @@ pub const Context = struct {
         var en2 = std.mem.zeroes(c.VkPhysicalDeviceFeatures2);
         en2.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         en2.pNext = &en11;
+        var en_cm = c.VkPhysicalDeviceCooperativeMatrixFeaturesKHR{ .cooperativeMatrix = 1 };
+        var en_dp = c.VkPhysicalDeviceShaderIntegerDotProductFeatures{ .shaderIntegerDotProduct = 1 };
+        if (coopmat) en12.pNext = &en_cm;
+        if (int_dot) {
+            if (coopmat) en_cm.pNext = &en_dp else en12.pNext = &en_dp;
+        }
         en2.features.shaderInt16 = feats.features.shaderInt16;
         en2.features.shaderInt64 = feats.features.shaderInt64;
 
@@ -362,8 +446,8 @@ pub const Context = struct {
         dci.pNext = &en2;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
-        if (has_budget) {
-            dci.enabledExtensionCount = 1;
+        if (n_dev_exts > 0) {
+            dci.enabledExtensionCount = n_dev_exts;
             dci.ppEnabledExtensionNames = &dev_exts;
         }
         var device: c.VkDevice = null;
@@ -374,9 +458,9 @@ pub const Context = struct {
         }
 
         var fns: Fns = undefined;
-        inline for (@typeInfo(Fns).@"struct".fields) |fld| {
-            const name = "vk" ++ [_]u8{std.ascii.toUpper(fld.name[0])} ++ fld.name[1..];
-            @field(fns, fld.name) = @ptrCast(get_dev_proc(device, name) orelse return error.NoVulkan);
+        inline for (comptime std.meta.fieldNames(Fns)) |fld_name| {
+            const name = "vk" ++ [_]u8{std.ascii.toUpper(fld_name[0])} ++ fld_name[1..];
+            @field(fns, fld_name) = @ptrCast(get_dev_proc(device, name) orelse return error.NoVulkan);
         }
 
         var queue: c.VkQueue = null;
@@ -417,7 +501,6 @@ pub const Context = struct {
 
         return .{
             .allocator = allocator,
-            .lib = lib,
             .instance = instance,
             .phys = phys,
             .device = device,
@@ -430,7 +513,6 @@ pub const Context = struct {
             .desc_pool = desc_pool,
             .fence = fence,
             .xfer_cb = xfer,
-            .destroyInstance = destroy_instance,
             .getMemoryBudget = if (has_budget) @ptrCast(get_inst(instance, "vkGetPhysicalDeviceMemoryProperties2")) else null,
         };
     }
@@ -442,8 +524,6 @@ pub const Context = struct {
         self.f.destroyDescriptorPool(self.device, self.desc_pool, null);
         self.f.destroyCommandPool(self.device, self.cmd_pool, null);
         self.f.destroyDevice(self.device, null);
-        self.destroyInstance(self.instance, null);
-        self.lib.close();
     }
 
     /// Bytes of device memory the driver says are still available, or the heap size when it does
@@ -651,6 +731,15 @@ pub const Context = struct {
         self.f.cmdPipelineBarrier(cb, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, null, 0, null);
     }
 
+    /// Makes shader writes of earlier dispatches visible to the copy that follows (`barrier` only orders compute work).
+    pub fn transferBarrier(self: *Context, cb: c.VkCommandBuffer) void {
+        var mb = std.mem.zeroes(c.VkMemoryBarrier);
+        mb.sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT;
+        self.f.cmdPipelineBarrier(cb, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, null, 0, null);
+    }
+
     pub fn copy(self: *Context, cb: c.VkCommandBuffer, src: Buffer, dst: Buffer, src_off: u64, dst_off: u64, size: u64) void {
         const region = c.VkBufferCopy{ .srcOffset = src_off, .dstOffset = dst_off, .size = size };
         self.f.cmdCopyBuffer(cb, src.buf, dst.buf, 1, &region);
@@ -725,4 +814,18 @@ test "a compute shader runs on the device, or there is no device" {
     try ctx.submitAndWait(cb);
     const of: [*]const f32 = @ptrCast(@alignCast(out.mapped.?));
     for (0..n) |i| try std.testing.expectEqual(@as(f32, @floatFromInt(i)) + 0.5, of[i]);
+}
+
+test "a process can open the device many times over" {
+    // NVIDIA's Vulkan driver (615.x; plain C reproduces it) starts failing vkEnumeratePhysicalDevices with
+    // INITIALIZATION_FAILED once a process has created and destroyed about 25 instances. A model load opens two
+    // contexts (a planner probe and the engine), so a long running process would stop loading models after a dozen.
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        var ctx = Context.init(std.testing.allocator, null) catch |e| switch (e) {
+            error.NoVulkan, error.NoDevice, error.MissingFeature, error.NoComputeQueue => return error.SkipZigTest,
+            else => return e,
+        };
+        ctx.deinit();
+    }
 }

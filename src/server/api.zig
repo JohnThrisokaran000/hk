@@ -178,19 +178,25 @@ fn authorized(srv: *Server, req: *std.http.Server.Request) bool {
     return false;
 }
 
-/// How much of an oversized body is read and thrown away after the 413 has been sent.
+/// How much of an oversized body is read and thrown away before the 413 is sent.
 const drain_limit: usize = 64 << 20;
 
-/// Reads the request body. When it exceeds `limit`, `rest` is set to the body reader so the caller
-/// can answer 413 and then drain what is still in flight: closing a connection that has unread
-/// data makes the peer's stack send a reset, and on some systems (macOS) that reset wipes out the
-/// response before the client has read it.
-fn readBody(req: *std.http.Server.Request, a: std.mem.Allocator, limit: usize, rest: *?*std.Io.Reader) ![]u8 {
+/// Reads the request body. When it exceeds `limit` the rest of it (up to `drain_limit`) is read and discarded
+/// *before* the caller answers 413: a client is still writing its body, and answering and closing first makes the
+/// peer's stack reset the connection, which on some systems (macOS) makes the client's write fail with no response
+/// ever read (seen in CI: `WriteFailed`). Draining first costs a bounded amount of reading.
+fn readBody(req: *std.http.Server.Request, a: std.mem.Allocator, limit: usize) ![]u8 {
     const buf = try a.alloc(u8, 4096);
     const reader = try req.readerExpectContinue(buf);
     return reader.allocRemaining(a, .limited(limit)) catch |e| switch (e) {
         error.StreamTooLong => {
-            rest.* = reader;
+            // `discard` may stop after one chunk, so keep going until the body ends or the allowance is used up.
+            var left: usize = drain_limit;
+            while (left > 0) {
+                const n = reader.discard(.limited(left)) catch break;
+                if (n == 0) break;
+                left -= n;
+            }
             return error.BodyTooLarge;
         },
         else => error.ReadFailed,
@@ -240,11 +246,9 @@ fn handle(srv: *Server, req: *std.http.Server.Request) !bool {
         return true;
     }
     if (method == .POST) {
-        var rest: ?*std.Io.Reader = null;
-        const body = readBody(req, a, srv.cfg.max_body_bytes, &rest) catch |e| {
+        const body = readBody(req, a, srv.cfg.max_body_bytes) catch |e| {
             const status: std.http.Status = if (e == error.BodyTooLarge) .payload_too_large else .bad_request;
             try respondError(req, a, status, "invalid_request_error", if (e == error.BodyTooLarge) "the request body is too large" else "could not read the request body");
-            if (rest) |r| _ = r.discard(.limited(drain_limit)) catch {};
             return false;
         };
         if (std.mem.eql(u8, path, "/v1/chat/completions") or std.mem.eql(u8, path, "/chat/completions")) {

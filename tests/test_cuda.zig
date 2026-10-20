@@ -1,7 +1,6 @@
 const std = @import("std");
 const hk = @import("hk");
 const cuda = hk.cuda;
-const tensor_ops = hk.tensor_ops;
 const quantization = hk.quantization;
 
 test "cuda device detected" {
@@ -36,7 +35,7 @@ test "cuda gemv f32 matches cpu reference" {
 
     const y_cpu = try allocator.alloc(f32, M);
     defer allocator.free(y_cpu);
-    tensor_ops.gemvF32(W, x, null, y_cpu, M, K);
+    try hk.engine.abi_ops.gemvF32(W, x, null, y_cpu, M, K);
 
     const d_w = try cuda.DeviceBuffer.upload(std.mem.sliceAsBytes(W));
     defer d_w.free();
@@ -91,7 +90,7 @@ test "cuda gemv q8_0 matches cpu reference" {
 
     const y_cpu = try allocator.alloc(f32, M);
     defer allocator.free(y_cpu);
-    tensor_ops.gemvQ8_0(W_q8, x, null, y_cpu, M, K);
+    try hk.engine.abi_ops.gemvQ8_0(W_q8, x, null, y_cpu, M, K);
 
     const d_w = try cuda.DeviceBuffer.upload(W_q8);
     defer d_w.free();
@@ -130,7 +129,7 @@ test "cuda rmsnorm matches cpu reference" {
 
     const out_cpu = try allocator.alloc(f32, dim);
     defer allocator.free(out_cpu);
-    tensor_ops.rmsNormF32(x, w, 1e-5, out_cpu);
+    hk.ops.rmsNormF32(x, w, 1e-5, out_cpu);
 
     const d_x = try cuda.DeviceBuffer.upload(std.mem.sliceAsBytes(x));
     defer d_x.free();
@@ -262,4 +261,129 @@ test "cuda stream and event profiling" {
 
     const elapsed = try cuda.CudaEvent.elapsedMs(&start, &end);
     try std.testing.expect(elapsed >= 0.0);
+}
+
+/// Fills `dst` (whole blocks of `t`) with random bytes, re-rolling any block that does not decode to small finite
+/// values (a random f16 scale is often inf/NaN), so the test data is a valid, well-conditioned tensor.
+fn randomBlocks(comptime t: hk.format.StorageType, rand: std.Random, dst: []u8) !void {
+    const info = comptime hk.quant.blocks.info(t).?;
+    var decoded: [info.elems]f32 = undefined;
+    var off: usize = 0;
+    while (off < dst.len) : (off += info.bytes) {
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            if (attempts > 2000) return error.CouldNotBuildValidBlock;
+            rand.bytes(dst[off..][0..info.bytes]);
+            try hk.quant.dequantizeRow(t, dst[off..][0..info.bytes], &decoded);
+            var ok = true;
+            for (decoded) |v| {
+                if (!std.math.isFinite(v) or @abs(v) > 1000) ok = false;
+            }
+            if (ok) break;
+        }
+    }
+}
+
+test "device gemm matches the CPU decoders for every format the CPU runs" {
+    if (!cuda.isAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(2024);
+    const rand = prng.random();
+    const M: usize = 21; // one full tile of 16 rows and a partial one
+    const K: usize = 512; // a whole number of blocks for 1, 32, 64 and 256 element formats
+
+    // 19 tokens: two full tiles of eight and a partial tile of three, so both tile edges are exercised. 150 tokens:
+    // one full tile of the tensor core kernel (128) and a partial one.
+    const max_tokens: usize = 150;
+    const x = try allocator.alloc(f32, max_tokens * K);
+    defer allocator.free(x);
+    for (x) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
+    const d_x = try cuda.DeviceBuffer.upload(std.mem.sliceAsBytes(x));
+    defer d_x.free();
+    const d_y = try cuda.DeviceBuffer.allocUninit(max_tokens * M * @sizeOf(f32));
+    defer d_y.free();
+
+    var tested: usize = 0;
+    inline for (comptime std.enums.values(hk.format.StorageType)) |t| {
+        if (comptime hk.quant.vecdot.supported(t)) {
+            const info = comptime hk.quant.blocks.info(t).?;
+            const row_bytes = K / info.elems * info.bytes;
+            const w = try allocator.alloc(u8, M * row_bytes);
+            defer allocator.free(w);
+            try randomBlocks(t, rand, w);
+
+            // One token takes the decode kernel, several the batch kernel, and on sm_80 and newer the tensor core kernel
+            // takes a prompt; each must match the reference. The tensor core kernel rounds both operands to f16, so its
+            // bound is looser (2^-10 of the sum of magnitudes at worst).
+            const runs = [_]struct { n: usize, tensor: bool, imma: bool = false }{
+                .{ .n = 1, .tensor = false },
+                .{ .n = 19, .tensor = false },
+                .{ .n = 19, .tensor = true },
+                .{ .n = max_tokens, .tensor = true },
+                .{ .n = 19, .tensor = false, .imma = true },
+                .{ .n = max_tokens, .tensor = false, .imma = true },
+            };
+            for (runs) |run| {
+                if ((run.tensor or run.imma) and !cuda.hasTensorCores()) continue;
+                if (run.imma and cuda.immaKernel(t) == null) continue;
+                const N = run.n;
+                const dec = try allocator.alloc(f32, K);
+                defer allocator.free(dec);
+                const want = try allocator.alloc(f64, N * M);
+                defer allocator.free(want);
+                const scale = try allocator.alloc(f64, N * M);
+                defer allocator.free(scale);
+                // Integer kernel: activations are rounded to int8 per 32 values, an error of at most amax / 254 each.
+                const qbound = try allocator.alloc(f64, N * M);
+                defer allocator.free(qbound);
+                for (0..M) |r| {
+                    try hk.quant.dequantizeRow(t, w[r * row_bytes ..][0..row_bytes], dec);
+                    for (0..N) |tok| {
+                        const xs = x[tok * K ..][0..K];
+                        var s: f64 = 0;
+                        var mag: f64 = 0;
+                        for (dec, xs) |a, b| {
+                            s += @as(f64, a) * b;
+                            mag += @abs(@as(f64, a) * b);
+                        }
+                        want[tok * M + r] = s;
+                        scale[tok * M + r] = mag;
+                        var qb: f64 = 0;
+                        var b0: usize = 0;
+                        while (b0 < K) : (b0 += 32) {
+                            var amax: f64 = 0;
+                            var wsum: f64 = 0;
+                            for (b0..b0 + 32) |i| {
+                                amax = @max(amax, @abs(@as(f64, xs[i])));
+                                wsum += @abs(@as(f64, dec[i]));
+                            }
+                            qb += wsum * amax / 254.0;
+                        }
+                        qbound[tok * M + r] = qb;
+                    }
+                }
+
+                const d_w = try cuda.DeviceBuffer.upload(w);
+                defer d_w.free();
+                if (run.imma) try cuda.deviceGemmImma(t, d_w, d_x, d_y, M, K, N) else if (run.tensor) try cuda.deviceGemmTensor(t, d_w, d_x, d_y, M, K, N) else try cuda.deviceGemm(t, d_w, d_x, d_y, M, K, N);
+                try cuda.synchronize();
+                const got = try allocator.alloc(f32, N * M);
+                defer allocator.free(got);
+                try d_y.download(std.mem.sliceAsBytes(got));
+
+                for (0..N * M) |i| {
+                    // f32 accumulation in a different order: error scales with the sum of magnitudes, not the result.
+                    const rel: f64 = if (run.tensor) 1.1e-3 else 1e-4;
+                    const tol = rel * scale[i] + 1e-6 + (if (run.imma) 1.02 * qbound[i] else 0);
+                    if (@abs(@as(f64, got[i]) - want[i]) > tol) {
+                        std.debug.print("format {s} token {d} row {d}: device {d} cpu {d} (tol {d})\n", .{ @tagName(t), i / M, i % M, got[i], want[i], tol });
+                        return error.DeviceMismatch;
+                    }
+                }
+
+            }
+            tested += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 26), tested);
 }

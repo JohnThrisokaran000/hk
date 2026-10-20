@@ -12,11 +12,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const format = @import("format.zig");
+const envvar = @import("envvar.zig");
 
 pub const enabled = build_options.cuda;
 
 pub const CudaError = error{
     CudaNotCompiledIn,
+    /// cuMemAlloc reported CUDA_ERROR_OUT_OF_MEMORY.
+    OutOfDeviceMemory,
     CudaCallFailed,
     NoCudaDevice,
     UnsupportedStorageType,
@@ -84,9 +87,11 @@ const DriverApi = struct {
     cuDeviceGetCount: *const fn (count: *c_int) callconv(.c) CuResult,
     cuDeviceGet: *const fn (device: *CuDevice, ordinal: c_int) callconv(.c) CuResult,
     cuDeviceGetName: *const fn (name: [*]u8, len: c_int, dev: CuDevice) callconv(.c) CuResult,
+    cuDeviceGetAttribute: *const fn (value: *c_int, attrib: c_int, dev: CuDevice) callconv(.c) CuResult,
     cuDeviceTotalMem_v2: *const fn (bytes: *usize, dev: CuDevice) callconv(.c) CuResult,
     cuMemGetInfo_v2: *const fn (free: *usize, total: *usize) callconv(.c) CuResult,
     cuCtxCreate_v2: *const fn (pctx: *CuContext, flags: c_uint, dev: CuDevice) callconv(.c) CuResult,
+    cuCtxSetCurrent: *const fn (ctx: CuContext) callconv(.c) CuResult,
     cuCtxDestroy_v2: *const fn (ctx: CuContext) callconv(.c) CuResult,
     cuCtxSynchronize: *const fn () callconv(.c) CuResult,
     cuMemAlloc_v2: *const fn (dptr: *CuDeviceptr, bytesize: usize) callconv(.c) CuResult,
@@ -132,6 +137,11 @@ const DriverApi = struct {
 // ---------------------------------------------------------------------
 const PTX_SOURCE: [:0]const u8 = @embedFile("cuda/hk_cuda.ptx");
 
+/// PTX compiled by `build.zig` from `src/cuda_device.zig` (device code written in Zig, nvptx64).
+const DEVICE_PTX: [:0]const u8 = if (enabled) @embedFile("cuda_device_ptx") else "";
+/// The same device code built for sm_80, which adds the tensor core kernels.
+const DEVICE_PTX_SM80: [:0]const u8 = if (enabled) @embedFile("cuda_device_ptx_sm80") else "";
+
 const DriverState = struct {
     lib_handle: ?*anyopaque = null,
     api: ?DriverApi = null,
@@ -140,6 +150,12 @@ const DriverState = struct {
     device: CuDevice = 0,
     context: CuContext = null,
     module: CuModule = null,
+    /// The Zig-built device module (`DEVICE_PTX`). Null when the driver rejected it; `deviceFunction` then reports it.
+    dev_module: CuModule = null,
+    /// True when `dev_module` is the sm_80 build, i.e. the `gemm_tc_*` kernels exist.
+    tensor_cores: bool = false,
+    /// Kernel handles of the device module, looked up on first use.
+    dev_fns: std.StringHashMapUnmanaged(CuFunction) = .empty,
 
     // Kernel Function Pointers
     fn_gemv_f32: CuFunction = null,
@@ -171,12 +187,23 @@ const Mutex = struct {
 var global_state: DriverState = .{};
 var global_mutex: Mutex = .{};
 
+/// Whether this thread has made the process's context current. A CUDA context is current per thread: the thread that
+/// created it has it, a server worker thread does not (and every call it made failed with "invalid context").
+threadlocal var thread_bound: bool = false;
+
 fn ensureDriver() !*DriverState {
     if (!enabled) return CudaError.CudaNotCompiledIn;
+    if (thread_bound and global_state.initialized) return &global_state;
     global_mutex.lock();
     defer global_mutex.unlock();
 
-    if (global_state.initialized) return &global_state;
+    if (global_state.initialized) {
+        if (!thread_bound) {
+            if (global_state.api.?.cuCtxSetCurrent(global_state.context) != 0) return CudaError.CudaCallFailed;
+            thread_bound = true;
+        }
+        return &global_state;
+    }
     if (global_state.init_attempted) return CudaError.DriverNotLoaded;
     global_state.init_attempted = true;
 
@@ -202,9 +229,11 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
         .cuDeviceGetCount = getProc(*const fn (*c_int) callconv(.c) CuResult, handle, "cuDeviceGetCount") orelse return CudaError.DriverNotLoaded,
         .cuDeviceGet = getProc(*const fn (*CuDevice, c_int) callconv(.c) CuResult, handle, "cuDeviceGet") orelse return CudaError.DriverNotLoaded,
         .cuDeviceGetName = getProc(*const fn ([*]u8, c_int, CuDevice) callconv(.c) CuResult, handle, "cuDeviceGetName") orelse return CudaError.DriverNotLoaded,
+        .cuDeviceGetAttribute = getProc(*const fn (*c_int, c_int, CuDevice) callconv(.c) CuResult, handle, "cuDeviceGetAttribute") orelse return CudaError.DriverNotLoaded,
         .cuDeviceTotalMem_v2 = getProc(*const fn (*usize, CuDevice) callconv(.c) CuResult, handle, "cuDeviceTotalMem_v2") orelse return CudaError.DriverNotLoaded,
         .cuMemGetInfo_v2 = getProc(*const fn (*usize, *usize) callconv(.c) CuResult, handle, "cuMemGetInfo_v2") orelse return CudaError.DriverNotLoaded,
         .cuCtxCreate_v2 = getProc(*const fn (*CuContext, c_uint, CuDevice) callconv(.c) CuResult, handle, "cuCtxCreate_v2") orelse return CudaError.DriverNotLoaded,
+        .cuCtxSetCurrent = getProc(*const fn (CuContext) callconv(.c) CuResult, handle, "cuCtxSetCurrent") orelse return CudaError.DriverNotLoaded,
         .cuCtxDestroy_v2 = getProc(*const fn (CuContext) callconv(.c) CuResult, handle, "cuCtxDestroy_v2") orelse return CudaError.DriverNotLoaded,
         .cuCtxSynchronize = getProc(*const fn () callconv(.c) CuResult, handle, "cuCtxSynchronize") orelse return CudaError.DriverNotLoaded,
         .cuMemAlloc_v2 = getProc(*const fn (*CuDeviceptr, usize) callconv(.c) CuResult, handle, "cuMemAlloc_v2") orelse return CudaError.DriverNotLoaded,
@@ -253,6 +282,19 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
     global_state.context = ctx;
     global_state.module = mod;
 
+    var dmod: CuModule = null;
+    // Compute capability 8.0 and newer get the sm_80 build of the device code (tensor cores); `HK_NO_TENSOR_CORES`
+    // keeps the portable build. If the driver rejects the sm_80 module the portable one is used instead.
+    var cc_major: c_int = 0;
+    _ = api.cuDeviceGetAttribute(&cc_major, 75, dev);
+    if (cc_major >= 8 and !envvar.isSet("HK_NO_TENSOR_CORES") and api.cuModuleLoadData(&dmod, DEVICE_PTX_SM80.ptr) == 0) {
+        global_state.dev_module = dmod;
+        global_state.tensor_cores = true;
+    } else {
+        dmod = null;
+        if (api.cuModuleLoadData(&dmod, DEVICE_PTX.ptr) == 0) global_state.dev_module = dmod;
+    }
+
     _ = api.cuModuleGetFunction(&global_state.fn_gemv_f32, mod, "gemvF32KernelOpt");
     _ = api.cuModuleGetFunction(&global_state.fn_gemv_q8_0, mod, "gemvQ8_0KernelOpt");
     _ = api.cuModuleGetFunction(&global_state.fn_gemv_q4_0, mod, "gemvQ4_0KernelOpt");
@@ -265,6 +307,7 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
     _ = api.cuModuleGetFunction(&global_state.fn_add_residual, mod, "addResidualKernel");
 
     global_state.initialized = true;
+    thread_bound = true; // the creating thread has the context current already
     return &global_state;
 }
 
@@ -950,3 +993,271 @@ pub fn fusedSwiGluResidual(gate: anytype, up: anytype, res: anytype, hidden_dim:
         try addResidual(gate, res, dim);
     }
 }
+
+// ---------------------------------------------------------------------
+// Device module built from Zig (src/cuda_device.zig)
+// ---------------------------------------------------------------------
+
+/// A kernel of the Zig device module, resolved once. `name` is stable for the life of the process.
+pub const Kernel = struct { f: CuFunction, name: []const u8 };
+
+/// Looks up a kernel of the Zig device module by name; the handle is cached.
+fn deviceFunction(name: []const u8) !Kernel {
+    const s = try ensureDriver();
+    if (s.dev_module == null) return CudaError.KernelNotFound;
+    global_mutex.lock();
+    defer global_mutex.unlock();
+    if (s.dev_fns.getEntry(name)) |e| return .{ .f = e.value_ptr.*, .name = e.key_ptr.* };
+    var buf: [64]u8 = undefined;
+    if (name.len >= buf.len) return CudaError.KernelNotFound;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    var f: CuFunction = null;
+    if (s.api.?.cuModuleGetFunction(&f, s.dev_module, @ptrCast(&buf)) != 0 or f == null) return CudaError.KernelNotFound;
+    const key = std.heap.page_allocator.dupe(u8, name) catch return error.OutOfMemory;
+    s.dev_fns.put(std.heap.page_allocator, key, f) catch return error.OutOfMemory;
+    return .{ .f = f, .name = key };
+}
+
+/// Threads per block of the matrix kernels: the decode kernel's reduction width, and exactly the
+/// `gemm_tile_rows * gemm_tile_tokens` outputs of one tile of the batched kernel.
+pub const gemm_block_threads: c_uint = 128;
+/// Output rows one block of the decode kernel computes, a warp each (see `gemv_rows` in cuda_device.zig).
+pub const gemv_rows: usize = 4;
+/// Output rows and tokens of one tile of the batched matrix kernel (see `tile_rows`/`tile_tokens` in cuda_device.zig).
+pub const gemm_tile_rows: usize = 16;
+pub const gemm_tile_tokens: usize = 8;
+
+/// Grid of a matrix launch for `m` output rows and `n` tokens: one block per `gemv_rows` rows for a single token, one
+/// block per `gemm_tile_rows` x `gemm_tile_tokens` tile otherwise.
+pub fn gemmGrid(m: usize, n: usize) [2]u32 {
+    if (n <= 1) return .{ @intCast((m + gemv_rows - 1) / gemv_rows), 1 };
+    return .{ @intCast((m + gemm_tile_rows - 1) / gemm_tile_rows), @intCast((n + gemm_tile_tokens - 1) / gemm_tile_tokens) };
+}
+
+/// True when this process uses the sm_80 build of the device code and so has the tensor core kernels.
+pub fn hasTensorCores() bool {
+    const s = ensureDriver() catch return false;
+    return s.tensor_cores;
+}
+
+/// Tokens from which the tensor core kernel is used: below this the 128 token tile is mostly padding and the tiled
+/// kernel is as fast.
+pub const tensor_min_tokens: usize = 16;
+/// Output rows and tokens of one block of the tensor core kernel, and its thread count (see `tc_*` in cuda_device.zig).
+pub const tensor_tile_rows: usize = 64;
+pub const tensor_tile_tokens: usize = 128;
+pub const tensor_block_threads: c_uint = 256;
+
+/// The single-token integer kernel for `fmt` (activations quantized by `quantize_act`, products with `dp4a`), or null
+/// when the format has none. `HK_NO_DP4A=1` turns these kernels off.
+pub fn dp4aKernel(fmt: format.StorageType) ?Kernel {
+    if (envvar.isSet("HK_NO_DP4A")) return null;
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "gemv_dp4a_{s}", .{@tagName(fmt)}) catch return null;
+    return deviceKernel(name) catch null;
+}
+
+/// The integer tensor core kernel for `fmt` (activations quantized to int8, see `quantize_act`), or null when the device
+/// has none or the format has no integer kernel yet.
+pub fn immaKernel(fmt: format.StorageType) ?Kernel {
+    if (!hasTensorCores()) return null;
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "gemm_imma_{s}", .{@tagName(fmt)}) catch return null;
+    return deviceKernel(name) catch null;
+}
+
+/// The tensor core matrix kernel for `fmt`, or null when the device has none.
+pub fn tensorKernel(fmt: format.StorageType) ?Kernel {
+    if (!hasTensorCores()) return null;
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "gemm_tc_{s}", .{@tagName(fmt)}) catch return null;
+    return deviceKernel(name) catch null;
+}
+
+/// The matrix kernel for `fmt` suited to `n` tokens: a single token gets the lean decode (matrix-vector) kernel,
+/// anything larger the tiled kernel that stages activations in shared memory and reuses each decoded weight block.
+pub fn gemmKernel(fmt: format.StorageType, n: usize) !Kernel {
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{s}_{s}", .{ if (n <= 1) "gemv" else "gemm", @tagName(fmt) }) catch return CudaError.UnsupportedStorageType;
+    return deviceKernel(name) catch |e| switch (e) {
+        error.KernelNotFound => CudaError.UnsupportedStorageType,
+        else => e,
+    };
+}
+
+/// y[t][0..m] = W[m x k] * x[t] for `n` tokens (x is [n][k], y is [n][m]), with W stored as `fmt` blocks row after row
+/// (the container's layout), run by the Zig device kernel for that format. `k` must be a whole number of blocks. The
+/// same block decoders the CPU engine uses run on the device, so every format the CPU decodes is available here.
+pub fn deviceGemm(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize, n: usize) !void {
+    const kernel = try gemmKernel(fmt, n);
+    const g = gemmGrid(m, n);
+    try launchKernel2D(kernel, g[0], g[1], gemm_block_threads, .{
+        @as(u64, toDevicePtr(w)), @as(u64, toDevicePtr(x)), @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+    });
+}
+
+/// Like `deviceGemm`, on the integer tensor core kernel: activations are quantized to int8 first, products accumulate
+/// in int32. Fails where the device has none or `fmt` has no such kernel.
+pub fn deviceGemmImma(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize, n: usize) !void {
+    const kernel = immaKernel(fmt) orelse return CudaError.KernelNotFound;
+    const xq = try deviceAlloc(n * k);
+    defer deviceFree(xq);
+    const xs = try deviceAlloc(n * (k / 32) * 4);
+    defer deviceFree(xs);
+    const xsum = try deviceAlloc(n * (k / 32) * 4);
+    defer deviceFree(xsum);
+    const nblocks: u32 = @intCast(n * (k / 32));
+    try launchKernel(try deviceKernel("quantize_act"), (nblocks * 32 + 127) / 128, 128, .{ xq.addr, xs.addr, xsum.addr, @as(u64, toDevicePtr(x)), nblocks });
+    try launchKernel2D(kernel, @intCast((m + tensor_tile_rows - 1) / tensor_tile_rows), @intCast((n + tensor_tile_tokens - 1) / tensor_tile_tokens), tensor_block_threads, .{
+        @as(u64, toDevicePtr(w)), xq.addr, xs.addr, xsum.addr, @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+    });
+}
+
+/// Like `deviceGemm`, on the tensor core kernel (f16 operands, f32 accumulation). Fails where the device has none.
+pub fn deviceGemmTensor(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize, n: usize) !void {
+    const kernel = tensorKernel(fmt) orelse return CudaError.KernelNotFound;
+    // The kernel takes halves: convert the f32 activations into scratch first.
+    const half = try deviceAlloc(n * k * 2);
+    defer deviceFree(half);
+    try launchKernel(try deviceKernel("to_half"), @intCast((n * k / 2 + 255) / 256), 256, .{ half.addr, @as(u64, toDevicePtr(x)), @as(u32, @intCast(n * k / 2)) });
+    try launchKernel2D(kernel, @intCast((m + tensor_tile_rows - 1) / tensor_tile_rows), @intCast((n + tensor_tile_tokens - 1) / tensor_tile_tokens), tensor_block_threads, .{
+        @as(u64, toDevicePtr(w)), half.addr, @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+    });
+}
+
+// ---------------------------------------------------------------------
+// Exact-lifetime device memory and typed kernel launches (used by the engine)
+// ---------------------------------------------------------------------
+
+/// A device allocation with an exact lifetime: `deviceFree` returns the memory to the driver at once. Used for
+/// model weights and the KV cache, which must not linger in a cache after the model is unloaded.
+pub const DeviceMem = struct {
+    addr: u64,
+    len: usize,
+
+    /// Address `offset` bytes into the allocation, as the kernels receive it.
+    pub fn at(self: DeviceMem, offset: usize) u64 {
+        std.debug.assert(offset <= self.len);
+        return self.addr + offset;
+    }
+};
+
+const cuda_error_out_of_memory: CuResult = 2;
+
+pub fn deviceAlloc(nbytes: usize) !DeviceMem {
+    const s = try ensureDriver();
+    var p: CuDeviceptr = 0;
+    // 16 bytes of slack: kernels that read whole words around unaligned blocks may touch the bytes after the last one.
+    const r = s.api.?.cuMemAlloc_v2(&p, @max(nbytes, 1) + 16);
+    if (r == cuda_error_out_of_memory) return CudaError.OutOfDeviceMemory;
+    if (r != 0 or p == 0) return CudaError.CudaCallFailed;
+    return .{ .addr = p, .len = nbytes };
+}
+
+pub fn deviceFree(m: DeviceMem) void {
+    const s = ensureDriver() catch return;
+    _ = s.api.?.cuMemFree_v2(m.addr);
+}
+
+pub fn copyToDevice(dst: u64, src: []const u8) !void {
+    if (src.len == 0) return;
+    const s = try ensureDriver();
+    if (s.api.?.cuMemcpyHtoD_v2(dst, src.ptr, src.len) != 0) return CudaError.CudaCallFailed;
+}
+
+pub fn copyFromDevice(dst: []u8, src: u64) !void {
+    if (dst.len == 0) return;
+    const s = try ensureDriver();
+    if (s.api.?.cuMemcpyDtoH_v2(dst.ptr, src, dst.len) != 0) return CudaError.CudaCallFailed;
+}
+
+pub fn deviceKernel(name: []const u8) !Kernel {
+    return deviceFunction(name);
+}
+
+/// Launches `k` on the default stream with a one dimensional grid. `args` is a tuple whose fields match the kernel's
+/// parameters exactly in size: device pointers as `u64`, counts as `u32`, scalars as `f32`.
+pub fn launchKernel(k: Kernel, grid: u32, block: u32, args: anytype) !void {
+    return launchKernel2D(k, grid, 1, block, args);
+}
+
+/// True when the environment variable is set to switch a feature off.
+pub fn envDisabled(name: [*:0]const u8) bool {
+    return envvar.isSet(name);
+}
+
+/// The stream kernels are launched on: null (the default stream) except while a graph is being captured.
+var launch_stream: CuStream = null;
+
+/// Directs `launchKernel` to `stream` (null: the default stream). Not thread safe; the engine calls it around a capture.
+pub fn setLaunchStream(stream: ?CudaStream) void {
+    launch_stream = if (stream) |st| st.handle else null;
+}
+
+/// Like `launchKernel` with a two dimensional grid.
+pub fn launchKernel2D(k: Kernel, grid_x: u32, grid_y: u32, block: u32, args: anytype) !void {
+    const s = try ensureDriver();
+    var storage = args;
+    const n = args.len;
+    var ptrs: [n]?*anyopaque = undefined;
+    inline for (0..n) |i| ptrs[i] = @ptrCast(&storage[i]);
+    if (profiling.on) try profiling.begin(s);
+    if (s.api.?.cuLaunchKernel(k.f, grid_x, grid_y, 1, block, 1, 1, 0, launch_stream, &ptrs, null) != 0) return CudaError.CudaCallFailed;
+    if (profiling.on) try profiling.end(s, k.name);
+}
+
+/// Per kernel GPU time, measured with events around each launch. It synchronizes after every launch, so it slows the
+/// run down and exists to say where the time goes, not to measure speed.
+pub const profiling = struct {
+    const max_kernels = 96;
+    pub var on = false;
+    var start: CuEvent = null;
+    var stop: CuEvent = null;
+    var names: [max_kernels][]const u8 = undefined;
+    var ms: [max_kernels]f64 = @splat(0);
+    var calls: [max_kernels]u64 = @splat(0);
+    var count: usize = 0;
+
+    pub fn enable() !void {
+        const s = try ensureDriver();
+        if (on) return;
+        if (s.api.?.cuEventCreate(&start, 0) != 0 or s.api.?.cuEventCreate(&stop, 0) != 0) return CudaError.CudaCallFailed;
+        on = true;
+    }
+
+    pub fn reset() void {
+        ms = @splat(0);
+        calls = @splat(0);
+    }
+
+    fn begin(s: *DriverState) !void {
+        if (s.api.?.cuEventRecord(start, null) != 0) return CudaError.CudaCallFailed;
+    }
+
+    fn end(s: *DriverState, name: []const u8) !void {
+        if (s.api.?.cuEventRecord(stop, null) != 0 or s.api.?.cuEventSynchronize(stop) != 0) return CudaError.CudaCallFailed;
+        var t: f32 = 0;
+        if (s.api.?.cuEventElapsedTime(&t, start, stop) != 0) return CudaError.CudaCallFailed;
+        var i: usize = 0;
+        while (i < count and !std.mem.eql(u8, names[i], name)) : (i += 1) {}
+        if (i == count) {
+            if (count == max_kernels) return;
+            names[count] = name;
+            count += 1;
+        }
+        ms[i] += t;
+        calls[i] += 1;
+    }
+
+    /// One line per kernel: calls, total ms, mean microseconds, share of the total.
+    pub fn report(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var total: f64 = 0;
+        for (ms[0..count]) |v| total += v;
+        for (names[0..count], ms[0..count], calls[0..count]) |nm, t, c| {
+            const mean_us = if (c == 0) 0 else t * 1000.0 / @as(f64, @floatFromInt(c));
+            try w.print("  {s:<18} {d:>7} calls {d:>9.2} ms  {d:>8.1} us/call  {d:>5.1}%\n", .{ nm, c, t, mean_us, if (total > 0) 100.0 * t / total else 0 });
+        }
+        try w.print("  total {d:.2} ms\n", .{total});
+    }
+};

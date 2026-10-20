@@ -42,7 +42,7 @@ What this does and does not protect:
 - Detects: edits to an earlier record's name, target or payload; deleted or reordered middle records.
 - Does not cover: the base tensors, the header, or metadata. Changing weights does not invalidate the chain.
 - Does not authenticate: anyone who can rewrite the file can recompute the hashes. There are no signatures.
-- The per-record `data_crc32` field is reserved and currently always `0`.
+- New appendix records include a CRC-32/ISO-HDLC checksum of their payload. Readers accept legacy records with `data_crc32 == 0`, but reject a nonzero checksum that does not match.
 
 ---
 

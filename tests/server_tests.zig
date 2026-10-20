@@ -184,7 +184,8 @@ test "server end to end" {
 
     // The prompt cache reuses a shared prefix.
     {
-        const long = "shared system text " ** 6;
+        const unit = "shared system text ";
+        const long = unit ++ unit ++ unit ++ unit ++ unit ++ unit;
         const b1 = "{\"messages\":[{\"role\":\"system\",\"content\":\"" ++ long ++ "\"},{\"role\":\"user\",\"content\":\"one\"}],\"temperature\":0,\"max_tokens\":4}";
         const b2 = "{\"messages\":[{\"role\":\"system\",\"content\":\"" ++ long ++ "\"},{\"role\":\"user\",\"content\":\"two\"}],\"temperature\":0,\"max_tokens\":4}";
         const r1 = try srv.post("/v1/chat/completions", b1, &.{});
@@ -333,7 +334,11 @@ test "an oversized body is refused" {
     @memset(big, 'a');
     const body = try std.fmt.allocPrint(gpa, "{{\"messages\":[{{\"role\":\"user\",\"content\":\"{s}\"}}]}}", .{big});
     defer gpa.free(body);
-    const r = try srv.post("/v1/chat/completions", body, &.{});
+    const r = srv.post("/v1/chat/completions", body, &.{}) catch |e| {
+        // macOS has failed here without a message; say what the client saw.
+        std.debug.print("the oversized request failed on the client side: {s}\n", .{@errorName(e)});
+        return e;
+    };
     defer r.deinit(gpa);
     try std.testing.expectEqual(@as(u16, 413), r.status);
     const ok = try chat(&srv, "hello", 20);

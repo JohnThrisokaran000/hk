@@ -437,7 +437,7 @@ test "simd tensor ops: dot product and gemv" {
     const a = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0 };
     const b = [_]f32{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
 
-    const dot = hk.tensor_ops.dotProductF32(&a, &b);
+    const dot = try hk.engine.abi_ops.dotF32(&a, &b);
     // sum(1..10) * 0.5 = 55 * 0.5 = 27.5
     try std.testing.expectApproxEqAbs(@as(f32, 27.5), dot, 1e-5);
 
@@ -450,7 +450,7 @@ test "simd tensor ops: dot product and gemv" {
     const bias = [_]f32{ 10.0, 20.0 };
     var y: [2]f32 = undefined;
 
-    hk.tensor_ops.gemvF32(&w, &x, &bias, &y, 2, 4);
+    try hk.engine.abi_ops.gemvF32(&w, &x, &bias, &y, 2, 4);
     // row 0: 1+2+3+4 + 10 = 20
     // row 1: 5+6+7+8 + 20 = 46
     try std.testing.expectEqual(@as(f32, 20.0), y[0]);
@@ -466,7 +466,7 @@ test "simd gemv q8_0" {
     const bytes = std.mem.sliceAsBytes(&blocks);
     var x: [64]f32 = @as([64]f32, @splat(1.0));
     var y: [2]f32 = undefined;
-    hk.tensor_ops.gemvQ8_0(bytes, &x, null, &y, 2, 64);
+    try hk.engine.abi_ops.gemvQ8_0(bytes, &x, null, &y, 2, 64);
     try std.testing.expectEqual(@as(f32, 64.0), y[0]);
     try std.testing.expectEqual(@as(f32, 64.0), y[1]);
 }
@@ -480,7 +480,7 @@ test "simd gemv q4_0" {
     const bytes = std.mem.sliceAsBytes(&blocks);
     var x: [64]f32 = @as([64]f32, @splat(1.0));
     var y: [2]f32 = undefined;
-    hk.tensor_ops.gemvQ4_0(bytes, &x, null, &y, 2, 64);
+    try hk.engine.abi_ops.gemvQ4_0(bytes, &x, null, &y, 2, 64);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), y[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), y[1], 1e-4);
 }
@@ -496,7 +496,7 @@ test "simd gemv q4_k" {
     const bytes = std.mem.sliceAsBytes(&blocks);
     var x: [256]f32 = @as([256]f32, @splat(1.0));
     var y: [2]f32 = undefined;
-    hk.tensor_ops.gemvQ4_K(bytes, &x, null, &y, 2, 256);
+    try hk.engine.abi_ops.gemvQ4_K(bytes, &x, null, &y, 2, 256);
 }
 
 
@@ -522,10 +522,10 @@ test "net2wider function preservation" {
     // h1[0] = 1*1 + 2*0.5 + 3*(-1) + 0.1 = 1 + 1 - 3 + 0.1 = -0.9
     // h1[1] = 4*1 + 5*0.5 + 6*(-1) + 0.2 = 4 + 2.5 - 6 + 0.2 = 0.7
     var h1_orig: [2]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w1_old, &x, &b1_old, &h1_orig, 2, 3);
+    try hk.engine.abi_ops.gemvF32(&w1_old, &x, &b1_old, &h1_orig, 2, 3);
 
     var y_orig: [2]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w2_old, &h1_orig, &b2, &y_orig, 2, 2);
+    try hk.engine.abi_ops.gemvF32(&w2_old, &h1_orig, &b2, &y_orig, 2, 2);
 
     // Expand Layer 1 from 2 units to 4 units
     var w1_new: [4 * 3]f32 = undefined;
@@ -549,10 +549,10 @@ test "net2wider function preservation" {
 
     // Forward pass through wider network
     var h1_new: [4]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w1_new, &x, &b1_new, &h1_new, 4, 3);
+    try hk.engine.abi_ops.gemvF32(&w1_new, &x, &b1_new, &h1_new, 4, 3);
 
     var y_new: [2]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w2_new, &h1_new, &b2, &y_new, 2, 4);
+    try hk.engine.abi_ops.gemvF32(&w2_new, &h1_new, &b2, &y_new, 2, 4);
 
     // Check exact equivalence: y_orig == y_new
     try std.testing.expectApproxEqAbs(y_orig[0], y_new[0], 1e-5);
@@ -642,6 +642,144 @@ test "Appendix cryptographic SHA-256 tamper detection" {
 
     try std.testing.expectEqual(2, app_reader.records.items.len);
     try std.testing.expect(!app_reader.verifyLineage());
+}
+
+test "Appendix CRC-32 rejects a corrupted payload" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_appendix_crc.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    defer cwd.deleteFile(io, test_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{1.0};
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    try hk.appendix.appendRecordToFile(allocator, test_path, .{
+        .entry_type = .delta_patch,
+        .name = "patch.1",
+        .generation = 1,
+        .timestamp = 1,
+        .data = "checksum-protected payload",
+    });
+
+    var region = try hk.platform.mapOrReadFile(test_path, allocator);
+    const appendix_offset: usize = @intCast((@as(*const hk.FileHeader, @ptrCast(@alignCast(region.bytes.ptr)))).appendix_offset);
+    const payload_offset = appendix_offset + @sizeOf(hk.format.AppendixRecordHeader) + "patch.1".len;
+    region.deinit(allocator);
+
+    const corrupted = [_]u8{'X'};
+    try hk.platform.writeBytesAtOffset(test_path, &corrupted, payload_offset, allocator);
+
+    var corrupted_region = try hk.platform.mapOrReadFile(test_path, allocator);
+    defer corrupted_region.deinit(allocator);
+    try std.testing.expectError(
+        hk.appendix.AppendixError.ChecksumMismatch,
+        hk.appendix.AppendixReader.init(allocator, corrupted_region.bytes),
+    );
+}
+
+test "container SHA-256 seal detects tensor corruption" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_container_integrity.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    defer cwd.deleteFile(io, test_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{ 1.0, 2.0 };
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 2, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    var reader = try hk.HKReader.open(test_path, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try reader.verifyIntegrity());
+    const tensor_offset = reader.toc.entries.items[0].data_offset;
+    reader.deinit();
+
+    const corrupted = [_]u8{0xFF};
+    try hk.platform.writeBytesAtOffset(test_path, &corrupted, tensor_offset, allocator);
+
+    var corrupted_reader = try hk.HKReader.open(test_path, allocator);
+    defer corrupted_reader.deinit();
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try corrupted_reader.verifyIntegrity());
+}
+
+test "reader rejects an overflowing metadata range" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_overflowing_header.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    defer cwd.deleteFile(io, test_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{1.0};
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    var region = try hk.platform.mapOrReadFile(test_path, allocator);
+    const header_ptr: *const hk.FileHeader = @ptrCast(@alignCast(region.bytes.ptr));
+    var malformed = header_ptr.*;
+    malformed.metadata_size = std.math.maxInt(u64);
+    region.deinit(allocator);
+    try hk.platform.writeBytesAtOffset(test_path, std.mem.asBytes(&malformed), 0, allocator);
+
+    try std.testing.expectError(error.MetadataOutOfBounds, hk.HKReader.open(test_path, allocator));
+}
+
+test "metadata journal restores an interrupted mutation" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_metadata_journal.hk";
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    const journal_path = "test_metadata_journal.hk.hkmeta-journal";
+    defer cwd.deleteFile(io, test_path) catch {};
+    defer cwd.deleteFile(io, journal_path) catch {};
+
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    const weights = [_]f32{1.0};
+    try writer.addMetadataString("name", "before");
+    try writer.addTensor(.{
+        .name = "base.weight",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+        .data = std.mem.sliceAsBytes(&weights),
+    });
+    try writer.writeToFile(test_path);
+
+    try hk.transaction.begin(test_path, allocator, .metadata_prefix);
+    const invalid_magic = [_]u8{0};
+    try hk.platform.writeBytesAtOffset(test_path, &invalid_magic, 0, allocator);
+    try std.testing.expectEqual(hk.transaction.Recovery.restored, try hk.transaction.recover(test_path, allocator));
+
+    var reader = try hk.HKReader.open(test_path, allocator);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("before", reader.metadata_map.getString("name").?);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try reader.verifyIntegrity());
+    try std.testing.expectError(error.FileNotFound, cwd.openFile(io, journal_path, .{}));
 }
 
 test "Appendix all six entry types roundtrip" {
@@ -748,7 +886,7 @@ test "native SwiGLU Net2Wider exact function preservation" {
     const out_old = try allocator.alloc(f32, out_f);
     defer allocator.free(out_old);
 
-    try hk.tensor_ops.forwardSwiGLUF32(
+    try hk.ops.forwardSwiGLUF32(
         x,
         w_gate_old,
         null,
@@ -800,7 +938,7 @@ test "native SwiGLU Net2Wider exact function preservation" {
     const out_new = try allocator.alloc(f32, out_f);
     defer allocator.free(out_new);
 
-    try hk.tensor_ops.forwardSwiGLUF32(
+    try hk.ops.forwardSwiGLUF32(
         x,
         w_gate_new,
         null,
@@ -921,7 +1059,7 @@ test "native SIMD RMSNorm and SiLU activation" {
     }
 
     // Test RMSNorm
-    hk.tensor_ops.rmsNormF32(x, w, 1e-5, out);
+    hk.ops.rmsNormF32(x, w, 1e-5, out);
 
     // Compute expected RMS
     var sum_sq: f32 = 0.0;
@@ -936,7 +1074,7 @@ test "native SIMD RMSNorm and SiLU activation" {
     // Test SiLU: f(0.0) = 0.0, f(2.0) = 2.0 / (1 + exp(-2))
     const silu_in = [_]f32{ 0.0, 2.0, -2.0 };
     var silu_out: [3]f32 = undefined;
-    hk.tensor_ops.siluF32(&silu_in, &silu_out);
+    hk.ops.siluF32(&silu_in, &silu_out);
 
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), silu_out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.761594), silu_out[1], 1e-4);
@@ -1129,7 +1267,7 @@ test "k-quants q4_k super-block roundtrip" {
         weights[i] = @as(f32, @floatFromInt(i)) / 256.0 - 0.5;
     }
 
-    var block: hk.quantization.BlockQ4_K = .{};
+    var block: hk.quantization.BlockQ4_K = std.mem.zeroes(hk.quantization.BlockQ4_K);
     hk.quantization.quantizeSuperBlockQ4_K(&weights, &block);
 
     var dequant: [256]f32 = undefined;
@@ -1147,7 +1285,7 @@ test "k-quants q8_k super-block roundtrip" {
         weights[i] = (@as(f32, @floatFromInt(i)) - 128.0) / 128.0;
     }
 
-    var block: hk.quantization.BlockQ8_K = .{};
+    var block: hk.quantization.BlockQ8_K = std.mem.zeroes(hk.quantization.BlockQ8_K);
     hk.quantization.quantizeSuperBlockQ8_K(&weights, &block);
 
     var dequant: [256]f32 = undefined;
@@ -1315,8 +1453,8 @@ test "raw weight storage roundtrip with universal page alignment" {
     try std.testing.expectEqual(4, read_bf16.len);
     try std.testing.expectEqual(@as(u16, 0x3F80), read_bf16[0]);
     // Check direct conversion to f32
-    try std.testing.expectEqual(@as(f32, 1.0), hk.tensor_ops.bf16ToF32(read_bf16[0]));
-    try std.testing.expectEqual(@as(f32, 2.0), hk.tensor_ops.bf16ToF32(read_bf16[1]));
+    try std.testing.expectEqual(@as(f32, 1.0), hk.ops.bf16ToF32(read_bf16[0]));
+    try std.testing.expectEqual(@as(f32, 2.0), hk.ops.bf16ToF32(read_bf16[1]));
 
     const e_i8 = reader.toc.find("raw_layer.int8").?;
     const read_i8 = try reader.getRawInt8(e_i8);
@@ -1402,18 +1540,566 @@ test "raw BF16 and F16 GEMV mathematical correctness" {
 
     // y[0] = 1.0*0.5 + 2.0*(-1.0) = 0.5 - 2.0 = -1.5
     // y[1] = 3.0*0.5 + 4.0*(-1.0) = 1.5 - 4.0 = -2.5
-    hk.tensor_ops.gemvBF16(&w_bf16, &x, null, &y, 2, 2);
+    try hk.engine.abi_ops.gemvBF16(&w_bf16, &x, null, &y, 2, 2);
     try std.testing.expectApproxEqAbs(@as(f32, -1.5), y[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, -2.5), y[1], 1e-5);
 
     // FP16 test
     const w_f16 = [_]f16{ 1.0, 2.0, 3.0, 4.0 };
-    hk.tensor_ops.gemvF16(&w_f16, &x, null, &y, 2, 2);
+    try hk.engine.abi_ops.gemvF16(&w_f16, &x, null, &y, 2, 2);
     try std.testing.expectApproxEqAbs(@as(f32, -1.5), y[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, -2.5), y[1], 1e-5);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Integrity / crash-safety suite. Each test names the guard it protects; the guard was disabled once
+// to confirm the test goes red (see HANDOFF log).
+// ---------------------------------------------------------------------------------------------
 
+const Fixture = struct {
+    path: []const u8,
+    journal: []const u8,
+    partial: []const u8,
 
+    fn init(comptime name: []const u8) Fixture {
+        return .{
+            .path = "test_" ++ name ++ ".hk",
+            .journal = "test_" ++ name ++ ".hk.hkmeta-journal",
+            .partial = "test_" ++ name ++ ".hk.partial",
+        };
+    }
 
+    fn cleanup(self: Fixture) void {
+        const io = std.Options.debug_io;
+        const cwd = std.Io.Dir.cwd();
+        cwd.deleteFile(io, self.path) catch {};
+        cwd.deleteFile(io, self.journal) catch {};
+        cwd.deleteFile(io, self.partial) catch {};
+    }
 
+    /// Creates the journal file with arbitrary (torn) content.
+    fn writeTornJournal(self: Fixture) !void {
+        const io = std.Options.debug_io;
+        var f = try std.Io.Dir.cwd().createFile(io, self.journal, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "HKMJ-torn");
+    }
+
+    fn partialExists(self: Fixture) bool {
+        std.Io.Dir.cwd().access(std.Options.debug_io, self.partial, .{}) catch return false;
+        return true;
+    }
+
+    /// Writes a sealed container holding one f32 tensor of `n_floats` values.
+    fn write(self: Fixture, allocator: std.mem.Allocator, n_floats: usize) !void {
+        const values = try allocator.alloc(f32, n_floats);
+        defer allocator.free(values);
+        for (values, 0..) |*v, i| v.* = @floatFromInt(i % 251);
+        var writer = hk.HKWriter.init(allocator);
+        defer writer.deinit();
+        try writer.addTensor(.{
+            .name = "base.weight",
+            .storage_type = .f32,
+            .ndim = 1,
+            .shape = .{ n_floats, 0, 0, 0, 0, 0, 0, 0 },
+            .data = std.mem.sliceAsBytes(values),
+        });
+        try writer.writeToFile(self.path);
+    }
+
+    fn bytes(self: Fixture, allocator: std.mem.Allocator) ![]u8 {
+        var region = try hk.platform.mapOrReadFile(self.path, allocator);
+        defer region.deinit(allocator);
+        return allocator.dupe(u8, region.bytes);
+    }
+
+    fn flipByte(self: Fixture, allocator: std.mem.Allocator, offset: u64) !void {
+        var region = try hk.platform.mapOrReadFile(self.path, allocator);
+        const original = region.bytes[offset];
+        region.deinit(allocator);
+        try hk.platform.writeBytesAtOffset(self.path, &[_]u8{original ^ 0xFF}, offset, allocator);
+    }
+
+    fn tensorOffset(self: Fixture, allocator: std.mem.Allocator) !u64 {
+        var reader = try hk.HKReader.open(self.path, allocator);
+        defer reader.deinit();
+        return reader.toc.entries.items[0].data_offset;
+    }
+
+    fn journalExists(self: Fixture) bool {
+        std.Io.Dir.cwd().access(std.Options.debug_io, self.journal, .{}) catch return false;
+        return true;
+    }
+};
+
+fn appendTestRecord(allocator: std.mem.Allocator, path: []const u8, generation: u32, parent: [32]u8) !void {
+    try hk.appendix.appendRecordToFile(allocator, path, .{
+        .entry_type = .lora_adapter,
+        .flags = hk.format.AppendixFlags.ACTIVE,
+        .name = "adapter",
+        .target = "base.weight",
+        .generation = generation,
+        .timestamp = 1000 + generation,
+        .parent_hash = parent,
+        .data = "payload-bytes",
+    });
+}
+
+test "seal streaming covers every chunk of a multi-chunk file" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("seal_chunks");
+    defer fx.cleanup();
+    // 700k floats = 2.8 MB: more than two 1 MiB chunks.
+    try fx.write(allocator, 700_000);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+
+    const tensor_offset = try fx.tensorOffset(allocator);
+    const probes = [_]u64{ 10, hk.integrity.chunk_len + 5, 2 * hk.integrity.chunk_len + 5, 2_800_000 - 1 };
+    for (probes) |delta| {
+        try fx.flipByte(allocator, tensor_offset + delta);
+        try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+        var reader = try hk.HKReader.open(fx.path, allocator);
+        defer reader.deinit();
+        // The mapped and streaming verifiers must agree.
+        try std.testing.expectEqual(hk.integrity.Verification.invalid, try reader.verifyIntegrity());
+        try fx.flipByte(allocator, tensor_offset + delta); // restore
+        try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    }
+}
+
+test "mutations refuse to re-seal an already corrupted container" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("refuse_reseal");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    try appendTestRecord(allocator, fx.path, 1, @splat(0));
+    try fx.flipByte(allocator, try fx.tensorOffset(allocator));
+
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    try std.testing.expectError(error.ChecksumMismatch, hk.metadata.patchFileMetadataInPlace(allocator, fx.path, "name", "x"));
+    try std.testing.expectError(error.ChecksumMismatch, appendTestRecord(allocator, fx.path, 2, @splat(1)));
+    try std.testing.expectError(error.ChecksumMismatch, hk.appendix.rollbackToFile(allocator, fx.path, 0));
+
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expect(!fx.journalExists());
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "a legacy unsealed container is sealed by its first mutation" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("legacy_seal");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+
+    var region = try hk.platform.mapOrReadFile(fx.path, allocator);
+    var legacy: hk.FileHeader = @as(*const hk.FileHeader, @ptrCast(@alignCast(region.bytes.ptr))).*;
+    region.deinit(allocator);
+    legacy.flags &= ~hk.format.HeaderFlags.HAS_SHA256_CHECKSUM;
+    legacy.checksum = 0;
+    @memset(legacy.reserved1[0..hk.integrity.digest_len], 0);
+    try hk.platform.writeBytesAtOffset(fx.path, std.mem.asBytes(&legacy), 0, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.legacy_missing, try hk.integrity.verifyFile(fx.path, allocator));
+
+    try hk.metadata.patchFileMetadataInPlace(allocator, fx.path, "name", "now-sealed");
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "interrupted append rolls back to the previous sealed file" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("append_crash");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    // Simulate a crash after the journal, the appended record and the header edit, but before the seal.
+    try hk.transaction.begin(fx.path, allocator, .header_only);
+    try hk.platform.writeBytesAtOffset(fx.path, "garbage-record-bytes-from-a-dead-process", before.len, allocator);
+    var hdr: hk.FileHeader = @as(*const hk.FileHeader, @ptrCast(@alignCast(before.ptr))).*;
+    hdr.appendix_offset = before.len;
+    hdr.flags |= hk.format.HeaderFlags.HAS_APPENDIX;
+    try hk.platform.writeBytesAtOffset(fx.path, std.mem.asBytes(&hdr), 0, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+
+    try std.testing.expectEqual(hk.transaction.Recovery.restored, try hk.transaction.recover(fx.path, allocator));
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    try std.testing.expect(!fx.journalExists());
+}
+
+test "interrupted rollback is completed to the requested state, not guessed" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("rollback_crash");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    try appendTestRecord(allocator, fx.path, 1, @splat(0));
+    const size_after_gen1 = blk: {
+        const gen1 = try fx.bytes(allocator);
+        defer allocator.free(gen1);
+        break :blk gen1.len;
+    };
+    try appendTestRecord(allocator, fx.path, 2, @splat(1));
+
+    const full = try fx.bytes(allocator);
+    defer allocator.free(full);
+    const header: hk.FileHeader = @as(*const hk.FileHeader, @ptrCast(@alignCast(full.ptr))).*;
+
+    // Crash after journaling and truncating, before the seal was refreshed.
+    try hk.transaction.beginRollForward(fx.path, allocator, header, size_after_gen1);
+    try hk.platform.truncateFile(fx.path, size_after_gen1, allocator);
+    try std.testing.expectEqual(hk.integrity.Verification.invalid, try hk.integrity.verifyFile(fx.path, allocator));
+
+    try std.testing.expectEqual(hk.transaction.Recovery.completed, try hk.transaction.recover(fx.path, allocator));
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqual(size_after_gen1, after.len);
+    try std.testing.expect(!fx.journalExists());
+
+    // And the normal path leaves a sealed file too.
+    try hk.appendix.rollbackToFile(allocator, fx.path, 0);
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "a torn journal is discarded only when the container's seal proves it untouched" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("torn_journal");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+
+    try fx.writeTornJournal();
+    try std.testing.expectEqual(hk.transaction.Recovery.discarded_torn_journal, try hk.transaction.recover(fx.path, allocator));
+    try std.testing.expect(!fx.journalExists());
+
+    // Same torn journal next to a damaged container: must stay flagged, journal kept for inspection.
+    try fx.writeTornJournal();
+    try fx.flipByte(allocator, try fx.tensorOffset(allocator));
+    try std.testing.expectError(error.InvalidJournal, hk.transaction.recover(fx.path, allocator));
+    try std.testing.expect(fx.journalExists());
+}
+
+test "a failed metadata patch rolls back immediately and leaves no journal" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("patch_failure");
+    defer fx.cleanup();
+    try fx.write(allocator, 64);
+    try appendTestRecord(allocator, fx.path, 1, @splat(0));
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    // Far larger than the alignment padding, and the appendix forbids relocating the metadata.
+    const huge = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(huge);
+    @memset(huge, 'x');
+    try std.testing.expectError(error.MetadataExceedsPaddingWithAppendix, hk.metadata.patchFileMetadataInPlace(allocator, fx.path, "big", huge));
+
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expect(!fx.journalExists());
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+}
+
+test "streamed conversion output is sealed and leaves no partial file" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const fx = Fixture.init("stream_sealed");
+    defer fx.cleanup();
+
+    var meta = hk.metadata.MetadataMap.init(allocator);
+    defer meta.deinit();
+    const specs = [_]hk.convert.stream_writer.TensorSpec{.{
+        .name = "w",
+        .storage_type = .f32,
+        .ndim = 1,
+        .shape = .{ 16, 0, 0, 0, 0, 0, 0, 0 },
+        .data_size = 64,
+    }};
+    var w = try hk.convert.stream_writer.StreamWriter.begin(allocator, io, fx.path, &meta, &specs, hk.format.DEFAULT_ALIGNMENT_BYTES);
+    defer w.deinit();
+    const payload: [64]u8 = @splat(7);
+    try w.write(0, 0, &payload);
+    try w.finish();
+
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    try std.testing.expect(!fx.partialExists());
+}
+
+test "HKWriter replaces its target atomically and leaves no partial file" {
+    const allocator = std.testing.allocator;
+    const fx = Fixture.init("writer_atomic");
+    defer fx.cleanup();
+    try fx.write(allocator, 8);
+    try fx.write(allocator, 16); // overwrite an existing container
+    try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));
+    try std.testing.expect(!fx.partialExists());
+}
+
+test "a failed HKWriter write leaves the existing container untouched" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const cwd = std.Io.Dir.cwd();
+    const fx = Fixture.init("writer_failure");
+    defer fx.cleanup();
+    try fx.write(allocator, 8);
+    const before = try fx.bytes(allocator);
+    defer allocator.free(before);
+
+    // A directory squatting on `<path>.partial` makes the staged write fail. A writer that wrote to the
+    // destination directly would never notice and would overwrite the container.
+    try cwd.createDir(io, fx.partial, .default_dir);
+    defer cwd.deleteDir(io, fx.partial) catch {};
+    try std.testing.expectError(error.IsDir, fx.write(allocator, 16));
+
+    const after = try fx.bytes(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+// -- GGML block formats through the reader and the C-ABI-level quantizers --------------------------------------------
+
+/// Writes one tensor of `weights.len` values stored as `t` blocks produced by `encodeAll`, reads it back through
+/// `HKReader.dequantizeToF32`, and returns the maximum difference from decoding the same bytes directly with the
+/// engine's decoder. Zero means the reader and the engine agree on what the bytes mean.
+fn readerVsEngine(comptime t: hk.format.StorageType, block_bytes: []const u8, n_elems: usize, test_path: []const u8) !f32 {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    try writer.addTensor(.{
+        .name = "w",
+        .storage_type = t,
+        .ndim = 1,
+        .shape = .{ n_elems, 0, 0, 0, 0, 0, 0, 0 },
+        .data = block_bytes,
+    });
+    try writer.writeToFile(test_path);
+    var reader = try hk.HKReader.open(test_path, allocator);
+    defer reader.deinit();
+    const via_reader = try allocator.alloc(f32, n_elems);
+    defer allocator.free(via_reader);
+    try reader.dequantizeToF32(reader.toc.find("w").?, false, via_reader);
+    const direct = try allocator.alloc(f32, n_elems);
+    defer allocator.free(direct);
+    try hk.quant.dequantizeRow(t, block_bytes, direct);
+    var worst: f32 = 0;
+    for (via_reader, direct) |a, b| worst = @max(worst, @abs(a - b));
+    return worst;
+}
+
+test "reader decodes real GGML Q4_K, Q3_K, Q6_K and Q5_K tensors with the engine decoders" {
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    inline for (.{ .{ hk.format.StorageType.q4_k, "Q4_K" }, .{ hk.format.StorageType.q3_k, "Q3_K" }, .{ hk.format.StorageType.q6_k, "Q6_K" }, .{ hk.format.StorageType.q5_k, "Q5_K" } }) |spec| {
+        var w: [512]f32 = undefined;
+        for (&w) |*x| x.* = rand.floatNorm(f32);
+        var bytes: [2 * 256]u8 = undefined; // large enough for two blocks of any of these formats
+        const info = hk.quant.blocks.info(spec[0]).?;
+        const used = 2 * info.bytes;
+        for (0..2) |b| {
+            const dst = bytes[b * info.bytes ..][0..info.bytes];
+            const src = w[b * 256 ..][0..256];
+            // Encode into a properly aligned block, then copy its bytes (the buffer itself is only byte aligned).
+            switch (spec[0]) {
+                .q4_k => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ4_K);
+                    hk.quant.encode.quantizeSuperBlockQ4_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+                .q3_k => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ3_K);
+                    hk.quant.encode.quantizeSuperBlockQ3_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+                .q6_k => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ6_K);
+                    hk.quant.encode.quantizeSuperBlockQ6_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+                else => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ5_K);
+                    hk.quant.encode.quantizeSuperBlockQ5_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+            }
+        }
+        const diff = try readerVsEngine(spec[0], bytes[0..used], 512, "test_reader_" ++ spec[1] ++ ".hk");
+        try std.testing.expectEqual(@as(f32, 0), diff);
+    }
+}
+
+test "reader decodes scale-less GGML IQ4_NL and MXFP4 blocks instead of reporting missing scales" {
+    var iq: [18]u8 = undefined; // f16 scale + 16 bytes of nibbles
+    std.mem.writeInt(u16, iq[0..2], @bitCast(@as(f16, 0.5)), .little);
+    for (iq[2..], 0..) |*b, i| b.* = @intCast((i * 17 + 3) & 0xFF);
+    try std.testing.expectEqual(@as(f32, 0), try readerVsEngine(.iq4_nl, &iq, 32, "test_reader_iq4nl.hk"));
+
+    var mx: [17]u8 = undefined; // e8m0 scale + 16 bytes of nibbles
+    mx[0] = 127;
+    for (mx[1..], 0..) |*b, i| b.* = @intCast((i * 29 + 5) & 0xFF);
+    try std.testing.expectEqual(@as(f32, 0), try readerVsEngine(.mxfp4, &mx, 32, "test_reader_mxfp4.hk"));
+}
+
+test "a block shorter than its tensor is an error, not silently skipped" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const path = "test_reader_short_q4k.hk";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var blocks: [144]u8 = @splat(0); // one Q4_K block, but the tensor claims two
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    try writer.addTensor(.{ .name = "w", .storage_type = .q4_k, .ndim = 1, .shape = .{ 512, 0, 0, 0, 0, 0, 0, 0 }, .data = &blocks });
+    try writer.writeToFile(path);
+    var reader = try hk.HKReader.open(path, allocator);
+    defer reader.deinit();
+    var out: [512]f32 = undefined;
+    try std.testing.expectError(error.UnsupportedStorageType, reader.dequantizeToF32(reader.toc.find("w").?, false, &out));
+}
+
+// -- C ABI matrix products on the engine kernels ---------------------------------------------------------------------
+
+/// Reference y = W x + bias in f64 with W decoded by the engine's decoders (the same meaning of the bytes `hk run` uses).
+fn referenceGemv(comptime t: hk.format.StorageType, w: []const u8, x: []const f32, bias: ?[]const f32, m: usize, k: usize, out: []f64, mag: []f64) !void {
+    const allocator = std.testing.allocator;
+    const info = hk.quant.blocks.info(t).?;
+    const row_bytes = k / info.elems * info.bytes;
+    const dec = try allocator.alloc(f32, k);
+    defer allocator.free(dec);
+    for (0..m) |r| {
+        try hk.quant.dequantizeRow(t, w[r * row_bytes ..][0..row_bytes], dec);
+        var s: f64 = if (bias) |b| b[r] else 0;
+        var a: f64 = if (bias) |b| @abs(b[r]) else 0;
+        for (dec, x) |u, v| {
+            s += @as(f64, u) * v;
+            a += @abs(@as(f64, u) * v);
+        }
+        out[r] = s;
+        mag[r] = a;
+    }
+}
+
+test "abi_ops products agree with a decoder-based f64 reference for dense and quantized weights" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(77);
+    const rand = prng.random();
+    const m: usize = 19;
+    const k: usize = 512;
+    const x = try allocator.alloc(f32, k);
+    defer allocator.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+    const bias = try allocator.alloc(f32, m);
+    defer allocator.free(bias);
+    for (bias) |*v| v.* = rand.floatNorm(f32);
+    const wf = try allocator.alloc(f32, m * k);
+    defer allocator.free(wf);
+    for (wf) |*v| v.* = rand.floatNorm(f32) * 0.1;
+    const want = try allocator.alloc(f64, m);
+    defer allocator.free(want);
+    const mag = try allocator.alloc(f64, m);
+    defer allocator.free(mag);
+    const got = try allocator.alloc(f32, m);
+    defer allocator.free(got);
+
+    // Dense weights: only float summation order differs, so the tolerance is tight.
+    const w16 = try allocator.alloc(f16, m * k);
+    defer allocator.free(w16);
+    for (w16, wf) |*d, s| d.* = @floatCast(s);
+    try referenceGemv(.f16, std.mem.sliceAsBytes(w16), x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvF16(w16, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 1e-5 * mag[r] + 1e-6);
+
+    try referenceGemv(.f32, std.mem.sliceAsBytes(wf), x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvF32(wf, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 1e-5 * mag[r] + 1e-6);
+
+    // Quantized weights multiply 8-bit activations: the error is bounded by a few tenths of a percent of the magnitude
+    // of the terms, never by the (possibly cancelling) result.
+    const nb8 = m * k / 32;
+    const q8 = try allocator.alloc(u8, nb8 * 34);
+    defer allocator.free(q8);
+    for (0..nb8) |b| {
+        var blk = std.mem.zeroes(hk.quantization.BlockQ8_0);
+        hk.quantization.quantizeBlockQ8_0(wf[b * 32 ..][0..32], &blk);
+        @memcpy(q8[b * 34 ..][0..34], std.mem.asBytes(&blk));
+    }
+    try referenceGemv(.q8_0, q8, x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvQ8_0(q8, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 0.01 * mag[r] + 1e-6);
+
+    const nbk = m * k / 256;
+    const qk = try allocator.alloc(u8, nbk * 144);
+    defer allocator.free(qk);
+    for (0..nbk) |b| {
+        var blk = std.mem.zeroes(hk.quantization.BlockQ4_K);
+        hk.quantization.quantizeSuperBlockQ4_K(wf[b * 256 ..][0..256], &blk);
+        @memcpy(qk[b * 144 ..][0..144], std.mem.asBytes(&blk));
+    }
+    try referenceGemv(.q4_k, qk, x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvQ4_K(qk, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 0.01 * mag[r] + 1e-6);
+}
+
+test "abi_ops gemm equals the naive product" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(78);
+    const rand = prng.random();
+    const m: usize = 13;
+    const k: usize = 70; // deliberately not a multiple of any block size: dense f32 needs none
+    const n: usize = 11;
+    const a = try allocator.alloc(f32, m * k);
+    defer allocator.free(a);
+    const b = try allocator.alloc(f32, k * n);
+    defer allocator.free(b);
+    for (a) |*v| v.* = rand.floatNorm(f32);
+    for (b) |*v| v.* = rand.floatNorm(f32);
+    const c = try allocator.alloc(f32, m * n);
+    defer allocator.free(c);
+    try hk.engine.abi_ops.gemmF32(a, b, c, m, k, n);
+    for (0..m) |i| for (0..n) |j| {
+        var s: f64 = 0;
+        var mag: f64 = 0;
+        for (0..k) |l| {
+            s += @as(f64, a[i * k + l]) * b[l * n + j];
+            mag += @abs(@as(f64, a[i * k + l]) * b[l * n + j]);
+        }
+        try std.testing.expect(@abs(@as(f64, c[i * n + j]) - s) <= 1e-5 * mag + 1e-6);
+    };
+}
+
+test "abi_ops refuses what it cannot compute instead of guessing" {
+    var y: [4]f32 = undefined;
+    var w: [4 * 34]u8 = @splat(0);
+    const x: [33]f32 = @splat(1);
+    // Q8_0 needs k to be a multiple of 32.
+    try std.testing.expectError(error.BadShape, hk.engine.abi_ops.gemvQ8_0(&w, &x, null, &y, 4, 33));
+    // Fewer weight bytes than the shape needs.
+    try std.testing.expectError(error.BadShape, hk.engine.abi_ops.gemvQ8_0(w[0 .. 3 * 34], x[0..32], null, &y, 4, 32));
+    // Output shorter than rows.
+    try std.testing.expectError(error.BadShape, hk.engine.abi_ops.gemvQ8_0(&w, x[0..32], null, y[0..3], 4, 32));
+    // A storage type the engine has no kernel for.
+    try std.testing.expectError(error.UnsupportedType, hk.engine.abi_ops.gemv(.int8, &w, x[0..32], null, &y, 4, 32));
+}
+
+test "the C ABI product functions poison their output on failure instead of leaving stale numbers" {
+    var w: [4 * 34]u8 = @splat(0);
+    const x: [33]f32 = @splat(1);
+    var y: [4]f32 = .{ 1, 2, 3, 4 };
+    // k = 33 is not a whole number of Q8_0 blocks, which the engine refuses.
+    hk.c_api.hk_gemv_q8_0(&w, &x, null, &y, 4, 33);
+    for (y) |v| try std.testing.expect(std.math.isNan(v));
+}
+
+test "the C ABI version is exported and matches the header" {
+    try std.testing.expectEqual(@as(u32, 2), hk.c_api.hk_abi_version());
+    // The header is not inside the test's package path, so read it at run time (tests run from the repository root).
+    const header = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, "include/hk.h", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(header);
+    try std.testing.expect(std.mem.indexOf(u8, header, "#define HK_ABI_VERSION 2") != null);
+}

@@ -25,7 +25,8 @@ Generates text. Text goes to standard output, statistics to standard error, so t
 | `--repeat-penalty X` | penalty for recent tokens, `1` disables | 1.0 |
 | `--seed N` | random seed, `0` uses the clock | 0 |
 | `--threads N` | compute threads | physical cores |
-| `-ngl, --gpu-layers N` | run on a GPU (Vulkan) when N > 0; also `HK_GPU=1` | CPU |
+| `-ngl, --gpu-layers N` | the first N layers go to a device and the rest stay on the CPU; N at or above the layer count means the whole model; `0` is the CPU (also `HK_GPU=0`) | the whole model if it fits, otherwise as many layers as do |
+| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda` (also `HK_BACKEND`). `auto` uses a device when one takes the model and prints why when one exists but cannot. Naming `vulkan` or `cuda` means *use it or fail*: an unusable device is an error, never a silent CPU run. `auto` tries CUDA first on a card with tensor cores (compute capability 8.0+), Vulkan first otherwise | `auto` |
 
 Every flag is checked before the model is opened, and an unknown or malformed one is an error, never a silent default. With `--temp 0` the output is deterministic.
 
@@ -58,7 +59,8 @@ Tensor names are kept as they are in the container, so a model converted from GG
 |:---|:---|
 | `hk inspect <file.hk>` | header, metadata and the tensor table |
 | `hk dump <file.hk>` | the header field by field, with offsets |
-| `hk verify <file.hk>` | check the magic, version and the alignment of the payload |
+| `hk verify <file.hk>` | check the magic, version, payload alignment, tensor bounds and the SHA-256 seal; exits non-zero on any failure, including a leftover edit journal. Files without a seal are reported as legacy (warning, not failure) |
+| `hk repair <file.hk>` | finish or roll back an interrupted in-place edit (metadata, appendix), then re-check the seal. It never re-seals a file whose contents do not match its seal |
 | `hk hash <file.hk>` | SHA-256 of the container and of every tensor |
 | `hk eval <file.hk>` | parameter count, value range, NaN and Inf count |
 | `hk tokenize <file.hk> "text"` | token ids using the vocabulary stored in the file |
@@ -88,6 +90,7 @@ Tensor names are kept as they are in the container, so a model converted from GG
 | `HK_HOME` | model cache directory |
 | `HF_TOKEN`, `HF_ENDPOINT`, `HK_HTTP_BACKOFF_MS` | downloads, see [Downloading Models](Downloading-Models.md) |
 | `HK_GPU=1` | use the GPU when possible, without `-ngl` |
+| `HK_BACKEND` | same values as `--backend`; the flag wins |
 | `HK_KERNELS=<level>` | force an instruction set level (for example `avx2` or `generic`); useful for testing and measuring |
 | `HK_THREADS=N` | thread count for the developer tools |
 | `HK_API_KEY` | API key for `hk serve` |

@@ -18,8 +18,16 @@ pub const Result = struct {
     }
 };
 
-/// Path of the hk executable under test, installed by the build before the tests run.
-pub const exe_path = @import("test_options").hk_exe;
+/// Path of the hk executable under test. The build installs it before the tests run and passes the path in
+/// `HK_EXE` (Zig 0.17 no longer knows the install prefix while configuring, so it cannot be compiled in).
+/// The environment is copied once into a map that lives for the rest of the process (works on Windows too).
+var exe_env: ?std.process.Environ.Map = null;
+
+pub fn exePath() []const u8 {
+    if (exe_env == null) exe_env = std.testing.environ.createMap(std.heap.page_allocator) catch @panic("out of memory");
+    return exe_env.?.get("HK_EXE") orelse
+        @panic("HK_EXE is not set; run these tests through `zig build test-e2e`");
+}
 
 pub fn run(
     gpa: std.mem.Allocator,
@@ -39,7 +47,7 @@ pub fn runEnv(
 ) !Result {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.append(gpa, exe_path);
+    try argv.append(gpa, exePath());
     try argv.appendSlice(gpa, args);
 
     var stdin_file: ?std.Io.File = null;
@@ -56,9 +64,19 @@ pub fn runEnv(
         stdin_file = try std.Io.Dir.cwd().openFile(io, p, .{});
     }
 
+    // Tests of the command line run on the CPU whatever devices the machine has (a device run is a different, separately
+    // tested numeric path); a test that wants a device passes its own environment.
+    var cpu_env: ?std.process.Environ.Map = null;
+    defer if (cpu_env) |*m| m.deinit();
+    if (env == null) {
+        var m = try std.testing.environ.createMap(gpa);
+        try m.put("HK_BACKEND", "cpu");
+        cpu_env = m;
+    }
+
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
-        .environ_map = env,
+        .environ_map = if (env) |e| e else &cpu_env.?,
         .stdin = if (stdin_file) |f| .{ .file = f } else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,

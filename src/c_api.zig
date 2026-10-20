@@ -4,10 +4,18 @@ const reader_mod = @import("reader.zig");
 const writer_mod = @import("writer.zig");
 const appendix_mod = @import("appendix.zig");
 const nf4 = @import("nf4.zig");
-const quantization = @import("quantization.zig");
+const quantization = @import("quant/compat.zig");
 const sparsity = @import("sparsity.zig");
 const tiling = @import("tiling.zig");
-const tensor_ops_mod = @import("tensor_ops.zig");
+const abi_ops = @import("engine/abi_ops.zig");
+const ops_mod = @import("ops.zig");
+const research = @import("quant/research.zig");
+
+/// The ABI's product functions return nothing, so a failure (an unsupported shape, no memory) must still be visible:
+/// the output is filled with NaN rather than left holding whatever was there.
+fn poison(y: []f32) void {
+    @memset(y, std.math.nan(f32));
+}
 const growth_mod = @import("growth.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const engine_mod = @import("engine.zig");
@@ -807,10 +815,39 @@ pub export fn hk_appendix_append(
     data_ptr: ?[*]const u8,
     data_size: u64,
 ) c_int {
+    const io = std.Options.debug_io;
+    const cur_time_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const cur_time_sec: u64 = @intCast(@max(0, @divTrunc(cur_time_ns, 1_000_000_000)));
+    return hk_appendix_append_at(
+        file_path_c, entry_type, flags, name_c, target_c, generation, parent_hash_ptr,
+        metric_loss, metric_acc, metric_pass, metric_custom, data_ptr, data_size, cur_time_sec,
+    );
+}
+
+/// Same as `hk_appendix_append`, with a caller-chosen timestamp (seconds). Returns -1 for an unknown
+/// `entry_type` instead of casting the byte to an enum, and for any failure of the sealed, journaled append.
+pub export fn hk_appendix_append_at(
+    file_path_c: [*:0]const u8,
+    entry_type: u8,
+    flags: u8,
+    name_c: [*:0]const u8,
+    target_c: [*:0]const u8,
+    generation: u32,
+    parent_hash_ptr: ?[*]const u8,
+    metric_loss: f32,
+    metric_acc: f32,
+    metric_pass: f32,
+    metric_custom: f32,
+    data_ptr: ?[*]const u8,
+    data_size: u64,
+    timestamp: u64,
+) c_int {
     const file_path = std.mem.sliceTo(file_path_c, 0);
     const name = std.mem.sliceTo(name_c, 0);
     const target = std.mem.sliceTo(target_c, 0);
     const allocator = std.heap.page_allocator;
+
+    const kind = std.enums.fromInt(format.AppendixEntryType, entry_type) orelse return -1;
 
     var ph: [32]u8 = @as([32]u8, @splat(0));
     if (parent_hash_ptr != null) {
@@ -822,17 +859,13 @@ pub export fn hk_appendix_append(
     else
         &[_]u8{};
 
-    const io = std.Options.debug_io;
-    const cur_time_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
-    const cur_time_sec: u64 = @intCast(@max(0, @divTrunc(cur_time_ns, 1_000_000_000)));
-
     const record = format.AppendixRecord{
-        .entry_type = @enumFromInt(entry_type),
+        .entry_type = kind,
         .flags = flags,
         .name = name,
         .target = target,
         .generation = generation,
-        .timestamp = cur_time_sec,
+        .timestamp = timestamp,
         .parent_hash = ph,
         .metrics = .{
             .loss = metric_loss,
@@ -847,6 +880,25 @@ pub export fn hk_appendix_append(
     return 0;
 }
 
+/// Verifies the container's SHA-256 seal by streaming the file (bounded memory).
+/// Returns 0 = sealed and valid, 1 = legacy file with no seal, -1 = seal mismatch or the file cannot be read.
+/// The C ABI version this library implements; see `HK_ABI_VERSION` in include/hk.h for what changes it.
+pub const abi_version: u32 = 2;
+
+pub export fn hk_abi_version() u32 {
+    return abi_version;
+}
+
+pub export fn hk_verify_integrity(file_path_c: [*:0]const u8) c_int {
+    const file_path = std.mem.sliceTo(file_path_c, 0);
+    const status = @import("integrity.zig").verifyFile(file_path, std.heap.page_allocator) catch return -1;
+    return switch (status) {
+        .valid => 0,
+        .legacy_missing => 1,
+        .invalid => -1,
+    };
+}
+
 pub export fn hk_appendix_rollback(file_path_c: [*:0]const u8, target_generation: u32) c_int {
     const file_path = std.mem.sliceTo(file_path_c, 0);
     const allocator = std.heap.page_allocator;
@@ -855,7 +907,7 @@ pub export fn hk_appendix_rollback(file_path_c: [*:0]const u8, target_generation
 }
 
 pub export fn hk_dot_product_f32(a: [*]const f32, b: [*]const f32, count: u64) f32 {
-    return tensor_ops_mod.dotProductF32(a[0..@intCast(count)], b[0..@intCast(count)]);
+    return abi_ops.dotF32(a[0..@intCast(count)], b[0..@intCast(count)]) catch std.math.nan(f32);
 }
 
 pub export fn hk_gemv_f32(
@@ -867,7 +919,8 @@ pub export fn hk_gemv_f32(
     K: u64,
 ) void {
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..@intCast(M)] else null;
-    tensor_ops_mod.gemvF32(W[0..@intCast(M * K)], x[0..@intCast(K)], bias_slice, y[0..@intCast(M)], @intCast(M), @intCast(K));
+    const y_slice = y[0..@intCast(M)];
+    abi_ops.gemv(.f32, std.mem.sliceAsBytes(W[0..@intCast(M * K)]), x[0..@intCast(K)], bias_slice, y_slice, @intCast(M), @intCast(K)) catch poison(y_slice);
 }
 
 pub export fn hk_gemm_f32(
@@ -878,7 +931,7 @@ pub export fn hk_gemm_f32(
     K: u64,
     N: u64,
 ) void {
-    tensor_ops_mod.gemmF32(A[0..@intCast(M * K)], B[0..@intCast(K * N)], C[0..@intCast(M * N)], @intCast(M), @intCast(K), @intCast(N));
+    abi_ops.gemmF32(A[0..@intCast(M * K)], B[0..@intCast(K * N)], C[0..@intCast(M * N)], @intCast(M), @intCast(K), @intCast(N)) catch poison(C[0..@intCast(M * N)]);
 }
 
 pub export fn hk_fused_gemv_nf4(
@@ -894,7 +947,7 @@ pub export fn hk_fused_gemv_nf4(
     const k_bytes = (K + 1) / 2;
     const num_blocks = M * ((K + block_size - 1) / block_size);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..@intCast(M)] else null;
-    tensor_ops_mod.fusedGemvNF4(
+    research.fusedGemvNF4(
         packed_W[0..@intCast(M * k_bytes)],
         scales[0..@intCast(num_blocks)],
         x[0..@intCast(K)],
@@ -918,7 +971,7 @@ pub export fn hk_fused_gemv_dq8(
 ) void {
     const num_blocks = M * ((K + block_size - 1) / block_size);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..@intCast(M)] else null;
-    tensor_ops_mod.fusedGemvDQ8(
+    research.fusedGemvDQ8(
         W_i8[0..@intCast(M * K)],
         scales[0..@intCast(num_blocks)],
         x[0..@intCast(K)],
@@ -1076,7 +1129,7 @@ pub export fn hk_forward_swiglu(
     const bu: ?[]const f32 = if (b_up) |b| b[0..@intCast(inter_f)] else null;
     const bd: ?[]const f32 = if (b_down) |b| b[0..@intCast(out_f)] else null;
 
-    tensor_ops_mod.forwardSwiGLUF32(
+    ops_mod.forwardSwiGLUF32(
         x[0..@intCast(in_f)],
         w_gate[0..@intCast(inter_f * in_f)],
         bg,
@@ -1100,7 +1153,7 @@ pub export fn hk_forward_rmsnorm(
     out: [*]f32,
     len: u64,
 ) void {
-    tensor_ops_mod.rmsNormF32(
+    ops_mod.rmsNormF32(
         x[0..@intCast(len)],
         weight[0..@intCast(len)],
         eps,
@@ -1109,7 +1162,7 @@ pub export fn hk_forward_rmsnorm(
 }
 
 pub export fn hk_forward_silu(x: [*]const f32, out: [*]f32, len: u64) void {
-    tensor_ops_mod.siluF32(x[0..@intCast(len)], out[0..@intCast(len)]);
+    ops_mod.siluF32(x[0..@intCast(len)], out[0..@intCast(len)]);
 }
 
 pub const hk_writer_t = opaque {};
@@ -1188,10 +1241,7 @@ pub export fn hk_writer_add_metadata_json(writer_ptr: ?*hk_writer_t, key_c: [*:0
 /// Converts a raw byte to an enum value only if it names a declared tag, so untrusted
 /// input can never produce an invalid enum (undefined behavior in safe builds).
 fn safeEnum(comptime E: type, val: u8) ?E {
-    inline for (@typeInfo(E).@"enum".fields) |f| {
-        if (val == f.value) return @enumFromInt(val);
-    }
-    return null;
+    return std.enums.fromInt(E, val);
 }
 
 fn safeStorageType(val: u8) ?format.StorageType {
@@ -1315,16 +1365,16 @@ pub export fn hk_export_gguf(input_path_c: [*:0]const u8, output_path_c: [*:0]co
 
 pub export fn hk_rope_permute_hf_to_gguf(in: [*]const f32, out: [*]f32, total_len: u64, n_heads: u64, head_dim: u64) void {
     const len: usize = @intCast(total_len);
-    tensor_ops_mod.ropePermuteHFToGGUF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
+    ops_mod.ropePermuteHFToGGUF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
 }
 
 pub export fn hk_rope_unpermute_gguf_to_hf(in: [*]const f32, out: [*]f32, total_len: u64, n_heads: u64, head_dim: u64) void {
     const len: usize = @intCast(total_len);
-    tensor_ops_mod.ropeUnpermuteGGUFToHF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
+    ops_mod.ropeUnpermuteGGUFToHF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
 }
 
 pub export fn hk_layernorm_offset_f32(data: [*]f32, len: u64, offset: f32) void {
-    tensor_ops_mod.layerNormOffsetF32(data[0..@intCast(len)], offset);
+    ops_mod.layerNormOffsetF32(data[0..@intCast(len)], offset);
 }
 
 pub export fn hk_gemv_q8_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32, y: [*]f32, M: u64, K: u64) void {
@@ -1332,7 +1382,7 @@ pub export fn hk_gemv_q8_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32,
     const k: usize = @intCast(K);
     const w_bytes_len = m * (k / 32) * @sizeOf(quantization.BlockQ8_0);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvQ8_0(W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k);
+    abi_ops.gemv(.q8_0, W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_q4_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32, y: [*]f32, M: u64, K: u64) void {
@@ -1340,7 +1390,7 @@ pub export fn hk_gemv_q4_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32,
     const k: usize = @intCast(K);
     const w_bytes_len = m * (k / 32) * @sizeOf(quantization.BlockQ4_0);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvQ4_0(W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k);
+    abi_ops.gemv(.q4_0, W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_q4_k(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32, y: [*]f32, M: u64, K: u64) void {
@@ -1348,7 +1398,7 @@ pub export fn hk_gemv_q4_k(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32,
     const k: usize = @intCast(K);
     const w_bytes_len = m * (k / 256) * @sizeOf(quantization.BlockQ4_K);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvQ4_K(W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k);
+    abi_ops.gemv(.q4_k, W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,7 +1883,7 @@ pub export fn hk_gemv_bf16(
     k: usize,
 ) void {
     const b_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvBF16(w_bf16[0 .. m * k], x[0..k], b_slice, y[0..m], m, k);
+    abi_ops.gemv(.bf16, std.mem.sliceAsBytes(w_bf16[0 .. m * k]), x[0..k], b_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_f16(
@@ -1845,7 +1895,7 @@ pub export fn hk_gemv_f16(
     k: usize,
 ) void {
     const b_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvF16(w_f16[0 .. m * k], x[0..k], b_slice, y[0..m], m, k);
+    abi_ops.gemv(.f16, std.mem.sliceAsBytes(w_f16[0 .. m * k]), x[0..k], b_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_int8(
@@ -1858,19 +1908,19 @@ pub export fn hk_gemv_int8(
     k: usize,
 ) void {
     const b_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvInt8Scaled(w_i8[0 .. m * k], x[0..k], scale_w, b_slice, y[0..m], m, k);
+    research.gemvInt8Scaled(w_i8[0 .. m * k], x[0..k], scale_w, b_slice, y[0..m], m, k);
 }
 
 pub export fn hk_dot_bf16(a: [*]const u16, b: [*]const f32, len: usize) f32 {
-    return tensor_ops_mod.dotProductBF16(a[0..len], b[0..len]);
+    return abi_ops.dotBF16(a[0..len], b[0..len]) catch std.math.nan(f32);
 }
 
 pub export fn hk_dot_f16(a: [*]const f16, b: [*]const f32, len: usize) f32 {
-    return tensor_ops_mod.dotProductF16(a[0..len], b[0..len]);
+    return abi_ops.dotF16(a[0..len], b[0..len]) catch std.math.nan(f32);
 }
 
 pub export fn hk_dot_int8(a: [*]const i8, b: [*]const i8, len: usize) i32 {
-    return tensor_ops_mod.dotProductInt8(a[0..len], b[0..len]);
+    return research.dotProductInt8(a[0..len], b[0..len]);
 }
 
 

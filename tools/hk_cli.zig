@@ -120,6 +120,12 @@ pub fn main(init: std.process.Init) !void {
             return error.BadUsage;
         };
         try cmdVerify(file_path, allocator);
+    } else if (std.mem.eql(u8, command, "repair")) {
+        const file_path = it.next() orelse {
+            std.debug.print("Error: Missing file path for 'repair'\nUsage: hk repair <model.hk>\n", .{});
+            return error.BadUsage;
+        };
+        try cmdRepair(file_path, allocator);
     } else if (std.mem.eql(u8, command, "benchmark")) {
         const file_path = it.next() orelse {
             std.debug.print("Error: Missing file path for 'benchmark'\nUsage: hk benchmark <model.hk>\n", .{});
@@ -298,7 +304,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\HK CLI v1.2.0
+        \\HK CLI v2.0.0
         \\Usage: hk <command> [arguments]
         \\
         \\Commands:
@@ -320,6 +326,7 @@ fn printUsage() void {
         \\  convert-endian <in.hk> <out.hk>              Convert endianness (Little <-> Big Endian)
         \\  gui            [file.hk]                     Launch visual HK model editor GUI
         \\  verify         <file.hk>                     Verify header magic, 128-byte alignment, and bounds
+        \\  repair         <file.hk>                     Restore an interrupted metadata transaction, if present
         \\  eval           <file.hk>                     Inspect model weights, parameter counts, and integrity
         \\  expand         <in.hk> <out.hk> [options]    Natively expand vocab (--vocab N) and width (--width R)
         \\  benchmark      <file.hk>                     Benchmark mmap loading and dequantization throughput
@@ -437,7 +444,7 @@ fn cmdExport(fmt: []const u8, input_path: []const u8, output_path: []const u8, a
 fn cmdMetadataSet(file_path: []const u8, key: []const u8, val: []const u8, allocator: std.mem.Allocator) !void {
     hk.metadata.patchFileMetadataInPlace(allocator, file_path, key, val) catch |err| {
         std.debug.print("Error: Failed to patch metadata in '{s}': {}\n", .{ file_path, err });
-        return;
+        return err;
     };
     std.debug.print("[SUCCESS] In-place metadata updated in '{s}':\n  {s} = \"{s}\"\n(Tensor payload untouched, zero copy)\n", .{
         file_path, key, val,
@@ -576,7 +583,7 @@ fn cmdInspect(path: []const u8, allocator: std.mem.Allocator) !void {
 fn cmdVerify(path: []const u8, allocator: std.mem.Allocator) !void {
     var reader = hk.HKReader.open(path, allocator) catch |err| {
         std.debug.print("VERIFY FAILED: Could not open file: {}\n", .{err});
-        return;
+        return err;
     };
     defer reader.deinit();
 
@@ -609,10 +616,56 @@ fn cmdVerify(path: []const u8, allocator: std.mem.Allocator) !void {
         }
     }
 
+    // Streamed in bounded chunks: hashing through the reader's mapping would fault the whole file into RSS.
+    const integrity_status = hk.integrity.verifyFile(path, allocator) catch |err| blk: {
+        std.debug.print("[FAIL] Could not verify container checksum: {}\n", .{err});
+        passed = false;
+        break :blk null;
+    };
+    if (integrity_status) |status| switch (status) {
+        .valid => std.debug.print("[PASS] SHA-256 container checksum verified\n", .{}),
+        .legacy_missing => std.debug.print("[WARN] No container checksum (legacy v1 file)\n", .{}),
+        .invalid => {
+            std.debug.print("[FAIL] SHA-256 container checksum mismatch!\n", .{});
+            passed = false;
+        },
+    };
+
+    const journal_path = try std.fmt.allocPrint(allocator, "{s}.hkmeta-journal", .{path});
+    defer allocator.free(journal_path);
+    if (std.Io.Dir.cwd().access(std.Options.debug_io, journal_path, .{})) |_| {
+        std.debug.print("[FAIL] An interrupted edit left '{s}' behind; run `hk repair {s}`\n", .{ journal_path, path });
+        passed = false;
+    } else |_| {}
+
     if (passed) {
         std.debug.print("\n===> ALL CHECKS PASSED: File is a compliant, high-performance HK binary container.\n\n", .{});
     } else {
         std.debug.print("\n===> VERIFICATION FAILED: Violations found.\n\n", .{});
+        return error.VerificationFailed;
+    }
+}
+
+fn cmdRepair(path: []const u8, allocator: std.mem.Allocator) !void {
+    const recovery = hk.transaction.recover(path, allocator) catch |err| {
+        std.debug.print("REPAIR FAILED: the edit journal for '{s}' cannot be applied safely ({}). The file was left untouched.\n", .{ path, err });
+        return err;
+    };
+    switch (recovery) {
+        .none => std.debug.print("No interrupted edit found.\n", .{}),
+        .restored => std.debug.print("Rolled back an interrupted edit; the file is back at its last committed state.\n", .{}),
+        .completed => std.debug.print("Completed an interrupted appendix rollback and re-sealed the file.\n", .{}),
+        .discarded_torn_journal => std.debug.print("Discarded an incomplete edit journal; the file's seal confirms it was never modified.\n", .{}),
+    }
+
+    switch (try hk.integrity.verifyFile(path, allocator)) {
+        .valid => std.debug.print("REPAIR COMPLETE: SHA-256 seal is valid.\n", .{}),
+        .legacy_missing => std.debug.print("REPAIR COMPLETE: legacy file with no SHA-256 seal (nothing to check it against).\n", .{}),
+        .invalid => {
+            std.debug.print("REPAIR INCOMPLETE: the SHA-256 seal does not match the file contents and no journal explains it.\n" ++
+                "The file is damaged or was edited outside hk; it is NOT re-sealed, because that would hide the damage.\n", .{});
+            return error.ChecksumMismatch;
+        },
     }
 }
 
@@ -925,7 +978,7 @@ fn cmdRollback(path: []const u8, target_gen: u32, allocator: std.mem.Allocator) 
     std.debug.print("Rolling back '{s}' to generation {}...\n", .{ path, target_gen });
     hk.appendix.rollbackToFile(allocator, path, target_gen) catch |err| {
         std.debug.print("Rollback failed: {}\n", .{err});
-        return;
+        return err;
     };
     std.debug.print("[SUCCESS] Successfully rolled back '{s}' to generation {}\n", .{ path, target_gen });
 }
@@ -1498,8 +1551,12 @@ const Loaded = struct {
         errdefer l.model.deinit();
         if (opts.gpu != .off) {
             if (l.model.gpu) |g| {
-                std.debug.print("[gpu] running on {s} (Vulkan)\n", .{g.deviceName()});
-            } else {
+                if (l.model.gpu_layers != 0) {
+                    std.debug.print("[gpu] running the first {d} of {d} layers on {s} ({s}); the rest, the embedding and the output on the CPU\n", .{ l.model.gpu_layers, l.model.cfg.n_layers, g.deviceName(), g.apiName() });
+                } else {
+                    std.debug.print("[gpu] running on {s} ({s})\n", .{ g.deviceName(), g.apiName() });
+                }
+            } else if (l.model.gpu_note_notable or l.model.gpu_note == null) {
                 std.debug.print("[gpu] not used: {s}; running on the CPU\n", .{l.model.gpu_note orelse "unknown reason"});
             }
         }
@@ -1665,7 +1722,7 @@ fn printStats(l: *Loaded, st: GenStats) void {
         m.rss_mib,
         m.anon_mib,
         m.file_mib,
-        l.model.pool.size(),
+        l.model.cpu.pool.size(),
     });
 }
 
@@ -1683,20 +1740,50 @@ const usage_gen =
     \\      --repeat-penalty X  penalty for recent tokens, 1 to disable (default 1.0)
     \\      --seed N          random seed, 0 uses the clock (default 0)
     \\      --threads N       compute threads (default: the number of physical cores)
-    \\  -ngl, --gpu-layers N  run on a GPU (Vulkan) when N > 0 and the model fits; the whole model
-    \\                        goes to the device, so any N above 0 means all layers. Also HK_GPU=1.
+    \\  -ngl, --gpu-layers N  run on a GPU when N > 0: the first N layers go to the device and the rest
+    \\                        stay on the CPU; N at or above the layer count means the whole model. Without
+    \\                        N the whole model goes if it fits, otherwise as many layers as do (with --backend
+    \\                        or HK_GPU=1). 0 is the CPU.
+    \\      --backend B       auto | cpu | vulkan | cuda (also HK_BACKEND). auto uses a device when the model
+    \\                        fits and says why when it does not; naming a device fails if it cannot be used.
     \\
 ;
 
 const GenMode = enum { run, chat };
 
-/// Whether to use a GPU: `-ngl N` with N above 0, or HK_GPU=1 in the environment.
+const BackendChoice = hk.backend.select.Choice;
+
+/// Parses a `--backend` / HK_BACKEND value, or says what is accepted.
+fn parseBackend(text: []const u8, what: []const u8) !BackendChoice {
+    return std.meta.stringToEnum(BackendChoice, text) orelse {
+        std.debug.print("Error: {s} takes auto, cpu, vulkan or cuda, not '{s}'\n", .{ what, text });
+        return error.BadUsage;
+    };
+}
+
+/// GPU settings from `-ngl`, `--backend` and the environment. An explicit device (`--backend vulkan`/`cuda`) means
+/// the load must fail if that device cannot be used; `auto` tries a device and quietly stays on the CPU otherwise.
+fn gpuSettings(gpu_layers: ?usize, backend: ?BackendChoice) !struct { gpu: hk.engine.model.GpuMode, backend: BackendChoice, layers: ?usize } {
+    var choice = backend;
+    if (choice == null) if (g_env) |e| if (e.get("HK_BACKEND")) |t| {
+        choice = try parseBackend(t, "HK_BACKEND");
+    };
+    // `-ngl N` also fixes how many layers go to the device; `-ngl 0` is the CPU even when a device is named.
+    const layers: ?usize = if (gpu_layers) |n| (if (n > 0) n else null) else null;
+    const c = choice orelse return .{ .gpu = gpuMode(gpu_layers), .backend = .auto, .layers = layers };
+    const w = hk.backend.select.wants(c);
+    const off = if (gpu_layers) |n| n == 0 else false;
+    return .{ .gpu = if (!w.device or off) .off else if (w.required) .on else .auto, .backend = c, .layers = layers };
+}
+
+/// Whether to use a GPU: `-ngl 0` or HK_GPU=0 turn it off; otherwise a device is used when there is one that takes the
+/// model (`auto`), and the CPU runs it, saying why only when a device existed but could not.
 fn gpuMode(gpu_layers: ?usize) hk.engine.model.GpuMode {
     if (gpu_layers) |n| return if (n > 0) .auto else .off;
     if (g_env) |e| if (e.get("HK_GPU")) |t| {
-        if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "on")) return .auto;
+        if (std.mem.eql(u8, t, "0") or std.mem.eql(u8, t, "off")) return .off;
     };
-    return .off;
+    return .auto;
 }
 
 const GenArgs = struct {
@@ -1704,6 +1791,7 @@ const GenArgs = struct {
     chat_prompt: bool = false,
     max_tokens: usize = 128,
     gpu_layers: ?usize = null,
+    backend: ?BackendChoice = null,
     threads: usize = 0,
     params: hk.sampler.Params = .{},
 };
@@ -1754,6 +1842,8 @@ fn parseGenArgs(it: *std.process.Args.Iterator, mode: GenMode) error{BadUsage}!G
             g.max_tokens = try parseUint(it, flag, 1);
         } else if (std.mem.eql(u8, flag, "-ngl") or std.mem.eql(u8, flag, "--gpu-layers")) {
             g.gpu_layers = try parseUint(it, flag, 0);
+        } else if (std.mem.eql(u8, flag, "--backend")) {
+            g.backend = try parseBackend(try needValue(it, flag), "--backend");
         } else if (std.mem.eql(u8, flag, "--threads")) {
             g.threads = try parseUint(it, flag, 1);
         } else if (std.mem.eql(u8, flag, "--temp")) {
@@ -1796,7 +1886,8 @@ fn cmdRun(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !voi
         return error.BadUsage;
     };
 
-    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gpuMode(g.gpu_layers) });
+    const gs = try gpuSettings(g.gpu_layers, g.backend);
+    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend, .gpu_layers = gs.layers });
     defer l.close(allocator);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1834,7 +1925,8 @@ fn cmdRun(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !voi
 }
 
 fn cmdChat(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !void {
-    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gpuMode(g.gpu_layers) });
+    const gs = try gpuSettings(g.gpu_layers, g.backend);
+    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend, .gpu_layers = gs.layers });
     defer l.close(allocator);
 
     const io = std.Options.debug_io;
@@ -1901,7 +1993,8 @@ fn usageServe() error{BadUsage} {
         \\  --ctx N          context window per slot (default: the model's, up to 8192)
         \\  --batch N        most tokens per forward pass (default 256)
         \\  --threads N      compute threads (default: the number of physical cores)
-        \\  -ngl N           use a GPU (Vulkan) when N > 0 and the model fits; one device region per slot
+        \\  -ngl N           use a GPU when N > 0: the first N layers go to the device (N at or above the layer
+        \\                   count: all of them); one device region per slot
         \\  --api-key KEY    require "Authorization: Bearer KEY" (or set HK_API_KEY)
         \\  --alias NAME     model name reported by the API
         \\
@@ -1917,6 +2010,8 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
     var slots: usize = 4;
     var opts = hk.engine.Options{};
     var alias: ?[]const u8 = null;
+    var backend_flag: ?BackendChoice = null;
+    var ngl_flag: ?usize = null;
     cfg.api_key = env.get("HK_API_KEY");
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--host")) {
@@ -1934,7 +2029,9 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
             opts.n_threads = std.fmt.parseInt(usize, args.next() orelse return usageServe(), 10) catch return usageServe();
         } else if (std.mem.eql(u8, a, "-ngl") or std.mem.eql(u8, a, "--gpu-layers")) {
             const n = std.fmt.parseInt(usize, args.next() orelse return usageServe(), 10) catch return usageServe();
-            opts.gpu = if (n > 0) .auto else .off;
+            ngl_flag = n;
+        } else if (std.mem.eql(u8, a, "--backend")) {
+            backend_flag = try parseBackend(args.next() orelse return usageServe(), "--backend");
         } else if (std.mem.eql(u8, a, "--api-key")) {
             cfg.api_key = args.next() orelse return usageServe();
         } else if (std.mem.eql(u8, a, "--alias")) {
@@ -1953,7 +2050,12 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
     // A batch has to hold at least one token per slot or decoding would starve.
     opts.n_batch = @max(opts.n_batch, slots);
     opts.gpu_slots = slots;
-    if (opts.gpu == .off and gpuMode(null) != .off) opts.gpu = .auto;
+    {
+        const gs = try gpuSettings(ngl_flag, backend_flag);
+        opts.gpu = gs.gpu;
+        opts.backend = gs.backend;
+        opts.gpu_layers = gs.layers;
+    }
     const l = try Loaded.open(allocator, path, opts);
     defer l.close(allocator);
 
@@ -2025,6 +2127,4 @@ fn cmdConvertSafeTensors(in_path: []const u8, out_path: []const u8, target_st_st
     try hk.safetensors.transcodeSafeTensorsToHK(allocator, in_path, out_path, st);
     std.debug.print("Transcoding completed successfully.\n", .{});
 }
-
-
 

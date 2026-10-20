@@ -10,84 +10,91 @@ verified; when a "Now" item is finished, move one line of it to the log and dele
 
 ## Now
 
-### A. In flight: container integrity + crash-safe metadata edits (plan §4, §5) — UNCOMMITTED
+### Owner direction (2026-10-20)
 
-Working tree on top of `43cf891` (16 changed paths; new files `src/integrity.zig`, `src/transaction.zig`).
+Do **not** ship a "3.0.0". Implement the whole of `MASTER_PLAN.md` and release **in the plan's order**: 2.0 → 2.1 → … → 2.7 → 3.0
+(§150), built along the dependency chain in §151. 3.0 is the *last* milestone. Also: **keep as much as possible in Zig**
+(Python stays a thin layer over the C ABI; no second implementation of anything Zig already owns).
 
-| Piece | Where | State |
+### A. DONE, COMMITTED (`a1ee4eb`, branch `feat/container-integrity`): container integrity + crash-safe edits (plan §4, §5; milestone 2.4 items, landed early)
+
+Details and numbers: CHANGELOG `[Unreleased]`, STATUS rows 4–5, wiki `Format-Specification` "Integrity and crash safety".
+Committed on top of `054964b`; not pushed, not tagged.
+
+**Run (2026-10-20):** `zig build test` 148/148 at Debug, ReleaseFast, `-Dcpu=x86_64_v3`, `-Dcpu=x86_64`; `zig build test-e2e -Doptimize=ReleaseFast`
+24/24; `bash tests/bindings/run.sh` 8 suites 0 failed; `pytest tests` 97 passed / 3 skipped (missing `openai`, `jax`, `tkinter`) in a scratch
+venv at `/tmp/claude-1000/.../scratchpad/venv` (CPU torch) — recreate it, it is not in the repo. Mutation-checked: 9 Zig guards (G1–G9) and 4 CLI guards (C1–C4) each turn
+red when disabled. Measured on a 2.1 GiB container: `hk verify` 1.27 s / 13 MiB RSS, `hk metadata set` 2.50 s / 13 MiB RSS (warm cache, one machine).
+
+**Fixed while finishing (were silent failures):** converters never sealed; sealing could read the whole file into RAM when `mmap` failed;
+an edit of an already-corrupt sealed file re-sealed it; `sealFile` wrote the header twice (crash window); appendix append/rollback had no
+journal; a torn journal blocked all edits; `hk verify` / `hk metadata set` / `hk rollback` exited 0 on failure; `hk verify` hashed through
+the mapping (2 GiB RSS); `hk_appendix_append` cast an untrusted byte to an enum; Python `metadata_set` fell back to a patcher that left a stale seal
+and could corrupt an appendix, and Python `append_record`/`rollback_appendix` read the whole file and rewrote it non-atomically.
+Python now goes through the C ABI only and raises without the native library.
+
+**Decision I made (revisit if you disagree):** Open decision "seal cost" resolved as *keep whole-file SHA-256, streamed, verify-before-edit*.
+Rationale: correctness first, bounded RAM, measured ~1.65 GiB/s. Sectioned/Merkle hashing would make edits O(changed) but needs a format change — fits the
+2.4 "v2 format" item. Edits on a 70 GB model will take minutes; that is the known cost.
+
+**Not done / limits:** no Windows/macOS/ARM run (`std.Io` replaced the Windows-specific writer in sealing, unrun there); crash tests simulate the
+post-crash state by hand, no kill-9/power-loss harness; `hk_verify_integrity` is wrapped in C++ and Python only (Go/Rust/C#/Java/TS lack it);
+no `hk compact`/`hk fsck`; no signatures (an attacker can recompute the seal); `hk run` does not verify the seal at load (O(file) cost) —
+decide whether `hk pull` should.
+
+### A2. Toolchain moved to Zig 0.17 (branch `feat/hk-2.0-backends`)
+
+Owner asked for 0.17. `zig` on PATH is still 0.16 (pacman); 0.17 is `~/.local/bin/zig17`. Repo builds and passes on 0.17: unit 148/148 (Debug, ReleaseFast, v3, baseline),
+e2e 24/24 (now never cached), bindings 8/8 (needs a `zig`→0.17 shim on PATH), pytest 97/3. CI action pin changed to 0.17.0 but **CI was not run**.
+**Stage 0 spike result: GO** — a Zig-authored Q8_0 GEMV (shared memory, `shfl.sync`, `bar.sync`) compiled with
+`zig17 build-obj -target nvptx64-cuda -mcpu sm_86 -O ReleaseFast k.zig -fno-emit-bin -femit-asm=k.ptx`, loaded with `cuModuleLoadData`, ran on the RTX 3050
+and matched a CPU reference (rel err 1.25e-7). Shared memory must be file-scope `var x: [N]T addrspace(.shared)`. Spike files were in the scratchpad (not kept).
+
+### B. HK 2.0 — Unified Runtime: **2.0.0 (cut 2026-10-21 from PR #5 `feat/hk-2.0-backends`)**
+
+Plan: `~/.claude/plans/snug-foraging-quasar.md` (approved 2026-10-20). Checklist (§150): backend abstraction · CUDA engine · CUDA decode · CUDA prefill · CUDA attention · Vulkan under common API · CPU backend finalized · unified memory planner · automatic device selection.
+
+| Stage | State | Evidence |
 |:--|:--|:--|
-| Whole-file SHA-256 seal, header flag bit 9 (`HAS_SHA256_CHECKSUM`) | `src/integrity.zig`, `format.zig`, `writer.zig` (seals after write), `reader.verifyIntegrity` | Written; unit test passes |
-| Per-record CRC-32 in appendix; `0` = legacy record | `src/appendix.zig`, `python/hk/adaptive/appendix.py` | Written; unit test passes |
-| Overflow-safe reader range validation | `src/reader.zig` (`checkedEnd`, `validateHeaderLayout`, `validateTensorRanges`) | Written; unit test passes |
-| Metadata edit journal + recovery | `src/transaction.zig`, `metadata.patchFileMetadataInPlace` | Written; unit test passes |
-| CLI: `hk verify` reports seal; new `hk repair` | `tools/hk_cli.zig` | Written; **no e2e test** for `repair` / seal reporting |
-| Docs | `docs/wiki/Format-Specification.md`, `In-Container-Version-Lineage.md`, `Raw-Storage-and-Super-Coalescing.md` | Edited to match |
-| Python mirror of the seal | `python/hk/adaptive/appendix.py` | Written; **Python suite not run** |
+| 0 Zig-authored CUDA kernels feasible? | **GO** | Zig 0.17 nvptx64: Q8_0 GEMV with shared memory + `shfl.sync` + `bar.sync` ran on the RTX 3050, rel err 1.25e-7 vs CPU |
+| Toolchain → Zig 0.17 | done | `1f040ee`; unit/e2e/bindings/pytest green; CI action pin bumped, CI not run |
+| 1a `backend.Device` seam | done | `2a07119`; Vulkan under it |
+| 1b CPU executor extracted (`engine/cpu_backend.zig`) | done | `01d80b0`; logits byte-identical old vs new in 70/70 comparisons; **speed not re-measured** |
+| 1 capability table (`backend/caps.zig`) | done (formats only) | per-operator table (§136) not done |
+| 2 planner + `--backend` | done | `fb6c2c1`; 159/159 unit ×4 configs, e2e 26/26, guards mutation-checked |
+| 3 CUDA engine | **done (first version)** | `src/cuda/engine.zig` + `src/cuda_device.zig`; parity vs CPU for llama/qwen2/qwen3 × f32/Q8_0, 26 GEMV/GEMM formats, multi-slot, long context; 20+ mutations red |
+| 4 CUDA prefill | **done** | tensor-core `mma.sync` GEMM (`gemm_tc_<fmt>`, all 26 formats) + flash attention (`attention_tc_64/128`); Qwen3-0.6B Q8_0 prefill 350 -> 4,005 tok/s |
+| 4c Vulkan prefill | **done** | cooperative-matrix GEMM (`mm_cm.comp`) + attention (`attention_cm.comp`); 1,487 -> ~4,700 tok/s |
+| 4d Partial offload (planner v1) | **done** | `-ngl N` = first N layers; planner picks the largest fitting prefix; hybrid parity tests on both devices |
+| 4b CUDA decode | **done** | warp-per-row GEMV + split-KV attention; decode 360 tok/s vs Vulkan 406 |
+| 5 CUDA attention | **done** | online-softmax tiles, warp-cooperative key reads, split-KV for decode |
+| 6 CUDA fusion + graphs | **evaluated, not done** | host launch cost measured ~0.4 ms/pass of ~7 ms; GEMV was 72 % of decode, so fixing memory traffic came first (§152). Revisit after Tensor Cores/integer dot products |
+| 7 Vulkan under common API | partly (1a); parity harness not shared yet | |
+| 8 CPU finalized + kernel-stack unification (owner decision 2) | **done** | `quantization.zig` and `tensor_ops.zig` deleted; encoders → `quant/encode.zig`, research formats → `quant/research.zig`, C ABI products → `engine/abi_ops.zig`. Found and fixed: private Q4_K layout, broken Q3_K encoder, silent block skipping in `dequantizeToF32`. The "legacy optimizations worth porting" turned out to be nothing: the legacy code was single-threaded (its thread pool ran inline) and slower |
+| 9 Release gate: §148 compatibility contract | **contract written, release NOT cut** | `docs/wiki/Compatibility.md` "Release contract"; `hk_abi_version()` = 2. No version bump, tag, push or publish was done (owner approves those) |
 
-**Verified (2026-10-06):** `zig build test` → 17/17 steps, 138/138 tests pass (Debug). New tests:
-`Appendix CRC-32 rejects a corrupted payload`, `container SHA-256 seal detects tensor corruption`,
-`reader rejects an overflowing metadata range`, `metadata journal restores an interrupted mutation`.
+**2.0 readiness (honest assessment, 2026-10-20 evening; branch `feat/hk-2.0-backends`, pushed, draft PR #5):** every §150 item exists and is verified on this machine only (Ryzen 7 7445HS, RTX 3050 6 GB laptop, Arch, driver 615.78). Since the first assessment: Vulkan prompt matmul and attention run on cooperative matrices, CUDA has tensor-core GEMM and flash attention (Zig inline PTX, sm_80 build of the device code), Vulkan has split-KV decode attention, partial offload of leading layers exists on both devices with a planner that picks the largest prefix that fits, and perplexity agrees with llama.cpp and Transformers (`benchmarks/results/2026-10-20-ppl-*.json`: Qwen3-0.6B Q8_0 wikitext-2, 20 windows of 512: llama.cpp 23.67-23.68, hk 23.64-23.68, Transformers f32 23.73). Real-model prefill/decode (tok/s, Qwen3-0.6B Q8_0, 512/128): hk-vulkan ~4,700/~117, hk-cuda ~4,000/~108 (llama.cpp Vulkan measured earlier: 7,032/145.6; llama.cpp CUDA baseline needs a CUDA-capable host compiler, see below). Remaining gaps before calling it 2.0: decode is 20-25 % behind llama.cpp on both devices (CUDA GEMV reaches ~58 % of memory bandwidth; no `dp4a`); prefill still ~1.5x behind llama.cpp Vulkan; automatic selection is a fixed order (Vulkan, then CUDA), not measured; no fusion/graphs; nothing run on a second machine, ARM, macOS or a non-NVIDIA GPU; CI on PR #5 is the first run against Zig 0.17 (Windows/cross-compile failed on an unguarded `std.c.getenv`, fixed in `2fa7da8`; macOS fails `server_tests: an oversized body is refused`, which also fails on `main`, and the test now prints the client error so the next run says why). The CPU executor is a peer struct rather than a union variant of `Device`.
 
-**NOT verified:** `zig build test -Doptimize=ReleaseFast`, `-Dcpu=x86_64_v3`/`x86_64`, `zig build test-e2e`,
-`bash tests/bindings/run.sh`, `pytest tests`, Windows (the `writer.zig` change closes the handle before the
-second mapper opens it "to avoid a conflicting handle on Windows" — unrun). Mutation-style check ("does each new test
-fail when its guard is removed?") not done — owner's robustness standard requires it before calling this finished.
+**Benchmark environment (user-level, nothing installed system-wide):** `~/hk-bench/` holds llama.cpp builds (`build` Vulkan, `build-cpu`, `build-cuda` pending), models (`models/`), wikitext-2 (`data/`), CUDA 13.0.2 toolkit assembled from the runfile (`cuda/`; the installer needs libxml2.so.2 which Arch lacks, so it was unpacked with `--noexec` and the nvcc/cudart/cublas components copied), and a GCC 15.2 build in progress (`build_gcc.sh`; nvcc 13.0 rejects the system GCC 16). Harness: `benchmarks/suite.py` (speed, RSS, VRAM; interleaved repeats) and `benchmarks/perplexity.py` (accuracy).
 
-**Risks / gaps found by reading the diff (not yet decided):**
+**Release-cut steps (done for 2.0.0, repeat for each milestone):** (1) version in `build.zig.zon`, `pyproject.toml`, `python/hk/__init__.py`, `bindings/{js/package.json + package-lock.json, rust/Cargo.toml + Cargo.lock, java/pom.xml, csharp/Hk.csproj}`, `CITATION.cff`, the banner in `tools/hk_cli.zig`; (2) `## [Unreleased]` → `## [x.y.z] - date` in `CHANGELOG.md` with an upgrade note, a fresh empty `[Unreleased]` above; (3) `SECURITY.md`, `README.md`, `CONTEXT.md`, `STATUS.md`; (4) the whole matrix (Debug, ReleaseFast, `-Dcpu=x86_64_v3`, `-Dcpu=x86_64`, e2e, `tests/bindings/run.sh`, pytest, `gen_graph.py --check`) plus CI on all three OSes; (5) merge the PR into `main`; (6) tag `vX.Y.Z` — the release workflow then builds the native libraries, wheels and packages and publishes PyPI `hknt`, npm `hkntf`, crates.io `hknt`, NuGet and GitHub Packages (not undoable: a published version cannot be replaced); (7) wiki sync (automatic on `docs/wiki` changes).
 
-1. **O(file) cost per mutation.** `sealFile` hashes the entire container (mmap, bounded RAM, but a multi-GB read) on
-   *every* metadata patch and *every* appended appendix record, and rewrites the header twice. Fine for tests,
-   costly for large models, and it cuts against the memory/IO-first principle. Options: seal only on explicit
-   `hk seal`/write; hash sections separately (header+meta+TOC / each tensor / appendix) so appends only re-hash
-   the appendix; Merkle tree. **Owner decision needed** (see Open decisions).
-2. **Crash window in `sealFile`.** It first writes the header with the flag set and a *zeroed* digest, then hashes,
-   then writes the final header. A crash between leaves a file that claims a seal and fails it. `hk repair` can only
-   restore a *metadata journal*; with no journal (appendix append/rollback path) it reports `REPAIR INCOMPLETE`
-   and cannot re-seal. Re-sealing blindly would bless a possibly truncated appendix, so this is deliberately left.
-3. **Appendix append/rollback are still non-atomic** (in-place append + truncate; Python rewrites the whole file via
-   `open(..., "wb")` — a crash mid-write can destroy the file; also O(file) RAM in Python). Plan §5 wants atomic appendix writes.
-4. **`HKWriter.write` writes to the destination path directly** (no temp file + rename).
-5. **No `hk compact` / `hk fsck`.** `hk verify` text still says "128-byte alignment" in its usage line.
-6. **Legacy-file policy:** v1 files without seal verify as `legacy_missing` (warning, not failure). Fine for
-   compatibility; means an attacker can strip the seal. Signatures (plan §4) are the real fix, not started.
+**Bugs of mine found by the process (for the record):** an edit script that died halfway and left `engine.zig` half-edited while I reported it done (assert every anchor); a benchmark that stopped the prefill clock before the async GPU finished, which inflated prefill and deflated decode (end prefill with the first logits); `Engine.init` leaving defaulted fields `undefined`, visible only in Debug (keep Debug in the matrix); equivalent mutants ("every split covers the whole context", "never split") that look like test gaps but are not.
 
-**Suggested finish for A (in this order):**
-1. Run the full not-verified list above; fix whatever breaks.
-2. Mutation-check the four new tests (disable each guard, confirm red).
-3. Add an e2e test in `tests/cli_tests.zig` for `hk verify` (sealed / tampered / legacy) and `hk repair`.
-4. Resolve Open decision 1 (seal cost) before more code builds on `sealFile`.
-5. Update `CHANGELOG.md` (it is the project's release notes), then commit when the owner asks.
-
-### B. Recommended next arcs (after A), per plan §151
-
-The plan's chain says the next structural gate is **graph/model abstraction → backend abstraction**, because CUDA,
-Metal, ROCm, and the memory planner all hang off it. Today `engine/model.zig` imports the Vulkan engine directly
-(`gpu_mod`), and CUDA sits unused in `src/cuda.zig`. Candidate order, smallest useful step first:
-
-1. **Backend interface (plan §1.1, §137):** define `Backend` (capabilities query, buffer alloc, matmul-by-format,
-   attention, norm, rope, kv ops, sync) behind which CPU and Vulkan sit; no behavior change; tests prove parity.
-2. **Operator capability table (§136):** per op × dtype/quant × backend; replaces ad-hoc "GPU decodes these formats" lists
-   and makes fallback diagnostics (§137) systematic.
-3. **Wire CUDA into the engine through that interface** (reusing `src/cuda.zig`/PTX), measured against Vulkan and
-   llama.cpp on the RTX 3050 with `hk-compare`. Prefill (GEMM) before decode before attention (§151, §153).
-4. **Memory planner v0 (§1.2, §134):** answer "can it fit / where does each tensor live" for CPU+one GPU; enables
-   partial offload (currently unsupported in the Vulkan engine).
-5. **Architecture descriptor (§46):** replace the 3-value `Arch` enum with data-driven descriptors; then Gemma/Phi.
-
-None of B is started. These are recommendations, not decisions.
+**Gotchas learned this session:** shell `ls` alias is broken (use `find`); `/usr/bin/time` is not installed (use Python `resource`); zsh does not word-split `$var` (use `${=var}`); `pgrep -f X` inside a waiting loop matches the loop itself — poll a log file instead; Zig caches test *runs* (e2e is now `has_side_effects`); no real model on disk, so no speed claims; tiny models via `hk-tiny-model [--q8]`; parity harness lives in the scratchpad (`parity.py`, old-vs-new `hk-probe` over ISA levels × threads × prompts) — recreate from this description if needed: build the previous commit in a `git worktree`, run both `hk-probe`s with `HK_KERNELS`/`HK_THREADS`, compare raw f32 output bytes.
 
 ### Open decisions (owner)
 
-1. **Seal cost model** (Risk 1): whole-file hash per mutation vs sectioned hashes vs explicit seal command.
-2. **Which kernel stack is canonical?** Plan §9/§15/§17/§20 say "retain the earlier optimizations", but those live in
-   the legacy stack (`tensor_ops.zig`), not the engine. Options: port them into the engine stack; or retire the
-   legacy stack and route C API/Python through the engine kernels (smaller surface, one place to optimize).
-3. **CUDA path:** adopt `src/cuda.zig` as the base for an engine backend, or restart from the Vulkan engine's structure?
-   (Commit history gives conflicting accounts of how well the old CUDA code worked; nothing re-measured.)
-4. **Sandbox policy (§33):** `CodeSandbox` silently falls back from Docker to an unsandboxed subprocess — a plan
-   violation. Make it fail closed (raise unless `allow_unsafe=True`)? Likely yes; needs a go-ahead since it changes behavior.
-5. **Version number:** CLI banner says 1.2.0, packages say 1.1.1.
+1. ~~Seal cost model~~ — resolved above (revisitable).
+2. ~~**Which kernel stack is canonical?**~~ **DECIDED 2026-10-20: the engine stack.** Port the legacy optimizations worth keeping into `src/engine` + `src/quant` + `src/kernels`, then route the C API/Python through the engine kernels and retire `tensor_ops.zig`/`quantization.zig`. (Original question follows.) Plan §9/§15/§17/§20 say "retain the earlier optimizations", but those live in the legacy stack
+   (`tensor_ops.zig`), not the engine. Options: port them into the engine stack; or retire the legacy stack and route C API/Python through the engine kernels.
+   *Blocks the backend interface design.*
+3. ~~**CUDA path**~~ **DECIDED 2026-10-20: adopt `src/cuda.zig` as the base** (validate it first — it is unmeasured and wired into nothing). (Original question follows.) Adopt `src/cuda.zig` as the base for an engine backend, or restart from the Vulkan engine's structure? (Old commit messages
+   disagree on how well the old CUDA code worked; nothing re-measured.) *Blocks CUDA engine.*
+4. **Sandbox policy (§33):** `CodeSandbox` silently falls back from Docker to an unsandboxed subprocess. Make it fail closed? Likely yes; changes behavior.
+5. ~~Version number~~ — superseded: no version is assigned until a milestone is complete; the CLI banner still says 1.2.0 while packages say 1.1.1 (fix when 2.0 is cut).
 6. **`build.zig` `-Dcuda` default-on** for non-macOS builds although CUDA is off the engine path.
+7. ~~Commit the integrity work?~~ **DONE 2026-10-20:** commit `a1ee4eb` on branch `feat/container-integrity` (off `docs/context-system`). No tag, no push, no release.
 
 ### Verified facts worth not re-deriving
 
@@ -114,3 +121,9 @@ None of B is started. These are recommendations, not decisions.
   Still not run: the `jq` recipes (no jq installed) — equivalent Python queries were.
 - Added a pointer memory (`hk-context-system`) to the owner's Claude memory index.
 - No source code was modified. Nothing committed. The pre-existing uncommitted integrity/transaction work (item A) is untouched.
+
+### 2026-10-20 — container integrity finished; graphify added; direction reset
+- Finished item A (see Now). Found and fixed the silent failures listed there; added 9+5 tests, mutation-checked 13 guards, measured cost/RSS.
+- Owner redirected: no 3.0.0 now; follow the §150 milestone order and the §151 chain; keep as much as possible in Zig. Removed the Python seal/journal mirror I had started writing and routed Python through the C ABI instead.
+- Installed **graphify** (`pipx install graphifyy` 0.9.92; command `graphify`). Built the code graph with `graphify extract . --code-only` (local AST, no API key): 4,848 nodes, 9,617 edges, Zig/Python/C#/Rust/TS/Java included. `graphify claude install` appended a "graphify" section to `CLAUDE.md` and wrote PreToolUse hooks to `.claude/settings.json` (machine-specific absolute path — excluded via `.git/info/exclude`; re-run `graphify claude install` on another machine). `graphify-out/` is git-ignored. Not installed: git hooks (`graphify hook install`) — they would run on every commit. Community names are placeholders (naming needs an LLM backend). Refresh with `graphify update .`. `docs/graph/` (curated plan/status graph) stays the source for *meaning*; graphify is the source for *code structure*; both pass their checks.
+- Not run: Windows/macOS/ARM, GPU benchmarks, anything in section B.

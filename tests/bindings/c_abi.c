@@ -16,6 +16,8 @@
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
 
 static int write_fixture(const char* path) {
+    /* A binding built against this header must be running against a library with the same ABI version. */
+    CHECK(hk_abi_version() == HK_ABI_VERSION);
     hk_writer_t* w = hk_writer_create(4096);
     CHECK(w);
     CHECK(hk_writer_add_metadata_string(w, "general.name", "fixture") == 0);
@@ -39,10 +41,17 @@ static int write_fixture(const char* path) {
     uint8_t zero[32] = {0};
     const char* payload = "adapter-bytes";
     CHECK(hk_appendix_append(path, HK_APPENDIX_LORA_ADAPTER, 1, "gen1", "w.f32", 1, zero, 1.5f, 0.5f, 0.25f, 0.0f, payload, strlen(payload)) == 0);
+
+    /* The append re-sealed the container; an unknown entry type is refused without touching it. */
+    CHECK(hk_verify_integrity(path) == 0);
+    CHECK(hk_appendix_append(path, 0x7F, 1, "bad", "w.f32", 2, zero, 0, 0, 0, 0, payload, strlen(payload)) == -1);
+    CHECK(hk_verify_integrity(path) == 0);
+    CHECK(hk_verify_integrity("/nonexistent/fixture.hk") == -1);
     return 0;
 }
 
 static int check_file(const char* path) {
+    CHECK(hk_verify_integrity(path) == 0);
     hk_reader_t* r = hk_open(path);
     CHECK(r);
     CHECK(hk_get_tensor_count(r) == 2);

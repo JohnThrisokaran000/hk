@@ -205,6 +205,20 @@ if _LIB is not None:
     if hasattr(_LIB, "hk_metadata_patch_in_place"):
         _LIB.hk_metadata_patch_in_place.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         _LIB.hk_metadata_patch_in_place.restype = ctypes.c_int
+    if hasattr(_LIB, "hk_verify_integrity"):
+        _LIB.hk_verify_integrity.argtypes = [ctypes.c_char_p]
+        _LIB.hk_verify_integrity.restype = ctypes.c_int
+    if hasattr(_LIB, "hk_appendix_append_at"):
+        _LIB.hk_appendix_append_at.argtypes = [
+            ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float,
+            ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+        ]
+        _LIB.hk_appendix_append_at.restype = ctypes.c_int
+    if hasattr(_LIB, "hk_appendix_rollback"):
+        _LIB.hk_appendix_rollback.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
+        _LIB.hk_appendix_rollback.restype = ctypes.c_int
 
     # SIMD Compute API
     _LIB.hk_dot_product_f32.argtypes = [
@@ -2016,11 +2030,59 @@ class NativeHKReader:
 
 
 def native_metadata_patch_in_place(file_path: str, key: str, val: str) -> bool:
-    """Invokes native Zig in-place metadata patching."""
+    """Invokes native Zig in-place metadata patching (verified, journaled and re-sealed)."""
     if not is_native_available() or _LIB is None or not hasattr(_LIB, "hk_metadata_patch_in_place"):
         return False
     ret = _LIB.hk_metadata_patch_in_place(file_path.encode("utf-8"), key.encode("utf-8"), val.encode("utf-8"))
     return ret == 0
+
+
+def native_verify_integrity(file_path: str) -> Optional[bool]:
+    """True/False for a sealed container, None for a legacy unsealed one. Streams the file in Zig.
+
+    Raises RuntimeError when the native library cannot answer; a missing answer is never reported as valid.
+    """
+    if not is_native_available() or _LIB is None or not hasattr(_LIB, "hk_verify_integrity"):
+        raise RuntimeError("native hk library with hk_verify_integrity is not available")
+    ret = _LIB.hk_verify_integrity(file_path.encode("utf-8"))
+    if ret == 0:
+        return True
+    if ret == 1:
+        return None
+    if ret == -1:
+        return False
+    raise RuntimeError(f"hk_verify_integrity({file_path!r}) failed with code {ret}")
+
+
+def native_appendix_append(
+    file_path: str,
+    entry_type: int,
+    flags: int,
+    name: str,
+    target: str,
+    generation: int,
+    parent_hash: bytes,
+    metrics: tuple,
+    data: bytes,
+    timestamp: int,
+) -> bool:
+    """Native in-place appendix append (verified, journaled and re-sealed)."""
+    if not is_native_available() or _LIB is None or not hasattr(_LIB, "hk_appendix_append_at"):
+        return False
+    ph = (ctypes.c_uint8 * 32).from_buffer_copy(parent_hash if len(parent_hash) == 32 else b"\x00" * 32)
+    buf = (ctypes.c_uint8 * max(len(data), 1)).from_buffer_copy(data if data else b"\x00")
+    ret = _LIB.hk_appendix_append_at(
+        file_path.encode("utf-8"), entry_type, flags, name.encode("utf-8"), target.encode("utf-8"),
+        generation, ph, metrics[0], metrics[1], metrics[2], metrics[3], buf, len(data), timestamp,
+    )
+    return ret == 0
+
+
+def native_appendix_rollback(file_path: str, target_generation: int) -> bool:
+    """Native in-place appendix rollback (roll-forward journaled and re-sealed)."""
+    if not is_native_available() or _LIB is None or not hasattr(_LIB, "hk_appendix_rollback"):
+        return False
+    return _LIB.hk_appendix_rollback(file_path.encode("utf-8"), target_generation) == 0
 
 
 def native_convert_gguf(input_path: str, output_path: str) -> int:

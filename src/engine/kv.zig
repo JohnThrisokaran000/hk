@@ -37,12 +37,20 @@ pub const KvCache = struct {
     hd_pad: usize,
     /// Number of segments allocated so far (per layer).
     allocated: usize = 0,
+    /// Layers below this index live on a device (partial offload) and have no host cache.
+    first_layer: usize = 0,
     /// Segment (layer, s) holds positions [s * seg_len, (s + 1) * seg_len) as
     /// [kv_head][pos][head_dim]. Empty until the context first reaches it.
     k_segs: [][]f16,
     v_segs: [][]f16,
 
     pub fn init(allocator: std.mem.Allocator, cfg: config_mod.Config, n_ctx: usize) !KvCache {
+        return initFrom(allocator, cfg, n_ctx, 0);
+    }
+
+    /// A cache for layers `first_layer ..` only: the layers before it run on a device that keeps its own cache.
+    pub fn initFrom(allocator: std.mem.Allocator, cfg: config_mod.Config, n_ctx: usize, first_layer: usize) !KvCache {
+        std.debug.assert(first_layer <= cfg.n_layers);
         const n_segs = (n_ctx + seg_len - 1) / seg_len;
         const k = try allocator.alloc([]f16, cfg.n_layers * n_segs);
         errdefer allocator.free(k);
@@ -55,6 +63,7 @@ pub const KvCache = struct {
             .n_ctx = n_ctx,
             .n_segs = n_segs,
             .hd_pad = (cfg.head_dim + 15) / 16 * 16,
+            .first_layer = first_layer,
             .k_segs = k,
             .v_segs = v,
         };
@@ -82,7 +91,7 @@ pub const KvCache = struct {
         const seg_elems = cfg.n_kv_heads * seg_len * self.hd_pad;
         var s: usize = self.allocated;
         while (s < need) : (s += 1) {
-            for (0..cfg.n_layers) |l| {
+            for (self.first_layer..cfg.n_layers) |l| {
                 const i = l * self.n_segs + s;
                 self.k_segs[i] = try self.allocator.alloc(f16, seg_elems);
                 self.v_segs[i] = self.allocator.alloc(f16, seg_elems) catch |e| {
@@ -130,7 +139,7 @@ pub const KvCache = struct {
         var s = self.allocated;
         while (s > need) {
             s -= 1;
-            for (0..self.cfg.n_layers) |l| {
+            for (self.first_layer..self.cfg.n_layers) |l| {
                 const i = l * self.n_segs + s;
                 if (self.k_segs[i].len != 0) self.allocator.free(self.k_segs[i]);
                 if (self.v_segs[i].len != 0) self.allocator.free(self.v_segs[i]);

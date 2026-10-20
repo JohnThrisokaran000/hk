@@ -921,3 +921,41 @@ pub const struct_VkPhysicalDeviceMemoryBudgetPropertiesEXT = extern struct {
 pub const VkPhysicalDeviceMemoryBudgetPropertiesEXT = struct_VkPhysicalDeviceMemoryBudgetPropertiesEXT;
 pub const VK_QUEUE_FAMILY_IGNORED = ~@as(c_uint, 0);
 pub const VK_WHOLE_SIZE = ~@as(c_ulonglong, 0);
+
+// -- VK_KHR_cooperative_matrix -----------------------------------------------------------------------------------------
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: c_int = 1000506000;
+pub const VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR: c_int = 1000506001;
+pub const VK_COMPONENT_TYPE_FLOAT16_KHR: c_int = 0;
+pub const VK_COMPONENT_TYPE_FLOAT32_KHR: c_int = 1;
+pub const VK_SCOPE_SUBGROUP_KHR: c_int = 3;
+pub const struct_VkPhysicalDeviceCooperativeMatrixFeaturesKHR = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+    pNext: ?*anyopaque = null,
+    cooperativeMatrix: VkBool32 = 0,
+    cooperativeMatrixRobustBufferAccess: VkBool32 = 0,
+};
+pub const VkPhysicalDeviceCooperativeMatrixFeaturesKHR = struct_VkPhysicalDeviceCooperativeMatrixFeaturesKHR;
+pub const struct_VkCooperativeMatrixPropertiesKHR = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+    pNext: ?*anyopaque = null,
+    MSize: u32 = 0,
+    NSize: u32 = 0,
+    KSize: u32 = 0,
+    AType: c_int = 0,
+    BType: c_int = 0,
+    CType: c_int = 0,
+    ResultType: c_int = 0,
+    saturatingAccumulation: VkBool32 = 0,
+    scope: c_int = 0,
+};
+pub const VkCooperativeMatrixPropertiesKHR = struct_VkCooperativeMatrixPropertiesKHR;
+pub const PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR = ?*const fn (physicalDevice: VkPhysicalDevice, pPropertyCount: [*c]u32, pProperties: [*c]VkCooperativeMatrixPropertiesKHR) callconv(.c) VkResult;
+
+// -- VK_KHR_shader_integer_dot_product -------------------------------------------------------------------------------
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: c_int = 1000280000;
+pub const struct_VkPhysicalDeviceShaderIntegerDotProductFeatures = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+    pNext: ?*anyopaque = null,
+    shaderIntegerDotProduct: VkBool32 = 0,
+};
+pub const VkPhysicalDeviceShaderIntegerDotProductFeatures = struct_VkPhysicalDeviceShaderIntegerDotProductFeatures;

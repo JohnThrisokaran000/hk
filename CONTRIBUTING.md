@@ -13,10 +13,10 @@ We are committed to providing a welcoming, inclusive, and harassment-free enviro
 ## 2. Architecture Overview
 
 HK is structured as a layered, multi-language system:
-- **`src/`**: High-performance core engine written in Zig 0.16. Includes:
+- **`src/`**: High-performance core engine written in Zig 0.17. Includes:
   - `format.zig`: Binary container layout, headers, TOC, metadata, and chunk formats.
-  - `quantization.zig`: Quantization algorithms (`Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `IQ` codebooks, etc.) with SIMD vectorization.
-  - `tensor_ops.zig`: Packed-weight SIMD GEMV kernels (`gemvQ8_0`, `gemvQ4_0`, `gemvQ4_K`), RoPE coordinates, and LayerNorm offsets.
+  - `quant/`: the GGML block formats. `dequant.zig` (decoders, checked against llama.cpp), `encode.zig` (encoders), `vecdot.zig`/`gemm.zig` (CPU kernels), `research.zig` (HK-private NF4/DQ/FP8 formats), `compat.zig` (names the C ABI uses).
+  - `engine/abi_ops.zig`: the C ABI's matrix products, on the engine's kernels. `ops.zig`: small f32 helpers behind the ABI.
   - `gguf.zig`: Native binary GGUF reader, writer, and zero-copy bitstream transcoders.
   - `c_api.zig`: ABI-stable C interface exported as a shared library (`hk.dll`, `libhk.so`, `libhk.dylib`).
 - **`include/`**: C and C++ header files (`hk.h`, `hk.hpp`).
@@ -29,7 +29,7 @@ HK is structured as a layered, multi-language system:
 ## 3. Development Environment Setup
 
 ### Prerequisites
-- **Zig**: `0.16.x` or latest master build. Verify with `zig version`.
+- **Zig**: `0.17.x`. Verify with `zig version`. (0.16 no longer builds this repository: 0.17 renamed the optimize modes, moved reflection to `field_names`/`field_values`, and the install prefix is no longer known while configuring.)
 - **Python**: Python `3.10`+ (Python 3.12 recommended).
 - **C/C++ Compiler**: Clang, GCC, or MSVC (optional, Zig acts as C compiler).
 - **Rust** (optional, for Rust SDK): `rustc` & `cargo`.

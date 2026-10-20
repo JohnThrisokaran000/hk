@@ -4,12 +4,13 @@ pub const buf = @import("buf.zig");
 pub const metadata = @import("metadata.zig");
 pub const tensor_toc = @import("tensor_toc.zig");
 pub const nf4 = @import("nf4.zig");
-pub const quantization = @import("quantization.zig");
+pub const quantization = @import("quant/compat.zig");
 pub const quant = @import("quant.zig");
 pub const pool = @import("pool.zig");
 pub const kernels = @import("kernels.zig");
 pub const vk = @import("vk/vk.zig");
 pub const gpu = @import("vk/engine.zig");
+pub const backend = @import("backend/backend.zig");
 pub const cores = @import("cores.zig");
 /// Instruction set levels built into this binary, comma separated.
 pub const build_options_kernel_levels = @import("build_options").kernel_levels;
@@ -22,10 +23,12 @@ pub const engine = @import("engine.zig");
 pub const sparsity = @import("sparsity.zig");
 pub const tiling = @import("tiling.zig");
 pub const platform = @import("platform.zig");
+pub const integrity = @import("integrity.zig");
+pub const transaction = @import("transaction.zig");
 pub const writer = @import("writer.zig");
 pub const reader = @import("reader.zig");
 pub const appendix = @import("appendix.zig");
-pub const tensor_ops = @import("tensor_ops.zig");
+pub const ops = @import("ops.zig");
 pub const growth = @import("growth.zig");
 pub const sandbox = @import("sandbox.zig");
 pub const expansion = @import("expansion.zig");
@@ -61,8 +64,8 @@ comptime {
 /// walks one level of modules itself: each public module declaration is a namespace whose own declarations are
 /// referenced, which is what makes their `test` blocks reachable.
 fn refModule(comptime T: type) void {
-    inline for (comptime std.meta.declarations(T)) |d| {
-        const decl = @field(T, d.name);
+    inline for (comptime std.meta.declarations(T)) |decl_name| {
+        const decl = @field(T, decl_name);
         if (@TypeOf(decl) == type) {
             switch (@typeInfo(decl)) {
                 .@"struct" => refModule(decl),

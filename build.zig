@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "kernels",
         "Kernel instruction set levels to build: all, fallback, or a comma separated list (default: all, fallback for Debug)",
-    ) orelse if (optimize == .Debug) "fallback" else "all";
+    ) orelse if (optimize == .debug) "fallback" else "all";
 
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "cuda", cuda_enabled);
@@ -41,6 +41,39 @@ pub fn build(b: *std.Build) void {
         if (target.result.os.tag != .windows) {
             hk_mod.linkSystemLibrary("dl", .{});
         }
+        // Device code is Zig too (src/cuda_device.zig). Zig compiles it to PTX, which the host embeds and the driver
+        // JIT-compiles for the installed GPU, so no CUDA toolkit is needed to build HK. sm_70 is the oldest
+        // architecture with the warp shuffles the kernels use; newer GPUs JIT it forward.
+        const device_target = b.resolveTargetQuery(.{
+            .cpu_arch = .nvptx64,
+            .os_tag = .cuda,
+            .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_70 },
+        });
+        const device_obj = b.addObject(.{
+            .name = "hk_cuda_device",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cuda_device.zig"),
+                .target = device_target,
+                .optimize = .fast,
+            }),
+        });
+        hk_mod.addAnonymousImport("cuda_device_ptx", .{ .root_source_file = device_obj.getEmittedAsm() });
+        // The same device code for sm_80: it adds the tensor core kernels (`mma.sync.m16n8k16` needs sm_80). The driver
+        // is given this module on GPUs of compute capability 8.0 and up, the sm_70 one elsewhere.
+        const device_target80 = b.resolveTargetQuery(.{
+            .cpu_arch = .nvptx64,
+            .os_tag = .cuda,
+            .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_80 },
+        });
+        const device_obj80 = b.addObject(.{
+            .name = "hk_cuda_device_sm80",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cuda_device.zig"),
+                .target = device_target80,
+                .optimize = .fast,
+            }),
+        });
+        hk_mod.addAnonymousImport("cuda_device_ptx_sm80", .{ .root_source_file = device_obj80.getEmittedAsm() });
     }
 
     // Shared Library (DLL / .so / .dylib) for C ABI bindings (Python ctypes, C#, etc.)
@@ -133,8 +166,10 @@ pub fn build(b: *std.Build) void {
 
     // End to end tests of the command line and the server, run against the installed executable.
     {
-        const test_opts = b.addOptions();
-        test_opts.addOption([]const u8, "hk_exe", b.getInstallPath(.bin, cli_exe.out_filename));
+        // The tests run the installed binary. The install prefix is not known while configuring, so the
+        // path is passed through the environment, relative to the build root, assuming the default `zig-out`
+        // prefix (set HK_EXE yourself when using --prefix).
+        const hk_exe = b.fmt("zig-out/bin/{s}", .{cli_exe.out_filename});
         const e2e_step = b.step("test-e2e", "Run the command line and server end to end tests (builds and installs hk first)");
         const suites = [_]struct { file: []const u8, name: []const u8 }{
             .{ .file = "tests/cli_tests.zig", .name = "hk-cli-tests" },
@@ -146,10 +181,14 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(suite.file),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "test_options", .module = test_opts.createModule() }},
             });
             const t = b.addTest(.{ .name = suite.name, .root_module = mod });
             const run = b.addRunArtifact(t);
+            run.setCwd(b.path("."));
+            run.setEnvironmentVariable("HK_EXE", hk_exe);
+            // The cache key covers the test binary, not the hk executable it spawns, so a cached result would
+            // go stale (and pass) after hk changes. Always run.
+            run.has_side_effects = true;
             run.step.dependOn(b.getInstallStep());
             e2e_step.dependOn(&run.step);
         }
@@ -263,7 +302,7 @@ fn addKernelLevels(
 
         var q = target.query;
         q.cpu_arch = arch;
-        q.cpu_model = .{ .explicit = std.Target.Cpu.Arch.parseCpuModel(arch, v.model) catch
+        q.cpu_model = .{ .explicit = std.Target.Cpu.Arch.parseCpuModel(arch, v.model) orelse
             std.debug.panic("unknown cpu model {s}", .{v.model}) };
         q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
         for (v.add) |fname| {

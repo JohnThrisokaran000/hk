@@ -1,0 +1,39 @@
+{
+  "args": {
+    "gguf": "/home/harshit/hk-bench/models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+    "hk": "/home/harshit/hk-bench/models/qwen2.5-1.5b-instruct-q4_k_m.hk",
+    "tokenizer": "/home/harshit/hk-bench/models/Qwen__Qwen3-0.6B",
+    "text": "/home/harshit/hk-bench/data/wikitext-2-raw/wiki.test.raw",
+    "ctx": 512,
+    "chunks": 20,
+    "hf": false,
+    "hf_dtype": "float32",
+    "out": "benchmarks/results/2026-10-20-ppl-qwen2.5-1.5b-q4_k_m.json"
+  },
+  "results": {
+    "llama.cpp cpu": {
+      "ppl": 11.7096,
+      "stderr": 0.44853
+    },
+    "llama.cpp vulkan": {
+      "ppl": 11.6417,
+      "stderr": 0.44522
+    },
+    "llama.cpp cuda": {
+      "ppl": 11.6802,
+      "stderr": 0.44691
+    },
+    "hk cpu": {
+      "ppl": 11.6995,
+      "scored_tokens": 5100
+    },
+    "hk vulkan": {
+      "ppl": 11.6358,
+      "scored_tokens": 5100
+    },
+    "hk cuda": {
+      "ppl": 11.6472,
+      "scored_tokens": 5100
+    }
+  }
+}

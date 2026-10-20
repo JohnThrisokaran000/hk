@@ -14,6 +14,7 @@ const metadata = @import("../metadata.zig");
 const tensor_toc = @import("../tensor_toc.zig");
 const platform = @import("../platform.zig");
 const buf = @import("../buf.zig");
+const integrity = @import("../integrity.zig");
 
 pub const TensorSpec = struct {
     name: []const u8,
@@ -39,7 +40,7 @@ pub const StreamWriter = struct {
 
     pub const Error = error{ TensorIndexOutOfRange, WriteOutOfBounds, IncompleteTensor, TooManyTensors } ||
         std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.File.WritePositionalError ||
-        std.Io.File.SetLengthError || std.Io.Dir.RenameError;
+        std.Io.File.SetLengthError || std.Io.Dir.RenameError || integrity.Error;
 
     /// Creates `<path>.partial`, writes the header, metadata and tensor table, and reserves the
     /// data region. `specs` order is the order of the table; `alignment` applies to each tensor.
@@ -173,6 +174,9 @@ pub const StreamWriter = struct {
         self.file.sync(self.io) catch {};
         self.file.close(self.io);
         self.closed = true;
+        // Seal before the rename so the file never appears under its final name unsealed. This re-reads
+        // the output once (bounded memory, O(file) time).
+        try integrity.sealFile(self.partial_path, self.allocator);
         const cwd = std.Io.Dir.cwd();
         try cwd.rename(self.partial_path, cwd, self.final_path, self.io);
         self.finished = true;

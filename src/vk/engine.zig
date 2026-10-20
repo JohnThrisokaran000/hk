@@ -20,7 +20,7 @@ const StorageType = format.StorageType;
 const Config = config_mod.Config;
 const Mat = weights_mod.Mat;
 
-pub const Error = error{ UnsupportedType, UnsupportedShape, NoGpuSlot, OutOfMemory } || vk.Error;
+pub const Error = error{ UnsupportedType, UnsupportedShape, NoGpuSlot, OutOfMemory, PartialEngine } || vk.Error;
 
 pub const Options = struct {
     /// Most tokens in one forward pass.
@@ -31,6 +31,15 @@ pub const Options = struct {
     slots: usize = 1,
     /// Index of the Vulkan device, or null to pick the best one.
     device: ?usize = null,
+    /// Leading layers to run on the device; 0, or a count of all layers or more, means the whole network. With fewer,
+    /// the embedding and everything after the last device layer stay on the CPU (partial offload): the device takes
+    /// hidden states in and gives them back through `forwardPartial`.
+    layers: usize = 0,
+
+    /// Layers the device runs for a model of `n_layers`.
+    pub fn layerCount(self: Options, n_layers: usize) usize {
+        return if (self.layers == 0 or self.layers >= n_layers) n_layers else self.layers;
+    }
 };
 
 /// The format name used in shader file names, or null when the GPU cannot decode the format.
@@ -72,6 +81,11 @@ const EmbedPush = extern struct { dim: u32, row_bytes: u32 };
 const NormPush = extern struct { dim: u32, eps: f32 };
 const RopePush = extern struct { n_tokens: u32, n_heads: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, qk_norm: u32, n_ctx: u32, eps: f32, mscale: f32 };
 const AttnPush = extern struct { n_tokens: u32, n_heads: u32, n_kv: u32, head_dim: u32, n_ctx: u32, scale: f32 };
+const AttnSplitPush = extern struct { n_tokens: u32, n_heads: u32, n_kv: u32, head_dim: u32, n_ctx: u32, scale: f32, splits: u32 };
+
+/// Most slices the context of one (head, token) is cut into for decode, and the tokens such a pass may have.
+const max_splits = 16;
+const split_max_tokens = 4;
 const CountPush = extern struct { n: u32 };
 
 /// A weight matrix on the device.
@@ -84,7 +98,35 @@ const DevMat = struct {
     set: c.VkDescriptorSet = null,
     /// For the interleaved gate/up matrix: the set whose output is the pair buffer.
     set_pair: c.VkDescriptorSet = null,
+    /// The same product with integer arithmetic (`mmvq`), when the device and the format allow it.
+    set_q: c.VkDescriptorSet = null,
 };
+
+/// Formats the engine runs through the integer dot product decode kernel (shaders/mmvq.comp). Q8_0 has a kernel too but
+/// is not listed: its float kernel is as fast (measured: 127.0 against 128.9 tok/s on Qwen3-0.6B), so quantizing the
+/// activations only adds dispatches. The nibble formats spend their time unpacking, which the integer dot removes.
+fn mmvqSupported(t: StorageType) bool {
+    return switch (t) {
+        .q4_0, .q4_1, .q5_0, .q5_1, .q4_k, .q5_k, .q6_k => true,
+        else => false,
+    };
+}
+
+fn mmvqCode(t: StorageType) ?[]const u8 {
+    return switch (t) {
+        .q8_0 => @embedFile("spv/mmvq_q8_0.spv"),
+        .q4_0 => @embedFile("spv/mmvq_q4_0.spv"),
+        .q4_1 => @embedFile("spv/mmvq_q4_1.spv"),
+        .q5_0 => @embedFile("spv/mmvq_q5_0.spv"),
+        .q5_1 => @embedFile("spv/mmvq_q5_1.spv"),
+        .q4_k => @embedFile("spv/mmvq_q4_k.spv"),
+        .q5_k => @embedFile("spv/mmvq_q5_k.spv"),
+        .q6_k => @embedFile("spv/mmvq_q6_k.spv"),
+        else => null,
+    };
+}
+
+const QactPush = extern struct { blocks: u32, x_off: u32, x_stride: u32, o_tok: u32 };
 
 const Layer = struct {
     attn_norm: vk.Buffer,
@@ -110,6 +152,7 @@ const Layer = struct {
     s_norm1: c.VkDescriptorSet = null,
     s_rope: c.VkDescriptorSet = null,
     s_attn: c.VkDescriptorSet = null,
+    s_attn_part: c.VkDescriptorSet = null,
     s_add1: c.VkDescriptorSet = null,
     s_norm2: c.VkDescriptorSet = null,
     s_swiglu: c.VkDescriptorSet = null,
@@ -121,7 +164,7 @@ fn nowSecs() f64 {
     return @as(f64, @floatFromInt(std.Io.Timestamp.now(std.Options.debug_io, .awake).nanoseconds)) / 1e9;
 }
 
-pub const Kind = enum(u8) { embed, norm, mmv, mm, rope, attn, swiglu, add };
+pub const Kind = enum(u8) { embed, norm, mmv, mm, rope, attn, swiglu, add, qact };
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -131,6 +174,10 @@ pub const Engine = struct {
     n_ctx: u32,
     n_slots: u32,
     layers: []Layer,
+    /// Only the leading layers are on the device; no embedding, final norm or output matrix either.
+    partial: bool,
+    /// Hidden states of a partial pass, read back here.
+    hid_host: vk.Buffer,
     tok_embd: DevMat,
     output: DevMat,
     tied_output: bool,
@@ -163,9 +210,28 @@ pub const Engine = struct {
     pipes_mmv: [128]?vk.Pipeline = @splat(null),
     pipes_mm: [128]?vk.Pipeline = @splat(null),
     pipes_embed: [128]?vk.Pipeline = @splat(null),
+    pipes_mmvq: [128]?vk.Pipeline = @splat(null),
+    /// Integer decode path: activations quantized into `xq`/`xs` by `p_qact`; null sets when the device lacks the feature.
+    int_dot: bool,
+    /// At least one matrix runs the integer kernel, so the activations are quantized.
+    use_q: bool,
+    p_qact: vk.Pipeline,
+    xq: vk.Buffer,
+    xs: vk.Buffer,
+    s_qact_xb: c.VkDescriptorSet,
+    s_qact_att: c.VkDescriptorSet,
+    s_qact_gate: c.VkDescriptorSet,
+    s_qact_xn: c.VkDescriptorSet,
     p_norm: vk.Pipeline,
     p_rope: vk.Pipeline,
     p_attn: vk.Pipeline,
+    /// Split-KV attention for decode: slices of the context in `p_attn_part`, merged by `p_attn_combine`.
+    p_attn_part: vk.Pipeline,
+    p_attn_combine: vk.Pipeline,
+    attn_part: vk.Buffer,
+    s_attn_combine: c.VkDescriptorSet,
+    /// Cooperative matrix attention for prompt batches; null when the device or the head size does not allow it.
+    p_attn_cm: ?vk.Pipeline,
     p_swiglu: vk.Pipeline,
     p_swiglu_pair: vk.Pipeline,
     p_add: vk.Pipeline,
@@ -184,7 +250,7 @@ pub const Engine = struct {
     tq: c.VkQueryPool = null,
     tq_n: u32 = 0,
     tq_kinds: [2048]u8 = undefined,
-    kind_ns: [8]f64 = @splat(0),
+    kind_ns: [9]f64 = @splat(0),
 
     fn dev(self: *Engine, size: u64) !vk.Buffer {
         return self.ctx.createBuffer(size, .device);
@@ -335,15 +401,26 @@ pub const Engine = struct {
     }
 
     /// Bytes of device memory a model needs, so a caller can decide before uploading anything.
+    /// Device bytes of the weights of layer `i`.
+    pub fn layerBytes(w: *const weights_mod.Weights, i: usize) u64 {
+        const l = w.layers[i];
+        var total: u64 = 0;
+        for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| total += m.data.len;
+        return total;
+    }
+
     pub fn bytesNeeded(w: *const weights_mod.Weights, cfg: Config, o: Options) u64 {
         var total: u64 = 0;
-        for (w.layers) |l| {
+        const nl = o.layerCount(w.layers.len);
+        for (w.layers[0..nl]) |l| {
             for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| total += m.data.len;
         }
-        total += w.tok_embd.data.len;
-        if (!w.tied_output) total += w.output.data.len;
+        if (nl == w.layers.len) {
+            total += w.tok_embd.data.len;
+            if (!w.tied_output) total += w.output.data.len;
+        }
         const kv_per_layer: u64 = 2 * @as(u64, o.slots) * o.n_ctx * cfg.n_kv_heads * cfg.head_dim * 2;
-        total += kv_per_layer * cfg.n_layers;
+        total += kv_per_layer * nl;
         const act: u64 = @as(u64, o.n_batch) * (3 * cfg.dim + 2 * cfg.qDim() + 2 * cfg.kvDim() + 2 * cfg.ffn_dim) * 4;
         total += act + (64 << 20);
         return total;
@@ -358,12 +435,15 @@ pub const Engine = struct {
         o: Options,
     ) Error!Engine {
         if (cfg.head_dim > 256 or cfg.head_dim % 2 != 0) return error.UnsupportedShape;
-        for (w.layers) |l| {
+        const nl = o.layerCount(w.layers.len);
+        const partial = nl < w.layers.len;
+        for (w.layers[0..nl]) |l| {
             for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| if (!supports(m.t)) return error.UnsupportedType;
         }
-        if (!supports(w.tok_embd.t) or !supports(w.output.t)) return error.UnsupportedType;
+        if (!partial and (!supports(w.tok_embd.t) or !supports(w.output.t))) return error.UnsupportedType;
 
         var self: Engine = undefined;
+        self.partial = partial;
         self.allocator = allocator;
         self.ctx = try vk.Context.init(allocator, o.device);
         self.owners = &.{};
@@ -381,6 +461,9 @@ pub const Engine = struct {
         self.pipes_mmv = @splat(null);
         self.pipes_mm = @splat(null);
         self.pipes_embed = @splat(null);
+        self.pipes_mmvq = @splat(null);
+        self.int_dot = self.ctx.caps.int_dot;
+        self.use_q = false;
         self.n_last = 0;
         self.tq = null;
         self.tq_n = 0;
@@ -394,9 +477,21 @@ pub const Engine = struct {
         self.p_norm = try cx.createPipeline(@embedFile("spv/rmsnorm.spv"), 3, @sizeOf(NormPush));
         self.p_rope = try cx.createPipeline(@embedFile("spv/rope_kv.spv"), 9, @sizeOf(RopePush));
         self.p_attn = try cx.createPipeline(@embedFile("spv/attention.spv"), 5, @sizeOf(AttnPush));
+        self.p_attn_part = try cx.createPipeline(@embedFile("spv/attention_part.spv"), 5, @sizeOf(AttnSplitPush));
+        self.p_attn_combine = try cx.createPipeline(@embedFile("spv/attention_combine.spv"), 5, @sizeOf(AttnSplitPush));
+        self.p_attn_cm = null;
+        if (cx.caps.coopmat) {
+            const code: ?[]const u8 = switch (cfg.head_dim) {
+                64 => @embedFile("spv/attention_cm_64.spv"),
+                128 => @embedFile("spv/attention_cm_128.spv"),
+                else => null,
+            };
+            if (code) |bytes| self.p_attn_cm = try cx.createPipeline(bytes, 5, @sizeOf(AttnPush));
+        }
         self.p_swiglu = try cx.createPipeline(@embedFile("spv/swiglu.spv"), 2, @sizeOf(CountPush));
         self.p_add = try cx.createPipeline(@embedFile("spv/add.spv"), 2, @sizeOf(CountPush));
         self.p_swiglu_pair = try cx.createPipeline(@embedFile("spv/swiglu_pair.spv"), 2, @sizeOf(CountPush));
+        self.p_qact = undefined;
 
         const nb: u64 = self.n_batch;
         self.x = try cx.createBuffer(nb * cfg.dim * 4, .device);
@@ -414,16 +509,31 @@ pub const Engine = struct {
         self.toks = try cx.createBuffer(nb * 4, .upload);
         self.logits_dev = try cx.createBuffer(@as(u64, self.max_rows) * cfg.vocab * 4, .device);
         self.logits_host = try cx.createBuffer(@as(u64, self.max_rows) * cfg.vocab * 4, .readback);
+        self.hid_host = try cx.createBuffer(nb * cfg.dim * 4, .readback);
+        // Quantized activations for the integer decode kernels: 4 bytes of quants and 8 of scale + sum per 32 values, for
+        // every row the pass can have (logits read rows by index).
+        const max_in: u64 = @max(cfg.dim, @max(cfg.qDim(), cfg.ffn_dim));
+        self.xq = try cx.createBuffer(nb * max_in, .device);
+        self.xs = try cx.createBuffer(nb * (max_in / 32 + 1) * 8, .device);
+        if (self.int_dot) self.p_qact = try cx.createPipeline(@embedFile("spv/qact.spv"), 3, @sizeOf(QactPush));
+        self.attn_part = try cx.createBuffer(@as(u64, split_max_tokens) * cfg.n_heads * max_splits * (cfg.head_dim + 2) * 4, .device);
         self.dummy = try cx.createBuffer(64, .device);
         self.out_norm = try f32Buffer(cx, w.out_norm);
         self.inv_freq = try f32Buffer(cx, inv_freq);
         self.cb = cx.xfer_cb;
 
-        self.tok_embd = try matBuffer(cx, w.tok_embd, allocator);
-        self.tied_output = w.tied_output;
-        self.output = if (w.tied_output) self.tok_embd else try matBuffer(cx, w.output, allocator);
+        if (partial) {
+            // The CPU embeds and produces the logits; nothing of the head goes to the device.
+            self.tok_embd = .{ .buf = self.dummy, .t = .f32, .rows = 0, .cols = 0, .row_bytes = 0 };
+            self.output = self.tok_embd;
+            self.tied_output = true;
+        } else {
+            self.tok_embd = try matBuffer(cx, w.tok_embd, allocator);
+            self.tied_output = w.tied_output;
+            self.output = if (w.tied_output) self.tok_embd else try matBuffer(cx, w.output, allocator);
+        }
 
-        self.layers = try allocator.alloc(Layer, w.layers.len);
+        self.layers = try allocator.alloc(Layer, nl);
         var made: usize = 0;
         errdefer {
             for (self.layers[0..made]) |l| self.freeLayer(l);
@@ -431,7 +541,7 @@ pub const Engine = struct {
             self.layers = &.{};
         }
         const kv_bytes: u64 = @as(u64, o.slots) * o.n_ctx * cfg.n_kv_heads * cfg.head_dim * 2;
-        for (w.layers, 0..) |l, i| {
+        for (w.layers[0..nl], 0..) |l, i| {
             self.layers[i] = .{
                 .attn_norm = try f32Buffer(cx, l.attn_norm),
                 .ffn_norm = try f32Buffer(cx, l.ffn_norm),
@@ -490,19 +600,34 @@ pub const Engine = struct {
         for (self.layers) |l| self.freeLayer(l);
         self.allocator.free(self.layers);
         const cx = &self.ctx;
-        for ([_]vk.Buffer{ self.x, self.xb, self.xn, self.tmp, self.q, self.att, self.k, self.v, self.gate, self.up, self.gu, self.par, self.toks, self.logits_dev, self.logits_host, self.dummy, self.out_norm, self.inv_freq }) |b| cx.destroyBuffer(b);
-        cx.destroyBuffer(self.tok_embd.buf);
-        if (!self.tied_output) cx.destroyBuffer(self.output.buf);
+        for ([_]vk.Buffer{ self.x, self.xb, self.xn, self.tmp, self.q, self.att, self.k, self.v, self.gate, self.up, self.gu, self.par, self.toks, self.logits_dev, self.logits_host, self.hid_host, self.attn_part, self.dummy, self.out_norm, self.inv_freq, self.xq, self.xs }) |b| cx.destroyBuffer(b);
+        for (self.pipes_mmvq) |p| if (p) |pp| cx.destroyPipeline(pp);
+        if (self.int_dot) cx.destroyPipeline(self.p_qact);
+        if (!self.partial) {
+            cx.destroyBuffer(self.tok_embd.buf);
+            if (!self.tied_output) cx.destroyBuffer(self.output.buf);
+        }
         for (self.pipes_mmv) |p| if (p) |pp| cx.destroyPipeline(pp);
         for (self.pipes_mm) |p| if (p) |pp| cx.destroyPipeline(pp);
         for (self.pipes_embed) |p| if (p) |pp| cx.destroyPipeline(pp);
-        for ([_]vk.Pipeline{ self.p_norm, self.p_rope, self.p_attn, self.p_swiglu, self.p_swiglu_pair, self.p_add }) |p| cx.destroyPipeline(p);
+        for ([_]vk.Pipeline{ self.p_norm, self.p_rope, self.p_attn, self.p_attn_part, self.p_attn_combine, self.p_swiglu, self.p_swiglu_pair, self.p_add }) |p| cx.destroyPipeline(p);
+        if (self.p_attn_cm) |p| cx.destroyPipeline(p);
         self.allocator.free(self.owners);
         self.ctx.deinit();
     }
 
     pub fn deviceName(self: *const Engine) []const u8 {
         return self.ctx.caps.deviceName();
+    }
+
+    /// True when prompt batches of one sequence run the cooperative matrix attention kernel.
+    pub fn promptAttentionIsCooperative(self: *const Engine) bool {
+        return self.p_attn_cm != null;
+    }
+
+    /// The prompt (batch) matrix kernel in use: cooperative matrices with f16 operands, or the f32 shared-memory tile.
+    pub fn matmulPath(self: *const Engine) []const u8 {
+        return if (self.ctx.caps.coopmat) "cooperative matrix (f16 operands, f32 accumulate)" else "tiled f32";
     }
 
     fn mmvPipe(self: *Engine, t: StorageType) !vk.Pipeline {
@@ -516,8 +641,22 @@ pub const Engine = struct {
     fn mmPipe(self: *Engine, t: StorageType) !vk.Pipeline {
         const i = @intFromEnum(t);
         if (self.pipes_mm[i]) |p| return p;
-        const p = try self.ctx.createPipeline(spirv("mm", t) orelse return error.UnsupportedType, 4, @sizeOf(MmPush));
+        const code = if (self.ctx.caps.coopmat) spirv("mm_cm", t) else spirv("mm", t);
+        const p = try self.ctx.createPipeline(code orelse return error.UnsupportedType, 4, @sizeOf(MmPush));
         self.pipes_mm[i] = p;
+        return p;
+    }
+
+    /// Rows and tokens of the output tile one workgroup of the batch matrix kernel produces.
+    fn mmTile(self: *const Engine) u32 {
+        return if (self.ctx.caps.coopmat) 128 else 64;
+    }
+
+    fn mmvqPipe(self: *Engine, t: StorageType) !vk.Pipeline {
+        const i = @intFromEnum(t);
+        if (self.pipes_mmvq[i]) |p| return p;
+        const p = try self.ctx.createPipeline(mmvqCode(t) orelse return error.UnsupportedType, 5, @sizeOf(MmvPush));
+        self.pipes_mmvq[i] = p;
         return p;
     }
 
@@ -533,14 +672,32 @@ pub const Engine = struct {
         const p = try self.mmvPipe(m.t);
         _ = try self.mmPipe(m.t);
         m.set = try self.ctx.makeSet(p, &.{ .{ .buf = m.buf }, .{ .buf = input }, .{ .buf = output }, .{ .buf = bias orelse self.dummy } });
+        if (self.int_dot and mmvqSupported(m.t)) {
+            const pq = try self.mmvqPipe(m.t);
+            m.set_q = try self.ctx.makeSet(pq, &.{ .{ .buf = m.buf }, .{ .buf = self.xq }, .{ .buf = output }, .{ .buf = bias orelse self.dummy }, .{ .buf = self.xs } });
+        }
     }
 
     fn buildSets(self: *Engine) !void {
         const cx = &self.ctx;
-        const ep = try self.embedPipe(self.tok_embd.t);
-        self.s_embed = try cx.makeSet(ep, &.{ .{ .buf = self.tok_embd.buf }, .{ .buf = self.toks }, .{ .buf = self.x } });
-        self.s_final_norm = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = self.out_norm }, .{ .buf = self.xn } });
-        try self.matSet(&self.output, self.xn, self.logits_dev, null);
+        if (self.int_dot) {
+            self.s_qact_xb = try cx.makeSet(self.p_qact, &.{ .{ .buf = self.xb }, .{ .buf = self.xq }, .{ .buf = self.xs } });
+            self.s_qact_att = try cx.makeSet(self.p_qact, &.{ .{ .buf = self.att }, .{ .buf = self.xq }, .{ .buf = self.xs } });
+            self.s_qact_gate = try cx.makeSet(self.p_qact, &.{ .{ .buf = self.gate }, .{ .buf = self.xq }, .{ .buf = self.xs } });
+            self.s_qact_xn = try cx.makeSet(self.p_qact, &.{ .{ .buf = self.xn }, .{ .buf = self.xq }, .{ .buf = self.xs } });
+        } else {
+            self.s_qact_xb = null;
+            self.s_qact_att = null;
+            self.s_qact_gate = null;
+            self.s_qact_xn = null;
+        }
+        if (!self.partial) {
+            const ep = try self.embedPipe(self.tok_embd.t);
+            self.s_embed = try cx.makeSet(ep, &.{ .{ .buf = self.tok_embd.buf }, .{ .buf = self.toks }, .{ .buf = self.x } });
+            self.s_final_norm = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = self.out_norm }, .{ .buf = self.xn } });
+            try self.matSet(&self.output, self.xn, self.logits_dev, null);
+        }
+        self.s_attn_combine = try cx.makeSet(self.p_attn_combine, &.{ .{ .buf = self.attn_part }, .{ .buf = self.dummy }, .{ .buf = self.dummy }, .{ .buf = self.dummy }, .{ .buf = self.att } });
         for (self.layers) |*l| {
             l.s_norm1 = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = l.attn_norm }, .{ .buf = self.xb } });
             try self.matSet(&l.wq, self.xb, self.q, l.bq);
@@ -552,6 +709,7 @@ pub const Engine = struct {
                 .{ .buf = l.k_norm orelse self.dummy }, .{ .buf = l.kc }, .{ .buf = l.vc },
             });
             l.s_attn = try cx.makeSet(self.p_attn, &.{ .{ .buf = self.q }, .{ .buf = self.par }, .{ .buf = l.kc }, .{ .buf = l.vc }, .{ .buf = self.att } });
+            l.s_attn_part = try cx.makeSet(self.p_attn_part, &.{ .{ .buf = self.q }, .{ .buf = self.par }, .{ .buf = l.kc }, .{ .buf = l.vc }, .{ .buf = self.attn_part } });
             try self.matSet(&l.wo, self.att, self.x, null);
             l.s_norm2 = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = l.ffn_norm }, .{ .buf = self.xb } });
             if (l.fused_gu) {
@@ -567,6 +725,7 @@ pub const Engine = struct {
                 l.s_swiglu = try cx.makeSet(self.p_swiglu, &.{ .{ .buf = self.gate }, .{ .buf = self.up } });
             }
             try self.matSet(&l.down, self.gate, self.x, null);
+            if (l.wq.set_q != null or l.down.set_q != null or l.gate.set_q != null) self.use_q = true;
         }
     }
 
@@ -619,16 +778,32 @@ pub const Engine = struct {
         return lpr;
     }
 
+    /// Quantizes `n` rows of `cols` activations (`set` names the buffer they are in, starting `x_off` floats in) for the
+    /// integer decode kernels, into slots `o_tok` and following. Only does anything on devices with the feature.
+    fn quantAct(self: *Engine, set: c.VkDescriptorSet, cols: u32, n: u32, x_off: u32, o_tok: u32) void {
+        if (!self.use_q) return;
+        const push = QactPush{ .blocks = cols / 32, .x_off = x_off, .x_stride = cols, .o_tok = o_tok };
+        self.disp(.qact, self.p_qact, set, std.mem.asBytes(&push), (cols / 32 + 63) / 64, n, 1);
+        self.barrier();
+    }
+
     fn mat(self: *Engine, m: *const DevMat, n: u32, x_off: u32, y_off: u32, has_bias: bool, mode: u32) void {
         if (n <= 4) {
-            const p = self.pipes_mmv[@intFromEnum(m.t)].?;
             const lpr = lanesPerRow(m);
+            if (m.set_q != null) {
+                // The input was quantized into slot `x_off / cols` and following (see `quantAct`).
+                const push = MmvPush{ .rows = m.rows, .cols = m.cols, .row_bytes = m.row_bytes, .x_stride = m.cols, .y_stride = m.rows, .has_bias = @intFromBool(has_bias), .x_off = x_off / m.cols, .y_off = y_off, .lpr = lpr, .mode = mode };
+                self.disp(.mmv, self.pipes_mmvq[@intFromEnum(m.t)].?, m.set_q, std.mem.asBytes(&push), (m.rows + (128 / lpr) - 1) / (128 / lpr), n, 1);
+                return;
+            }
+            const p = self.pipes_mmv[@intFromEnum(m.t)].?;
             const push = MmvPush{ .rows = m.rows, .cols = m.cols, .row_bytes = m.row_bytes, .x_stride = m.cols, .y_stride = m.rows, .has_bias = @intFromBool(has_bias), .x_off = x_off, .y_off = y_off, .lpr = lpr, .mode = mode };
             self.disp(.mmv, p, m.set, std.mem.asBytes(&push), (m.rows + (128 / lpr) - 1) / (128 / lpr), n, 1);
         } else {
             const p = self.pipes_mm[@intFromEnum(m.t)].?;
             const push = MmPush{ .rows = m.rows, .cols = m.cols, .row_bytes = m.row_bytes, .x_stride = m.cols, .y_stride = m.rows, .has_bias = @intFromBool(has_bias), .x_off = x_off, .y_off = y_off, .n_tokens = n, .mode = mode };
-            self.disp(.mm, p, m.set, std.mem.asBytes(&push), (m.rows + 63) / 64, (n + 63) / 64, 1);
+            const tile = self.mmTile();
+            self.disp(.mm, p, m.set, std.mem.asBytes(&push), (m.rows + tile - 1) / tile, (n + tile - 1) / tile, 1);
         }
     }
 
@@ -637,13 +812,18 @@ pub const Engine = struct {
         const m = &l.gate;
         if (n <= 4) {
             const lpr = lanesPerRow(m);
-            const p = self.pipes_mmv[@intFromEnum(m.t)].?;
             const push = MmvPush{ .rows = m.rows, .cols = m.cols, .row_bytes = m.row_bytes, .x_stride = m.cols, .y_stride = m.rows, .has_bias = 0, .x_off = 0, .y_off = 0, .lpr = lpr, .mode = 2 };
-            self.disp(.mmv, p, m.set, std.mem.asBytes(&push), (m.rows + (128 / lpr) - 1) / (128 / lpr), n, 1);
+            if (m.set_q != null) {
+                self.disp(.mmv, self.pipes_mmvq[@intFromEnum(m.t)].?, m.set_q, std.mem.asBytes(&push), (m.rows + (128 / lpr) - 1) / (128 / lpr), n, 1);
+            } else {
+                const p = self.pipes_mmv[@intFromEnum(m.t)].?;
+                self.disp(.mmv, p, m.set, std.mem.asBytes(&push), (m.rows + (128 / lpr) - 1) / (128 / lpr), n, 1);
+            }
         } else {
             const p = self.pipes_mm[@intFromEnum(m.t)].?;
             const push = MmPush{ .rows = 2 * m.rows, .cols = m.cols, .row_bytes = m.row_bytes, .x_stride = m.cols, .y_stride = 2 * m.rows, .has_bias = 0, .x_off = 0, .y_off = 0, .n_tokens = n, .mode = 0 };
-            self.disp(.mm, p, m.set_pair, std.mem.asBytes(&push), (2 * m.rows + 63) / 64, (n + 63) / 64, 1);
+            const tile = self.mmTile();
+            self.disp(.mm, p, m.set_pair, std.mem.asBytes(&push), (2 * m.rows + tile - 1) / tile, (n + tile - 1) / tile, 1);
             self.barrier();
             const count = CountPush{ .n = n * m.rows };
             self.disp(.swiglu, self.p_swiglu_pair, l.s_swiglu_pair, std.mem.asBytes(&count), (count.n + 255) / 256, 1, 1);
@@ -653,6 +833,18 @@ pub const Engine = struct {
     /// Runs the whole network on `n` tokens. The items name the sequence (cache), token and
     /// position of each; items of one cache must be consecutive positions in increasing order.
     pub fn forward(self: *Engine, items: []const kv_mod.Item) Error!void {
+        if (self.partial) return error.PartialEngine;
+        return self.forwardImpl(items, null);
+    }
+
+    /// A partial engine's pass: `hidden` holds the embedded tokens ([n][dim], from the CPU) on the way in and the state
+    /// after the last device layer on the way out.
+    pub fn forwardPartial(self: *Engine, items: []const kv_mod.Item, hidden: []f32) Error!void {
+        std.debug.assert(self.partial and hidden.len >= items.len * self.cfg.dim);
+        return self.forwardImpl(items, hidden[0 .. items.len * self.cfg.dim]);
+    }
+
+    fn forwardImpl(self: *Engine, items: []const kv_mod.Item, hidden: ?[]f32) Error!void {
         const n: u32 = @intCast(items.len);
         std.debug.assert(n >= 1 and n <= self.n_batch);
         const cfg = self.cfg;
@@ -667,6 +859,7 @@ pub const Engine = struct {
 
         const cx = &self.ctx;
         const cb = self.cb;
+        if (hidden) |h| try cx.upload(self.x, 0, std.mem.sliceAsBytes(h));
         const t_start = nowSecs();
         try cx.begin(cb, true);
         if (self.tq != null) {
@@ -675,10 +868,12 @@ pub const Engine = struct {
             self.tq_n = 0;
         }
 
-        const ep = self.pipes_embed[@intFromEnum(self.tok_embd.t)].?;
-        const eb = EmbedPush{ .dim = @intCast(cfg.dim), .row_bytes = self.tok_embd.row_bytes };
-        self.disp(.embed, ep, self.s_embed, std.mem.asBytes(&eb), (@as(u32, @intCast(cfg.dim)) + 127) / 128, n, 1);
-        self.barrier();
+        if (hidden == null) {
+            const ep = self.pipes_embed[@intFromEnum(self.tok_embd.t)].?;
+            const eb = EmbedPush{ .dim = @intCast(cfg.dim), .row_bytes = self.tok_embd.row_bytes };
+            self.disp(.embed, ep, self.s_embed, std.mem.asBytes(&eb), (@as(u32, @intCast(cfg.dim)) + 127) / 128, n, 1);
+            self.barrier();
+        }
 
         const norm = NormPush{ .dim = @intCast(cfg.dim), .eps = cfg.rms_eps };
         const rope = RopePush{
@@ -694,12 +889,33 @@ pub const Engine = struct {
             .mscale = self.mscale,
         };
         const attn = AttnPush{ .n_tokens = n, .n_heads = @intCast(cfg.n_heads), .n_kv = @intCast(cfg.n_kv_heads), .head_dim = @intCast(cfg.head_dim), .n_ctx = self.n_ctx, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim))) };
+        // The cooperative matrix kernel takes a batch that is consecutive positions of one sequence, which is what a
+        // prompt is; several sequences in one pass (the server) or a decode step run the per-token kernel.
+        var attn_cm: ?vk.Pipeline = null;
+        if (self.p_attn_cm != null and n >= 16) {
+            const first = items[0];
+            var single = true;
+            for (items, 0..) |it, t| {
+                if (it.kv != first.kv or it.pos != first.pos + t) single = false;
+            }
+            if (single) attn_cm = self.p_attn_cm;
+        }
+        // Decode has a handful of (head, token) workgroups; cutting the context into slices gives the device enough
+        // of them. Slices of fewer than 32 positions are not worth a workgroup.
+        var splits: u32 = 1;
+        if (n <= split_max_tokens) {
+            var max_pos: u32 = 0;
+            for (items) |it| max_pos = @max(max_pos, it.pos);
+            const want = (96 + n * @as(u32, @intCast(cfg.n_heads)) - 1) / (n * @as(u32, @intCast(cfg.n_heads)));
+            splits = std.math.clamp(@min(want, (max_pos + 1) / 32), 1, max_splits);
+        }
         const count_dim = CountPush{ .n = n * @as(u32, @intCast(cfg.dim)) };
         const count_ffn = CountPush{ .n = n * @as(u32, @intCast(cfg.ffn_dim)) };
 
         for (self.layers) |*l| {
             self.disp(.norm, self.p_norm, l.s_norm1, std.mem.asBytes(&norm), n, 1, 1);
             self.barrier();
+            if (n <= 4) self.quantAct(self.s_qact_xb, @intCast(cfg.dim), n, 0, 0);
             // The three projections read the same input and write different buffers.
             self.mat(&l.wq, n, 0, 0, l.bq != null, 0);
             self.mat(&l.wk, n, 0, 0, l.bk != null, 0);
@@ -707,13 +923,24 @@ pub const Engine = struct {
             self.barrier();
             self.disp(.rope, self.p_rope, l.s_rope, std.mem.asBytes(&rope), @intCast(cfg.n_heads + 2 * cfg.n_kv_heads), n, 1);
             self.barrier();
-            self.disp(.attn, self.p_attn, l.s_attn, std.mem.asBytes(&attn), @intCast(cfg.n_heads), n, 1);
+            if (attn_cm) |pipe| {
+                self.disp(.attn, pipe, l.s_attn, std.mem.asBytes(&attn), (n + 63) / 64, @intCast(cfg.n_heads), 1);
+            } else if (splits > 1) {
+                const sp = AttnSplitPush{ .n_tokens = attn.n_tokens, .n_heads = attn.n_heads, .n_kv = attn.n_kv, .head_dim = attn.head_dim, .n_ctx = attn.n_ctx, .scale = attn.scale, .splits = splits };
+                self.disp(.attn, self.p_attn_part, l.s_attn_part, std.mem.asBytes(&sp), @intCast(cfg.n_heads), n, splits);
+                self.barrier();
+                self.disp(.attn, self.p_attn_combine, self.s_attn_combine, std.mem.asBytes(&sp), @intCast(cfg.n_heads), n, 1);
+            } else {
+                self.disp(.attn, self.p_attn, l.s_attn, std.mem.asBytes(&attn), @intCast(cfg.n_heads), n, 1);
+            }
             self.barrier();
             // The output projection adds its result to the residual stream itself.
+            if (n <= 4) self.quantAct(self.s_qact_att, @intCast(cfg.qDim()), n, 0, 0);
             self.mat(&l.wo, n, 0, 0, false, 1);
             self.barrier();
             self.disp(.norm, self.p_norm, l.s_norm2, std.mem.asBytes(&norm), n, 1, 1);
             self.barrier();
+            if (n <= 4) self.quantAct(self.s_qact_xb, @intCast(cfg.dim), n, 0, 0);
             if (l.fused_gu) {
                 self.gateUp(l, n);
             } else {
@@ -723,13 +950,20 @@ pub const Engine = struct {
                 self.disp(.swiglu, self.p_swiglu, l.s_swiglu, std.mem.asBytes(&count_ffn), (count_ffn.n + 255) / 256, 1, 1);
             }
             self.barrier();
+            if (n <= 4) self.quantAct(self.s_qact_gate, @intCast(cfg.ffn_dim), n, 0, 0);
             self.mat(&l.down, n, 0, 0, false, 1);
             self.barrier();
         }
         _ = count_dim;
 
-        // The final norm, for every row, so any of them can be asked for afterwards.
-        self.disp(.norm, self.p_norm, self.s_final_norm, std.mem.asBytes(&norm), n, 1, 1);
+        if (hidden != null) {
+            // Leading layers only: the hidden states go back to the CPU, which runs the rest.
+            cx.transferBarrier(cb);
+            cx.copy(cb, self.x, self.hid_host, 0, 0, @as(u64, n) * cfg.dim * 4);
+        } else {
+            // The final norm, for every row, so any of them can be asked for afterwards.
+            self.disp(.norm, self.p_norm, self.s_final_norm, std.mem.asBytes(&norm), n, 1, 1);
+        }
         try cx.end(cb);
         const t_rec = nowSecs();
         try cx.submitAndWait(cb);
@@ -737,6 +971,7 @@ pub const Engine = struct {
         self.prof_wait += nowSecs() - t_rec;
         self.prof_calls += 1;
         self.n_last = n;
+        if (hidden) |h| @memcpy(std.mem.sliceAsBytes(h), self.hid_host.mapped.?[0 .. h.len * 4]);
         if (self.tq != null) self.collectTimestamps();
     }
 
@@ -766,9 +1001,11 @@ pub const Engine = struct {
         try cx.begin(cb, true);
         for (indices, 0..) |idx, k| {
             std.debug.assert(idx < self.n_last);
+            self.quantAct(self.s_qact_xn, @intCast(cfg.dim), 1, @intCast(idx * cfg.dim), @intCast(idx));
             self.mat(&self.output, 1, @intCast(idx * cfg.dim), @intCast(k * cfg.vocab), false, 0);
             self.barrier();
         }
+        cx.transferBarrier(cb);
         cx.copy(cb, self.logits_dev, self.logits_host, 0, 0, @as(u64, indices.len) * cfg.vocab * 4);
         try cx.end(cb);
         const t0 = nowSecs();
@@ -778,3 +1015,286 @@ pub const Engine = struct {
         return out[0 .. indices.len * cfg.vocab];
     }
 };
+
+const test_formats = [_]StorageType{ .f32, .f16, .bf16, .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .iq4_nl, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq4_xs };
+
+/// Random weights of format `t`: blocks of random bytes that decode to finite, moderate values (random bytes alone put
+/// NaNs and 1e30 in the scales).
+fn randomWeights(allocator: std.mem.Allocator, random: std.Random, t: StorageType, rows: usize, cols: usize) ![]u8 {
+    const quant = @import("../quant.zig");
+    const info = quant.info(t).?;
+    const bytes = rows * (cols / info.elems) * info.bytes;
+    const data = try allocator.alloc(u8, bytes);
+    errdefer allocator.free(data);
+    var vals: [256]f32 = undefined;
+    var off: usize = 0;
+    while (off < bytes) : (off += info.bytes) {
+        const block = data[off..][0..info.bytes];
+        while (true) {
+            random.bytes(block);
+            quant.dequant.dequantizeRow(t, block, vals[0..info.elems]) catch unreachable;
+            var ok = true;
+            for (vals[0..info.elems]) |v| {
+                if (!std.math.isFinite(v) or @abs(v) > 8) ok = false;
+            }
+            if (ok) break;
+        }
+    }
+    return data;
+}
+
+/// Runs the batch kernel `kind` ("mm" or "mm_cm") on a random problem and returns the [n][rows] result.
+fn runBatchKernel(ctx: *vk.Context, comptime kind: []const u8, t: StorageType, dm: DevMat, xbuf: vk.Buffer, bias: vk.Buffer, n: u32, tile: u32, out: []f32) !void {
+    const pipe = try ctx.createPipeline(spirv(kind, t).?, 4, @sizeOf(MmPush));
+    defer ctx.destroyPipeline(pipe);
+    const ybytes = @as(u64, n) * dm.rows * 4;
+    const ybuf = try ctx.createBuffer(ybytes, .readback);
+    defer ctx.destroyBuffer(ybuf);
+    @memset(ybuf.mapped.?[0..ybytes], 0xff);
+    const set = try ctx.makeSet(pipe, &.{ .{ .buf = dm.buf }, .{ .buf = xbuf }, .{ .buf = ybuf }, .{ .buf = bias } });
+    const push = MmPush{ .rows = dm.rows, .cols = dm.cols, .row_bytes = dm.row_bytes, .x_stride = dm.cols, .y_stride = dm.rows, .has_bias = 1, .x_off = 0, .y_off = 0, .n_tokens = n, .mode = 0 };
+    const cb = ctx.xfer_cb;
+    try ctx.begin(cb, true);
+    ctx.dispatch(cb, pipe, set, std.mem.asBytes(&push), (dm.rows + tile - 1) / tile, (n + tile - 1) / tile, 1);
+    try ctx.end(cb);
+    try ctx.submitAndWait(cb);
+    @memcpy(std.mem.sliceAsBytes(out), ybuf.mapped.?[0..ybytes]);
+}
+
+test "the cooperative matrix kernel agrees with the tiled f32 kernel on every format" {
+    const gpa = std.testing.allocator;
+    var ctx = vk.Context.init(gpa, null) catch |e| switch (e) {
+        error.NoVulkan, error.NoDevice, error.MissingFeature, error.NoComputeQueue => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+    if (!ctx.caps.coopmat) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    // Sizes that are not multiples of either kernel's tile, so every edge is exercised.
+    const rows: usize = 197;
+    const cols: usize = 768;
+    const n: u32 = 131;
+
+    const xs = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xs);
+    for (xs) |*v| v.* = random.float(f32) * 4 - 2;
+    const xbuf = try ctx.createBuffer(xs.len * 4, .upload);
+    defer ctx.destroyBuffer(xbuf);
+    @memcpy(xbuf.mapped.?[0 .. xs.len * 4], std.mem.sliceAsBytes(xs));
+    const biases = try gpa.alloc(f32, rows);
+    defer gpa.free(biases);
+    for (biases) |*v| v.* = random.float(f32) - 0.5;
+    const bias = try ctx.createBuffer(rows * 4, .upload);
+    defer ctx.destroyBuffer(bias);
+    @memcpy(bias.mapped.?[0 .. rows * 4], std.mem.sliceAsBytes(biases));
+
+    const ref = try gpa.alloc(f32, n * rows);
+    defer gpa.free(ref);
+    const got = try gpa.alloc(f32, n * rows);
+    defer gpa.free(got);
+
+    inline for (test_formats) |t| {
+        const data = try randomWeights(gpa, random, t, rows, cols);
+        defer gpa.free(data);
+        const dm = try Engine.matBuffer(&ctx, .{ .data = data, .t = t, .rows = rows, .cols = cols }, gpa);
+        defer ctx.destroyBuffer(dm.buf);
+        try runBatchKernel(&ctx, "mm", t, dm, xbuf, bias, n, 64, ref);
+        try runBatchKernel(&ctx, "mm_cm", t, dm, xbuf, bias, n, 128, got);
+
+        // f16 operands against f32 ones: the products differ by about 2^-11 per term, so compare relative to the
+        // size of the result, over the whole matrix.
+        var sq: f64 = 0;
+        var worst: f64 = 0;
+        for (ref) |v| sq += @as(f64, v) * v;
+        const rms = @sqrt(sq / @as(f64, @floatFromInt(ref.len)));
+        for (ref, got) |a, b| worst = @max(worst, @abs(@as(f64, a) - b));
+        std.testing.expect(std.math.isFinite(rms) and rms > 0 and worst <= 0.02 * rms) catch |err| {
+            std.debug.print("{s}: worst difference {d:.5} against rms {d:.5}\n", .{ @tagName(t), worst, rms });
+            return err;
+        };
+    }
+}
+
+/// Runs one attention kernel over a synthetic prompt and returns [n][n_heads * hd].
+fn runAttention(ctx: *vk.Context, code: []const u8, cm: bool, hd: u32, qb: vk.Buffer, parb: vk.Buffer, kb: vk.Buffer, vb: vk.Buffer, n: u32, n_heads: u32, n_kv: u32, n_ctx: u32, out: []f32) !void {
+    const pipe = try ctx.createPipeline(code, 5, @sizeOf(AttnPush));
+    defer ctx.destroyPipeline(pipe);
+    const bytes = @as(u64, n) * n_heads * hd * 4;
+    const ob = try ctx.createBuffer(bytes, .readback);
+    defer ctx.destroyBuffer(ob);
+    @memset(ob.mapped.?[0..bytes], 0xff);
+    const set = try ctx.makeSet(pipe, &.{ .{ .buf = qb }, .{ .buf = parb }, .{ .buf = kb }, .{ .buf = vb }, .{ .buf = ob } });
+    const push = AttnPush{ .n_tokens = n, .n_heads = n_heads, .n_kv = n_kv, .head_dim = hd, .n_ctx = n_ctx, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))) };
+    const cb = ctx.xfer_cb;
+    try ctx.begin(cb, true);
+    if (cm) {
+        ctx.dispatch(cb, pipe, set, std.mem.asBytes(&push), (n + 63) / 64, n_heads, 1);
+    } else {
+        ctx.dispatch(cb, pipe, set, std.mem.asBytes(&push), n_heads, n, 1);
+    }
+    try ctx.end(cb);
+    try ctx.submitAndWait(cb);
+    @memcpy(std.mem.sliceAsBytes(out), ob.mapped.?[0..bytes]);
+}
+
+test "the cooperative matrix attention agrees with the per-token kernel, including when the running maximum climbs" {
+    const gpa = std.testing.allocator;
+    var ctx = vk.Context.init(gpa, null) catch |e| switch (e) {
+        error.NoVulkan, error.NoDevice, error.MissingFeature, error.NoComputeQueue => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+    if (!ctx.caps.coopmat) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0xa77);
+    const random = prng.random();
+    const n_heads: u32 = 4;
+    const n_kv: u32 = 2;
+    const n_ctx: u32 = 256;
+    const n: u32 = 100;
+    const pos0: u32 = 37; // a chunk that continues a prompt; the cache below pos0 is already there
+    inline for (.{ .{ 64, "spv/attention_cm_64.spv" }, .{ 128, "spv/attention_cm_128.spv" } }) |cfg| {
+        const hd: u32 = cfg[0];
+        const qd = n_heads * hd;
+        const qs = try gpa.alloc(f32, n * qd);
+        defer gpa.free(qs);
+        // Keys grow with position, so later blocks have larger scores than earlier ones and a row's maximum moves up by
+        // more than the kernel's rescale threshold several times.
+        const kv_len = @as(usize, n_ctx) * n_kv * hd;
+        const ks = try gpa.alloc(f16, kv_len);
+        defer gpa.free(ks);
+        const vs = try gpa.alloc(f16, kv_len);
+        defer gpa.free(vs);
+        for (qs) |*v| v.* = (random.float(f32) * 2 - 1) * 3;
+        for (0..n_ctx) |j| for (0..n_kv * hd) |i| {
+            const grow = 1.0 + @as(f32, @floatFromInt(j)) / 12.0;
+            ks[j * n_kv * hd + i] = @floatCast((random.float(f32) * 2 - 1) * grow);
+            vs[j * n_kv * hd + i] = @floatCast(random.float(f32) * 2 - 1);
+        };
+        const qb = try ctx.createBuffer(qs.len * 4, .upload);
+        defer ctx.destroyBuffer(qb);
+        @memcpy(qb.mapped.?[0 .. qs.len * 4], std.mem.sliceAsBytes(qs));
+        const kb = try ctx.createBuffer(kv_len * 2, .upload);
+        defer ctx.destroyBuffer(kb);
+        @memcpy(kb.mapped.?[0 .. kv_len * 2], std.mem.sliceAsBytes(ks));
+        const vb = try ctx.createBuffer(kv_len * 2, .upload);
+        defer ctx.destroyBuffer(vb);
+        @memcpy(vb.mapped.?[0 .. kv_len * 2], std.mem.sliceAsBytes(vs));
+        const parb = try ctx.createBuffer(2 * n * 4, .upload);
+        defer ctx.destroyBuffer(parb);
+        const par: [*]u32 = @ptrCast(@alignCast(parb.mapped.?));
+        for (0..n) |t| {
+            par[t] = pos0 + @as(u32, @intCast(t));
+            par[n + t] = 0;
+        }
+        const ref = try gpa.alloc(f32, n * qd);
+        defer gpa.free(ref);
+        const got = try gpa.alloc(f32, n * qd);
+        defer gpa.free(got);
+        try runAttention(&ctx, @embedFile("spv/attention.spv"), false, hd, qb, parb, kb, vb, n, n_heads, n_kv, n_ctx, ref);
+        try runAttention(&ctx, @embedFile(cfg[1]), true, hd, qb, parb, kb, vb, n, n_heads, n_kv, n_ctx, got);
+
+        var sq: f64 = 0;
+        var worst: f64 = 0;
+        for (ref) |v| sq += @as(f64, v) * v;
+        const rms = @sqrt(sq / @as(f64, @floatFromInt(ref.len)));
+        for (ref, got) |a, b| worst = @max(worst, @abs(@as(f64, a) - b));
+        std.testing.expect(std.math.isFinite(rms) and rms > 0 and worst <= 0.01 * rms + 0.004) catch |err| {
+            std.debug.print("head size {d}: worst difference {d:.5} against rms {d:.5}\n", .{ hd, worst, rms });
+            return err;
+        };
+    }
+}
+
+test "the integer decode kernels agree with the float ones on every format they cover" {
+    const gpa = std.testing.allocator;
+    var ctx = vk.Context.init(gpa, null) catch |e| switch (e) {
+        error.NoVulkan, error.NoDevice, error.MissingFeature, error.NoComputeQueue => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+    if (!ctx.caps.int_dot) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0x1d07);
+    const random = prng.random();
+    const rows: usize = 61;
+    const cols: usize = 768;
+    const n: u32 = 3;
+    const xs_f = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xs_f);
+    for (xs_f) |*v| v.* = random.float(f32) * 4 - 2;
+    const xbuf = try ctx.createBuffer(xs_f.len * 4, .upload);
+    defer ctx.destroyBuffer(xbuf);
+    @memcpy(xbuf.mapped.?[0 .. xs_f.len * 4], std.mem.sliceAsBytes(xs_f));
+    const bias = try ctx.createBuffer(rows * 4, .upload);
+    defer ctx.destroyBuffer(bias);
+    @memset(bias.mapped.?[0 .. rows * 4], 0);
+    const xq = try ctx.createBuffer(n * cols, .device);
+    defer ctx.destroyBuffer(xq);
+    const xsb = try ctx.createBuffer(n * (cols / 32) * 8, .device);
+    defer ctx.destroyBuffer(xsb);
+    const ybuf_f = try ctx.createBuffer(n * rows * 4, .readback);
+    defer ctx.destroyBuffer(ybuf_f);
+    const ybuf_q = try ctx.createBuffer(n * rows * 4, .readback);
+    defer ctx.destroyBuffer(ybuf_q);
+
+    const qact = try ctx.createPipeline(@embedFile("spv/qact.spv"), 3, @sizeOf(QactPush));
+    defer ctx.destroyPipeline(qact);
+    const qset = try ctx.makeSet(qact, &.{ .{ .buf = xbuf }, .{ .buf = xq }, .{ .buf = xsb } });
+
+    inline for (.{ .q8_0, .q4_0, .q4_1, .q5_0, .q5_1, .q4_k, .q5_k, .q6_k }) |t| {
+        const data = try randomWeights(gpa, random, t, rows, cols);
+        defer gpa.free(data);
+        const dm = try Engine.matBuffer(&ctx, .{ .data = data, .t = t, .rows = rows, .cols = cols }, gpa);
+        defer ctx.destroyBuffer(dm.buf);
+        const pf = try ctx.createPipeline(spirv("mmv", t).?, 4, @sizeOf(MmvPush));
+        defer ctx.destroyPipeline(pf);
+        const pq = try ctx.createPipeline(mmvqCode(t).?, 5, @sizeOf(MmvPush));
+        defer ctx.destroyPipeline(pq);
+        const sf = try ctx.makeSet(pf, &.{ .{ .buf = dm.buf }, .{ .buf = xbuf }, .{ .buf = ybuf_f }, .{ .buf = bias } });
+        const sq = try ctx.makeSet(pq, &.{ .{ .buf = dm.buf }, .{ .buf = xq }, .{ .buf = ybuf_q }, .{ .buf = bias }, .{ .buf = xsb } });
+        const push = MmvPush{ .rows = dm.rows, .cols = dm.cols, .row_bytes = dm.row_bytes, .x_stride = dm.cols, .y_stride = dm.rows, .has_bias = 0, .x_off = 0, .y_off = 0, .lpr = 8, .mode = 0 };
+        const qpush = QactPush{ .blocks = cols / 32, .x_off = 0, .x_stride = cols, .o_tok = 0 };
+        const cb = ctx.xfer_cb;
+        try ctx.begin(cb, true);
+        ctx.dispatch(cb, qact, qset, std.mem.asBytes(&qpush), (cols / 32 + 63) / 64, n, 1);
+        ctx.barrier(cb);
+        ctx.dispatch(cb, pf, sf, std.mem.asBytes(&push), (rows + 15) / 16, n, 1);
+        ctx.dispatch(cb, pq, sq, std.mem.asBytes(&push), (rows + 15) / 16, n, 1);
+        try ctx.end(cb);
+        try ctx.submitAndWait(cb);
+
+        // The integer kernel rounds each block of activations to int8: at most amax / 254 per element, times |w|.
+        const dec = try gpa.alloc(f32, cols);
+        defer gpa.free(dec);
+        const rb = @import("../quant.zig").info(t).?;
+        const row_bytes_file = cols / rb.elems * rb.bytes;
+        const yf: [*]const f32 = @ptrCast(@alignCast(ybuf_f.mapped.?));
+        const yq: [*]const f32 = @ptrCast(@alignCast(ybuf_q.mapped.?));
+        for (0..rows) |r| {
+            try @import("../quant.zig").dequant.dequantizeRow(t, data[r * row_bytes_file ..][0..row_bytes_file], dec);
+            for (0..n) |tk| {
+                var bound: f64 = 0;
+                var b0: usize = 0;
+                while (b0 < cols) : (b0 += 32) {
+                    var amax: f64 = 0;
+                    var wsum: f64 = 0;
+                    for (b0..b0 + 32) |i| {
+                        amax = @max(amax, @abs(@as(f64, xs_f[tk * cols + i])));
+                        wsum += @abs(@as(f64, dec[i]));
+                    }
+                    bound += wsum * amax / 254.0;
+                }
+                const got = yq[tk * rows + r];
+                const want = yf[tk * rows + r];
+                // 1.05 for the f32 summation order and the float kernel's own rounding.
+                std.testing.expect(@abs(@as(f64, got) - want) <= 1.05 * bound + 1e-3 * @abs(@as(f64, want)) + 1e-4) catch |err| {
+                    std.debug.print("{s} row {d} token {d}: integer {d} float {d} bound {d}\n", .{ @tagName(t), r, tk, got, want, bound });
+                    return err;
+                };
+            }
+        }
+    }
+}

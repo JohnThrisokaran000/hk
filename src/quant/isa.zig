@@ -26,7 +26,7 @@ const features = builtin.cpu.features;
 /// Zig's unoptimized code generator does not enable the vector subtarget features for inline
 /// assembly, so Debug builds always use the portable path. It is also the path the unit tests of
 /// the generic variant exercise.
-const asm_ok = builtin.mode != .Debug;
+const asm_ok = builtin.mode != .debug;
 
 fn x86has(comptime f: std.Target.x86.Feature) bool {
     return arch == .x86_64 and std.Target.x86.featureSetHas(features, f);

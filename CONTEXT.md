@@ -9,7 +9,7 @@
 
 ## 1. What HK is
 
-A local LLM runtime and universal model container written in **Zig 0.16**. One binary pulls a model from
+A local LLM runtime and universal model container written in **Zig 0.17**. One binary pulls a model from
 Hugging Face, converts it to `.hk` while downloading (bounded memory), and runs it (CLI, chat, OpenAI-compatible
 server). Weights are memory-mapped and never copied. The owner's stated reason for existing: *memory efficiency
 done seriously* — "the most efficient option out there".
@@ -21,18 +21,18 @@ scope; it is staged by the dependency order in plan §151.
 
 Repo: `github.com/harshitkhandelwal208/hk` · Apache-2.0 · packages: PyPI `hknt`, npm `hkntf`.
 
-## 2. Where things stand (verified 2026-10-06)
+## 2. Where things stand (verified 2026-10-20)
 
 | | |
 |:--|:--|
-| Version | 1.1.1 (tag `v1.1.1`); `HEAD` = `43cf891` on `main`. **Uncommitted work in tree** — see HANDOFF |
+| Version | **2.0.0** (plan §150, Unified Runtime). Next is 2.1 (hardware acceleration), then 2.2 … 2.7; no 3.0.0 until the last milestone. See HANDOFF for the state of the next milestone |
 | Engine runs | Llama / Mistral (no sliding window) / Qwen2 / Qwen3 dense decoders — **3 architecture families** |
 | Formats | 26 weight storage formats decoded; CPU kernel for every one; Vulkan decodes a subset |
 | CPU perf | prefill 91–240 % of llama.cpp (faster on 8/10 models), decode 92–100 %, private RSS 5–9× lower |
 | GPU | Vulkan whole-model-on-one-device; one NVIDIA card tested; slower than llama.cpp's Vulkan |
 | Not present | CUDA in the engine, Metal, ROCm, NPU, MoE, SWA, multimodal, grammar, speculative decoding, distributed, sparse execution, signatures, `hk quantize` |
 | Research half | Python prototypes (Net2Net growth, lineage, 2:4 storage, LoRA/QLoRA, SPIN, self-training) — unit-tested on small models only |
-| Tests | `zig build test`: 138/138 pass (Debug, this machine). Python suite not run in the last session |
+| Tests | `zig build test`: 148/148 (Debug, ReleaseFast, v3, baseline); e2e 24/24; bindings 8 suites; `pytest` 97 passed / 3 skipped (verified 2026-10-20) |
 
 Do **not** quote "137+ architectures" as support. It is a Python name-mapping registry (169 aliases → 79
 canonical names). The engine executes 3 families. Details and every other gap: STATUS.md.
@@ -43,7 +43,7 @@ canonical names). The engine executes 3 families. Details and every other gap: S
 src/                    Zig core (library + C ABI)
   format.zig reader.zig writer.zig metadata.zig tensor_toc.zig   .hk container
   appendix.zig                                                   in-file version lineage (hash chain)
-  integrity.zig transaction.zig                                  SHA-256 seal + metadata journal (NEW, uncommitted)
+  integrity.zig transaction.zig                                  SHA-256 seal + edit journal (uncommitted)
   platform.zig                                                   mmap / file mapping / in-place IO
   engine/        model, config(Arch enum), weights, kv, attention, ops, matmul, session   ← live inference path
   quant/         per-format dequant, vecdot, gemm, unpack, isa                           ← live kernels
@@ -54,7 +54,7 @@ src/                    Zig core (library + C ABI)
   convert/       streaming GGUF / safetensors / HF → .hk; .hk → safetensors
   tokenizer/ tokenizer.zig chat/    BPE + SentencePiece; Jinja subset for chat templates
   sampler.zig                                                    temp/top-k/top-p/min-p/penalties
-  tensor_ops.zig quantization.zig c_api.zig                      LEGACY stack behind C ABI / Python / bindings
+  c_api.zig ops.zig engine/abi_ops.zig                           C ABI / Python / bindings, on the engine kernels
   cuda.zig cuda/                                                 standalone CUDA (NOT in engine)
   growth.zig adaptive.zig expansion.zig sparsity.zig nf4.zig sandbox.zig   research-side Zig
 tools/          hk_cli.zig (the `hk` binary), hk_compare.zig, hk_probe.zig, hk_gpu_bench.zig, GUI, generators
@@ -65,10 +65,11 @@ benchmarks/     results.md (reproduce with hk-compare)             docs/wiki/  u
 docs/plan/      MASTER_PLAN, STATUS, HANDOFF                       docs/graph/ knowledge graph (+ generator)
 ```
 
-**Two kernel stacks** (most common source of wasted effort): the live engine uses `engine → quant + kernels → vk`.
-`tensor_ops.zig` + `quantization.zig` (where the v1.1.0 "gemmF32 zero-skip / RoPE table / FP8 LUT"
-optimizations live) are reached only through `c_api.zig`, Python, and the converters. `cuda.zig` is wired into
-neither. Check which stack a change belongs to before optimizing anything.
+**One kernel stack** (since the 2.0 work): `engine → quant + kernels`, with `vk` and `cuda` as device backends behind
+`backend.Device`. The C ABI, Python and the importers use the same kernels (`engine/abi_ops.zig`, `quant/compat.zig`); the
+former second stack (`tensor_ops.zig`, `quantization.zig`) was removed after it turned out to contain a private "Q4_K"
+layout and a broken Q3_K encoder (see CHANGELOG). The one leftover is the old standalone CUDA kernel set in `src/cuda.zig`,
+used only by `hk-gpu-bench` and `test-cuda`.
 
 ## 4. Commands
 
@@ -87,7 +88,7 @@ HK_KERNELS=avx2 hk run model.hk "hi"        # force a kernel level;  HK_GPU=1 or
 python3 docs/graph/gen_graph.py --check     # refresh/verify the knowledge graph
 ```
 
-Zig 0.16 specifics that bite: I/O goes through `std.Io` (`std.Options.debug_io`, `std.process.Init` for `main`),
+Zig 0.17 specifics that bite (on this machine `zig` and `~/.local/bin/zig17` are both 0.17.0; `zig version` to be sure): optimize modes are `.debug/.safe/.fast/.small`; reflection is `field_names`/`field_values` (use `std.meta.fieldNames`, `std.enums.fromInt`); no `@bitCast` bytes→extern struct (use `std.mem.bytesToValue`); `b.getInstallPath` is gone, so e2e tests get the binary from `HK_EXE`; I/O goes through `std.Io` (`std.Options.debug_io`, `std.process.Init` for `main`),
 `std.Io.Dir.cwd().createFile(io, path, …)`; `build.zig` fans the kernel library out once per ISA level
 (`src/kernels/variants.zig`); never rely on the build machine's CPU features.
 

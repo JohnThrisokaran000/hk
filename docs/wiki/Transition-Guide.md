@@ -12,7 +12,7 @@ hk reads the same GGUF files and runs the same kinds of models from a terminal o
 | Server | `llama-server -m m.gguf --port 8080` | `hk serve m.hk --port 8080` |
 | Use a GGUF you already have | pass it | `hk convert-gguf m.gguf m.hk`, once |
 | Threads | `-t N` | `--threads N` (default: physical cores) |
-| Offload to a GPU | `-ngl 99` | `-ngl 99` (Vulkan, whole model only) |
+| Offload to a GPU | `-ngl 99` | automatic; `-ngl N` is the first N layers, as in llama.cpp |
 | Context size | `-c 4096` | `--ctx 4096` (server) |
 | Sampling | `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed` | the same names |
 | Inspect a file | `gguf-dump` | `hk inspect m.hk` |
@@ -24,7 +24,7 @@ hk reads the same GGUF files and runs the same kinds of models from a terminal o
 
 - The container is `.hk`, not GGUF. `hk export -f gguf in.hk out.gguf` writes one back.
 - hk runs fewer architectures: Llama, Qwen2 and Qwen3 style dense models. If you run Gemma, Phi, mixture of experts or vision models, stay with llama.cpp. See [Compatibility](Compatibility.md).
-- hk has no Metal, ROCm or CUDA backend. The GPU path is Vulkan and runs the whole model on one device. If your model is larger than your VRAM, llama.cpp's partial offload is the better tool today.
+- hk has no Metal or ROCm backend. The GPU paths are CUDA (tensor cores on compute capability 8.0+) and Vulkan, each on one device; a model larger than your VRAM runs its leading layers on the device and the rest on the CPU, as in llama.cpp. On the one laptop it was measured on, hk's CUDA backend is level with llama.cpp's on Q8_0 prompts and 5 to 30 percent behind elsewhere; Vulkan is further behind (see [Compatibility](Compatibility.md)).
 - Memory: a running model costs far less private memory than in llama.cpp (see [Benchmarks and Performance](Benchmarks-and-Performance.md)), because the weights stay in the mapped file and the KV cache grows as the context fills.
 - Speed: see the same page for a measured comparison per format, including where hk is behind.
 
