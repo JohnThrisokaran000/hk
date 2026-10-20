@@ -55,6 +55,7 @@ $ hk run model.hk "Hello" -ngl 99
 ### Not supported
 
 - **Metal.** Apple Silicon runs the CPU kernels (NEON, untested) or the Vulkan backend through MoltenVK (untested). A Metal backend would need an Apple machine to build and check.
-- **CUDA, ROCm.** The tree contains an old CUDA driver wrapper that the engine does not use. Vulkan covers NVIDIA and AMD cards.
+- **CUDA.** `--backend cuda` runs the whole model on one NVIDIA GPU through the CUDA driver API (loaded at run time; no CUDA toolkit is needed to build or run hk). The device code is written in Zig and compiled to PTX by `zig build`; its matrix-vector kernel calls the same block decoders as the CPU, so every weight format the CPU runs works. It has been checked against the CPU on one RTX 3050 (llama, Qwen2, Qwen3; f32 and Q8_0). It is a *first* version: each token runs the network on its own, so a prompt costs one decode step per token, and there is no kernel fusion, CUDA graph or Tensor Core use yet. It has not been benchmarked, so `--backend auto` still prefers Vulkan.
+- **ROCm.** No backend. Vulkan covers NVIDIA and AMD cards.
 - **TPUs.** Google TPUs are programmed through XLA and have no runtime that a program like this can drive directly. There is no TPU backend and none is planned.
 - **NPUs.** No backend.

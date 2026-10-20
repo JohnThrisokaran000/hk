@@ -5,13 +5,14 @@
 //! matrix-vector kernel (decode) and the batched kernel (prefill), `.decode` when only the former exists (prompt
 //! processing would fall back to repeated matrix-vector products), and `.none` otherwise.
 //!
-//! Entries are claims about code that exists today. A target with no engine yet (CUDA, until stage 3 of 2.0 lands)
-//! answers `.none` for everything rather than advertising kernels nothing calls.
+//! Entries are claims about code that exists today, nothing aspirational. CUDA is `.decode` because its engine has
+//! matrix-vector kernels only (stage 3 of HK 2.0); `.full` waits for its batched kernels.
 
 const std = @import("std");
 const format = @import("../format.zig");
 const quant = @import("../quant.zig");
 const vk_engine = @import("../vk/engine.zig");
+const cuda_engine = @import("../cuda/engine.zig");
 const weights_mod = @import("../engine/weights.zig");
 
 pub const StorageType = format.StorageType;
@@ -25,7 +26,8 @@ pub fn weightFormat(target: Target, t: StorageType) Level {
     return switch (target) {
         .cpu => if (quant.vecdot.supported(t)) .full else .none,
         .vulkan => if (vk_engine.supports(t)) .full else .none,
-        .cuda => .none,
+        // Matrix-vector kernels only: a prompt is processed as repeated decode steps until a batched kernel exists.
+        .cuda => if (cuda_engine.supports(t)) .decode else .none,
     };
 }
 
@@ -50,9 +52,10 @@ pub fn firstUnsupported(target: Target, w: *const weights_mod.Weights) ?StorageT
     return null;
 }
 
-test "a target with no engine claims no formats" {
+test "CUDA runs exactly what the CPU decodes, matrix-vector only" {
     inline for (comptime std.enums.values(StorageType)) |t| {
-        try std.testing.expectEqual(Level.none, weightFormat(.cuda, t));
+        const want: Level = if (quant.vecdot.supported(t)) .decode else .none;
+        try std.testing.expectEqual(want, weightFormat(.cuda, t));
     }
 }
 

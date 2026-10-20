@@ -57,7 +57,17 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("HK_THREADS")) |v| n_threads = std.fmt.parseInt(usize, v, 10) catch 0;
     const want_gpu = if (init.environ_map.get("HK_GPU")) |v| std.mem.eql(u8, v, "1") else false;
     gpu_profile = init.environ_map.get("HK_GPU_PROFILE") != null;
-    var model = hk.engine.Model.init(allocator, &reader, .{ .n_ctx = 4096, .n_threads = n_threads, .gpu = if (want_gpu) .on else .off }, &diag) catch |err| {
+    // HK_BACKEND=vulkan|cuda picks the device (and implies HK_GPU=1); cpu forces the CPU.
+    var backend: hk.backend.select.Choice = .auto;
+    var gpu_mode: hk.engine.model.GpuMode = if (want_gpu) .on else .off;
+    if (init.environ_map.get("HK_BACKEND")) |v| {
+        backend = std.meta.stringToEnum(hk.backend.select.Choice, v) orelse {
+            std.debug.print("HK_BACKEND must be auto, cpu, vulkan or cuda\n", .{});
+            return error.BadUsage;
+        };
+        gpu_mode = if (backend == .cpu) .off else .on;
+    }
+    var model = hk.engine.Model.init(allocator, &reader, .{ .n_ctx = 4096, .n_threads = n_threads, .gpu = gpu_mode, .backend = backend }, &diag) catch |err| {
         std.debug.print("load failed: {s}: {s}\n", .{ @errorName(err), diag.message() });
         return err;
     };
@@ -337,5 +347,6 @@ fn vkEngine(model: *hk.engine.Model) ?*hk.gpu.Engine {
     const dev = model.gpu orelse return null;
     return switch (dev) {
         .vulkan => |e| e,
+        .cuda => null,
     };
 }

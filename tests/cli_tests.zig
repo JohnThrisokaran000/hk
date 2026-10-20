@@ -367,11 +367,15 @@ test "backend flag: cpu runs, an unknown value and a missing backend are refused
         try std.testing.expect(contains(r.stderr, "takes auto, cpu, vulkan or cuda"));
     }
     {
-        // Naming a device means "use it or fail"; this build has no CUDA backend, and it must say so.
-        const r = try hk(&.{ "run", m.plain, "hi", "-n", "2", "--backend", "cuda" }, null);
+        // Naming a device means "use it or fail": either it ran on CUDA, or it failed saying CUDA was the problem.
+        // It must never quietly run on the CPU.
+        const r = try hk(&.{ "run", m.plain, "hi", "-n", "2", "--temp", "0", "--backend", "cuda" }, null);
         defer r.deinit(gpa);
-        try std.testing.expect(!r.ok());
-        try std.testing.expect(contains(r.stderr, "this build has no CUDA backend"));
+        if (r.ok()) {
+            try std.testing.expect(contains(r.stderr, "(CUDA)"));
+        } else {
+            try std.testing.expect(contains(r.stderr, "CUDA"));
+        }
     }
 }
 

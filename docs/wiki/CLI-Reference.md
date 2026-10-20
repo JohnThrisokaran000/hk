@@ -26,7 +26,7 @@ Generates text. Text goes to standard output, statistics to standard error, so t
 | `--seed N` | random seed, `0` uses the clock | 0 |
 | `--threads N` | compute threads | physical cores |
 | `-ngl, --gpu-layers N` | run on a GPU (Vulkan) when N > 0; also `HK_GPU=1` | CPU |
-| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda` (also `HK_BACKEND`). `auto` uses a device when the model fits and prints why when it does not. Naming `vulkan` or `cuda` means *use it or fail*: an unusable device is an error, never a silent CPU run. **`cuda` is not implemented yet**; it fails with "this build has no CUDA backend" | follows `-ngl` |
+| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda` (also `HK_BACKEND`). `auto` uses a device when the model fits and prints why when it does not. Naming `vulkan` or `cuda` means *use it or fail*: an unusable device is an error, never a silent CPU run. `cuda` is a first, unoptimized engine (see [Inference and Serving](Inference-and-Serving)); `auto` still prefers Vulkan until CUDA is benchmarked ahead of it | follows `-ngl` |
 
 Every flag is checked before the model is opened, and an unknown or malformed one is an error, never a silent default. With `--temp 0` the output is deterministic.
 

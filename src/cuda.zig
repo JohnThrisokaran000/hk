@@ -17,6 +17,8 @@ pub const enabled = build_options.cuda;
 
 pub const CudaError = error{
     CudaNotCompiledIn,
+    /// cuMemAlloc reported CUDA_ERROR_OUT_OF_MEMORY.
+    OutOfDeviceMemory,
     CudaCallFailed,
     NoCudaDevice,
     UnsupportedStorageType,
@@ -1004,4 +1006,67 @@ pub fn deviceGemv(t: format.StorageType, w: anytype, x: anytype, y: anytype, m: 
     var params = [_]?*anyopaque{ @ptrCast(&d_w), @ptrCast(&d_x), @ptrCast(&d_y), @ptrCast(&k_val) };
     const res = s.api.?.cuLaunchKernel(f, @intCast(m), 1, 1, gemv_block_threads, 1, 1, 0, null, &params, null);
     if (res != 0) return CudaError.CudaCallFailed;
+}
+
+// ---------------------------------------------------------------------
+// Exact-lifetime device memory and typed kernel launches (used by the engine)
+// ---------------------------------------------------------------------
+
+/// A device allocation with an exact lifetime: `deviceFree` returns the memory to the driver at once. Used for
+/// model weights and the KV cache, which must not linger in a cache after the model is unloaded.
+pub const DeviceMem = struct {
+    addr: u64,
+    len: usize,
+
+    /// Address `offset` bytes into the allocation, as the kernels receive it.
+    pub fn at(self: DeviceMem, offset: usize) u64 {
+        std.debug.assert(offset <= self.len);
+        return self.addr + offset;
+    }
+};
+
+const cuda_error_out_of_memory: CuResult = 2;
+
+pub fn deviceAlloc(nbytes: usize) !DeviceMem {
+    const s = try ensureDriver();
+    var p: CuDeviceptr = 0;
+    const r = s.api.?.cuMemAlloc_v2(&p, @max(nbytes, 1));
+    if (r == cuda_error_out_of_memory) return CudaError.OutOfDeviceMemory;
+    if (r != 0 or p == 0) return CudaError.CudaCallFailed;
+    return .{ .addr = p, .len = nbytes };
+}
+
+pub fn deviceFree(m: DeviceMem) void {
+    const s = ensureDriver() catch return;
+    _ = s.api.?.cuMemFree_v2(m.addr);
+}
+
+pub fn copyToDevice(dst: u64, src: []const u8) !void {
+    if (src.len == 0) return;
+    const s = try ensureDriver();
+    if (s.api.?.cuMemcpyHtoD_v2(dst, src.ptr, src.len) != 0) return CudaError.CudaCallFailed;
+}
+
+pub fn copyFromDevice(dst: []u8, src: u64) !void {
+    if (dst.len == 0) return;
+    const s = try ensureDriver();
+    if (s.api.?.cuMemcpyDtoH_v2(dst.ptr, src, dst.len) != 0) return CudaError.CudaCallFailed;
+}
+
+/// A kernel of the Zig device module, resolved once.
+pub const Kernel = struct { f: CuFunction };
+
+pub fn deviceKernel(name: []const u8) !Kernel {
+    return .{ .f = try deviceFunction(name) };
+}
+
+/// Launches `k` on the default stream with a one dimensional grid. `args` is a tuple whose fields match the kernel's
+/// parameters exactly in size: device pointers as `u64`, counts as `u32`, scalars as `f32`.
+pub fn launchKernel(k: Kernel, grid: u32, block: u32, args: anytype) !void {
+    const s = try ensureDriver();
+    var storage = args;
+    const n = args.len;
+    var ptrs: [n]?*anyopaque = undefined;
+    inline for (0..n) |i| ptrs[i] = @ptrCast(&storage[i]);
+    if (s.api.?.cuLaunchKernel(k.f, grid, 1, 1, block, 1, 1, 0, null, &ptrs, null) != 0) return CudaError.CudaCallFailed;
 }

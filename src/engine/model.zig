@@ -15,6 +15,7 @@ const kernels = @import("../kernels.zig");
 const cores = @import("../cores.zig");
 const gpu_mod = @import("../vk/engine.zig");
 const backend_mod = @import("../backend/backend.zig");
+const cuda_engine = @import("../cuda/engine.zig");
 const ops = @import("ops.zig");
 
 pub const Config = config_mod.Config;
@@ -142,9 +143,13 @@ pub const Model = struct {
     /// Plans and starts the device engine. On failure `gpu_note` says why and the model stays on the CPU.
     fn tryGpu(self: *Model, opts: Options, diag: *Diag) !void {
         _ = diag;
-        const gopts = gpu_mod.Options{ .n_batch = self.n_batch, .n_ctx = self.n_ctx, .slots = opts.gpu_slots, .device = opts.gpu_device };
+        const vopts = gpu_mod.Options{ .n_batch = self.n_batch, .n_ctx = self.n_ctx, .slots = opts.gpu_slots, .device = opts.gpu_device };
+        const copts = cuda_engine.Options{ .n_batch = self.n_batch, .n_ctx = self.n_ctx, .slots = opts.gpu_slots };
+        // Vulkan first: its engine has batched kernels and is the measured one. CUDA is chosen by `--backend cuda`
+        // until it is benchmarked ahead of Vulkan.
         const candidates = [_]backend_mod.select.Candidate{
-            backend_mod.probeVulkan(self.allocator, &self.weights, self.cfg, gopts),
+            backend_mod.probeVulkan(self.allocator, &self.weights, self.cfg, vopts),
+            backend_mod.probeCuda(&self.weights, self.cfg, copts),
         };
         const plan = backend_mod.select.plan(.{ .choice = opts.backend, .n_ctx = self.n_ctx, .candidates = &candidates });
 
@@ -160,21 +165,43 @@ pub const Model = struct {
             return error.NoDevice;
         }
 
-        var go = gopts;
-        go.n_ctx = plan.n_ctx;
-        const eng = try self.allocator.create(gpu_mod.Engine);
-        errdefer self.allocator.destroy(eng);
-        eng.* = gpu_mod.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
-            self.setNote(switch (e) {
-                error.UnsupportedType => "a weight format has no GPU kernel yet",
-                error.UnsupportedShape => "a tensor shape is not supported on the GPU",
-                error.OutOfDeviceMemory => "the model does not fit in device memory",
-                else => "the GPU engine failed to start",
-            });
-            return e;
-        };
-        self.gpu = .{ .vulkan = eng };
-        self.n_ctx = go.n_ctx;
+        switch (plan.target) {
+            .vulkan => {
+                var go = vopts;
+                go.n_ctx = plan.n_ctx;
+                const eng = try self.allocator.create(gpu_mod.Engine);
+                errdefer self.allocator.destroy(eng);
+                eng.* = gpu_mod.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
+                    self.setNote(switch (e) {
+                        error.UnsupportedType => "a weight format has no GPU kernel yet",
+                        error.UnsupportedShape => "a tensor shape is not supported on the GPU",
+                        error.OutOfDeviceMemory => "the model does not fit in device memory",
+                        else => "the GPU engine failed to start",
+                    });
+                    return e;
+                };
+                self.gpu = .{ .vulkan = eng };
+                self.n_ctx = go.n_ctx;
+            },
+            .cuda => {
+                var go = copts;
+                go.n_ctx = plan.n_ctx;
+                const eng = try self.allocator.create(cuda_engine.Engine);
+                errdefer self.allocator.destroy(eng);
+                eng.* = cuda_engine.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
+                    self.setNote(switch (e) {
+                        error.UnsupportedType => "a weight format has no CUDA kernel yet",
+                        error.UnsupportedShape => "a tensor shape is not supported on CUDA",
+                        error.OutOfDeviceMemory => "the model does not fit in device memory",
+                        else => "the CUDA engine failed to start",
+                    });
+                    return e;
+                };
+                self.gpu = .{ .cuda = eng };
+                self.n_ctx = go.n_ctx;
+            },
+            .cpu => unreachable,
+        }
     }
 
     /// Forgets a cache that is going away, so a GPU slot it held can be reused.

@@ -13,3 +13,4 @@ pub const Config = config.Config;
 pub const Diag = config.Diag;
 pub const Session = session.Session;
 pub const KvCache = kv.KvCache;
+pub const Item = kv.Item;

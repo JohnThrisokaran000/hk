@@ -24,7 +24,7 @@ hk reads the same GGUF files and runs the same kinds of models from a terminal o
 
 - The container is `.hk`, not GGUF. `hk export -f gguf in.hk out.gguf` writes one back.
 - hk runs fewer architectures: Llama, Qwen2 and Qwen3 style dense models. If you run Gemma, Phi, mixture of experts or vision models, stay with llama.cpp. See [Compatibility](Compatibility.md).
-- hk has no Metal, ROCm or CUDA backend. The GPU path is Vulkan and runs the whole model on one device. If your model is larger than your VRAM, llama.cpp's partial offload is the better tool today.
+- hk has no Metal or ROCm backend. The GPU paths are Vulkan and a first, unoptimized CUDA engine, and each runs the whole model on one device. If your model is larger than your VRAM, llama.cpp's partial offload is the better tool today.
 - Memory: a running model costs far less private memory than in llama.cpp (see [Benchmarks and Performance](Benchmarks-and-Performance.md)), because the weights stay in the mapped file and the KV cache grows as the context fills.
 - Speed: see the same page for a measured comparison per format, including where hk is behind.
 

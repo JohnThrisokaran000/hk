@@ -1763,11 +1763,8 @@ fn gpuSettings(gpu_layers: ?usize, backend: ?BackendChoice) !struct { gpu: hk.en
         choice = try parseBackend(t, "HK_BACKEND");
     };
     const c = choice orelse return .{ .gpu = gpuMode(gpu_layers), .backend = .auto };
-    return switch (c) {
-        .cpu => .{ .gpu = .off, .backend = .cpu },
-        .auto => .{ .gpu = .auto, .backend = .auto },
-        .vulkan, .cuda => .{ .gpu = .on, .backend = c },
-    };
+    const w = hk.backend.select.wants(c);
+    return .{ .gpu = if (!w.device) .off else if (w.required) .on else .auto, .backend = c };
 }
 
 /// Whether to use a GPU: `-ngl N` with N above 0, or HK_GPU=1 in the environment.

@@ -15,6 +15,8 @@
 const std = @import("std");
 const kv_mod = @import("../engine/kv.zig");
 const vk_engine = @import("../vk/engine.zig");
+const cuda_engine = @import("../cuda/engine.zig");
+const cuda = @import("../cuda.zig");
 const vk = @import("../vk/vk.zig");
 const weights_mod = @import("../engine/weights.zig");
 const config_mod = @import("../engine/config.zig");
@@ -22,9 +24,9 @@ const config_mod = @import("../engine/config.zig");
 pub const caps = @import("caps.zig");
 pub const select = @import("select.zig");
 
-pub const Kind = enum { vulkan };
+pub const Kind = enum { vulkan, cuda };
 
-pub const Error = vk_engine.Error;
+pub const Error = vk_engine.Error || cuda_engine.Error;
 
 pub const Item = kv_mod.Item;
 
@@ -64,8 +66,45 @@ pub fn probeVulkan(
     return cand;
 }
 
+/// Probes CUDA for the planner. See `probeVulkan`; the CUDA engine needs no device index yet.
+pub fn probeCuda(
+    w: *const weights_mod.Weights,
+    cfg: config_mod.Config,
+    opts: cuda_engine.Options,
+) select.Candidate {
+    var cand = select.Candidate{
+        .target = .cuda,
+        .need = .{ .base = 0, .per_ctx = 0 },
+        .unsupported = caps.firstUnsupported(.cuda, w),
+    };
+    if (!cuda.enabled) {
+        cand.unusable = "this build has no CUDA backend";
+        return cand;
+    }
+    if (!cuda.isAvailable()) {
+        cand.unusable = "no CUDA driver or device found";
+        return cand;
+    }
+    _ = cuda.deviceKernel("rms_norm") catch {
+        cand.unusable = "the CUDA device code could not be loaded by the driver";
+        return cand;
+    };
+    const free = cuda.freeMemBytes() catch {
+        cand.unusable = "the CUDA device could not be queried";
+        return cand;
+    };
+    cand.free_bytes = @intCast(@max(free, 0));
+    var o = opts;
+    o.n_ctx = 0;
+    const base = cuda_engine.bytesNeeded(w, cfg, o);
+    o.n_ctx = 1;
+    cand.need = .{ .base = base, .per_ctx = cuda_engine.bytesNeeded(w, cfg, o) - base };
+    return cand;
+}
+
 pub const Device = union(Kind) {
     vulkan: *vk_engine.Engine,
+    cuda: *cuda_engine.Engine,
 
     pub fn kind(self: Device) Kind {
         return std.meta.activeTag(self);
@@ -75,6 +114,7 @@ pub const Device = union(Kind) {
     pub fn apiName(self: Device) []const u8 {
         return switch (self) {
             .vulkan => "Vulkan",
+            .cuda => "CUDA",
         };
     }
 
@@ -87,7 +127,7 @@ pub const Device = union(Kind) {
     /// Most logit rows `logits` can return at once.
     pub fn maxRows(self: Device) usize {
         return switch (self) {
-            inline else => |e| e.max_rows,
+            inline else => |e| @as(usize, e.max_rows),
         };
     }
 

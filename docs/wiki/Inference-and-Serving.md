@@ -42,6 +42,7 @@ hk serve model.hk --port 8080 --slots 4 --ctx 4096
 | `--batch N` | most tokens per forward pass | 256 |
 | `--threads N` | compute threads | physical cores |
 | `-ngl N` | use the GPU (a device region per slot) | CPU |
+| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda`; naming a device fails if it cannot be used (also `HK_BACKEND`) | follows `-ngl` |
 | `--api-key KEY` | require `Authorization: Bearer KEY` (or set `HK_API_KEY`) | none |
 | `--alias NAME` | model name reported by the API | file name |
 | `--max-body-mb N` | largest request body | 32 |

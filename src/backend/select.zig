@@ -34,6 +34,22 @@ pub const Choice = enum {
     }
 };
 
+/// What a user's choice means for loading a model.
+pub const Wants = struct {
+    /// Whether a device should be tried at all.
+    device: bool,
+    /// Whether failing to get one is an error (an explicit request) or a quiet fall back to the CPU (`auto`).
+    required: bool,
+};
+
+pub fn wants(choice: Choice) Wants {
+    return switch (choice) {
+        .cpu => .{ .device = false, .required = false },
+        .auto => .{ .device = true, .required = false },
+        .vulkan, .cuda => .{ .device = true, .required = true },
+    };
+}
+
 /// Memory a target needs: a fixed part (weights, activations, runtime) plus a part that grows with the context
 /// (the KV cache of every slot).
 pub const Need = struct {
@@ -212,6 +228,13 @@ test "an explicit choice restricts the search" {
     const none = plan(.{ .choice = .cpu, .n_ctx = 4096, .candidates = &cs });
     try std.testing.expectEqual(Target.cpu, none.target);
     try std.testing.expectEqual(@as(usize, 0), none.n_rejections);
+}
+
+test "naming a device means use it or fail; auto may fall back; cpu never tries a device" {
+    try std.testing.expect(wants(.vulkan).required and wants(.vulkan).device);
+    try std.testing.expect(wants(.cuda).required and wants(.cuda).device);
+    try std.testing.expect(wants(.auto).device and !wants(.auto).required);
+    try std.testing.expect(!wants(.cpu).device and !wants(.cpu).required);
 }
 
 test "asking for a device the build has no backend for is a recorded rejection" {

@@ -17,7 +17,12 @@ pub const Options = struct {
     chat_template: ?[]const u8 = null,
     /// Store the weight matrices as Q8_0 instead of f32.
     q8_0: bool = false,
+    /// Which family's metadata and tensors to write: qwen2 adds q/k/v biases, qwen3 adds per head q/k norms; both
+    /// use NeoX style rotary embedding (the loader derives that from the architecture).
+    arch: Arch = .llama,
 };
+
+pub const Arch = enum { llama, qwen2, qwen3 };
 
 /// The GPT-2 byte to unicode table, so the vocabulary is a valid byte level BPE one.
 fn byteTokens(allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
@@ -114,16 +119,22 @@ pub fn makeTinyGguf(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
             n.* += 1;
         }
     };
-    try kvu32.putS(&kv, &n_kv, "general.architecture", "llama");
-    try kvu32.put(&kv, &n_kv, "llama.block_count", @intCast(o.n_layers));
-    try kvu32.put(&kv, &n_kv, "llama.context_length", 256);
-    try kvu32.put(&kv, &n_kv, "llama.embedding_length", @intCast(o.dim));
-    try kvu32.put(&kv, &n_kv, "llama.feed_forward_length", @intCast(o.ffn));
-    try kvu32.put(&kv, &n_kv, "llama.attention.head_count", @intCast(o.n_heads));
-    try kvu32.put(&kv, &n_kv, "llama.attention.head_count_kv", @intCast(o.n_kv));
-    try kvu32.putF(&kv, &n_kv, "llama.attention.layer_norm_rms_epsilon", 1e-5);
-    try kvu32.putF(&kv, &n_kv, "llama.rope.freq_base", 10000.0);
-    try kvu32.put(&kv, &n_kv, "llama.rope.dimension_count", @intCast(hd));
+    const arch = @tagName(o.arch);
+    const k = struct {
+        fn of(a: std.mem.Allocator, arch_: []const u8, suffix: []const u8) []const u8 {
+            return std.fmt.allocPrint(a, "{s}.{s}", .{ arch_, suffix }) catch unreachable;
+        }
+    }.of;
+    try kvu32.putS(&kv, &n_kv, "general.architecture", arch);
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "block_count"), @intCast(o.n_layers));
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "context_length"), 256);
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "embedding_length"), @intCast(o.dim));
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "feed_forward_length"), @intCast(o.ffn));
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "attention.head_count"), @intCast(o.n_heads));
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "attention.head_count_kv"), @intCast(o.n_kv));
+    try kvu32.putF(&kv, &n_kv, k(arena, arch, "attention.layer_norm_rms_epsilon"), 1e-5);
+    try kvu32.putF(&kv, &n_kv, k(arena, arch, "rope.freq_base"), 10000.0);
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "rope.dimension_count"), @intCast(hd));
     try kvu32.putS(&kv, &n_kv, "tokenizer.ggml.model", "gpt2");
     try kvu32.putS(&kv, &n_kv, "tokenizer.ggml.pre", "gpt-2");
     try kv.str("tokenizer.ggml.tokens");
@@ -165,6 +176,15 @@ pub fn makeTinyGguf(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
         try tensors.append(arena, .{ .name = nm(arena, i, "attn_k.weight"), .rows = o.n_kv * hd, .cols = o.dim, .is_vec = false });
         try tensors.append(arena, .{ .name = nm(arena, i, "attn_v.weight"), .rows = o.n_kv * hd, .cols = o.dim, .is_vec = false });
         try tensors.append(arena, .{ .name = nm(arena, i, "attn_output.weight"), .rows = o.dim, .cols = o.n_heads * hd, .is_vec = false });
+        if (o.arch == .qwen2) {
+            try tensors.append(arena, .{ .name = nm(arena, i, "attn_q.bias"), .rows = 1, .cols = o.n_heads * hd, .is_vec = true });
+            try tensors.append(arena, .{ .name = nm(arena, i, "attn_k.bias"), .rows = 1, .cols = o.n_kv * hd, .is_vec = true });
+            try tensors.append(arena, .{ .name = nm(arena, i, "attn_v.bias"), .rows = 1, .cols = o.n_kv * hd, .is_vec = true });
+        }
+        if (o.arch == .qwen3) {
+            try tensors.append(arena, .{ .name = nm(arena, i, "attn_q_norm.weight"), .rows = 1, .cols = hd, .is_vec = true });
+            try tensors.append(arena, .{ .name = nm(arena, i, "attn_k_norm.weight"), .rows = 1, .cols = hd, .is_vec = true });
+        }
         try tensors.append(arena, .{ .name = nm(arena, i, "ffn_norm.weight"), .rows = 1, .cols = o.dim, .is_vec = true });
         try tensors.append(arena, .{ .name = nm(arena, i, "ffn_gate.weight"), .rows = o.ffn, .cols = o.dim, .is_vec = false });
         try tensors.append(arena, .{ .name = nm(arena, i, "ffn_up.weight"), .rows = o.ffn, .cols = o.dim, .is_vec = false });

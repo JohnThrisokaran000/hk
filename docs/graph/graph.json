@@ -5,8 +5,8 @@
  "stats": {
   "curated_nodes": 79,
   "curated_edges": 153,
-  "file_nodes": 172,
-  "import_edges": 394,
+  "file_nodes": 173,
+  "import_edges": 405,
   "unowned_files": 0,
   "status_counts": {
    "done": 8,
@@ -690,9 +690,10 @@
     150
    ],
    "paths": [
-    "src/cuda_device.zig"
+    "src/cuda_device.zig",
+    "src/cuda/engine.zig"
    ],
-   "note": "Stage 3a: device code in Zig (nvptx64 PTX built by build.zig, no CUDA toolkit). One generic GEMV kernel for all 26 CPU formats reuses quant/dequant.zig; verified vs CPU on RTX 3050. No engine/forward pass, prefill, attention, Tensor Cores or graphs yet."
+   "note": "First engine: whole network on one NVIDIA GPU via the driver API; device code in Zig (nvptx64 PTX built by build.zig, no CUDA toolkit). One generic GEMV kernel for all 26 CPU formats reuses quant/dequant.zig. Parity with CPU verified on one RTX 3050 (llama/qwen2/qwen3, f32/Q8_0, multi-slot). Unoptimized and unbenchmarked: no batched prefill, fusion, graphs or Tensor Cores."
   },
   {
    "id": "backend-metal",
@@ -1524,7 +1525,7 @@
    "type": "file",
    "label": "src/backend/backend.zig",
    "lang": "zig",
-   "loc": 124,
+   "loc": 164,
    "owner": "backend-abstraction"
   },
   {
@@ -1532,7 +1533,7 @@
    "type": "file",
    "label": "src/backend/caps.zig",
    "lang": "zig",
-   "loc": 64,
+   "loc": 67,
    "owner": "backend-abstraction"
   },
   {
@@ -1540,7 +1541,7 @@
    "type": "file",
    "label": "src/backend/select.zig",
    "lang": "zig",
-   "loc": 245,
+   "loc": 268,
    "owner": "backend-abstraction"
   },
   {
@@ -1660,8 +1661,16 @@
    "type": "file",
    "label": "src/cuda.zig",
    "lang": "zig",
-   "loc": 1007,
+   "loc": 1072,
    "owner": "backend-cuda-standalone"
+  },
+  {
+   "id": "file:src/cuda/engine.zig",
+   "type": "file",
+   "label": "src/cuda/engine.zig",
+   "lang": "zig",
+   "loc": 486,
+   "owner": "backend-cuda-engine"
   },
   {
    "id": "file:src/cuda/hk_cuda.cu",
@@ -1684,7 +1693,7 @@
    "type": "file",
    "label": "src/cuda_device.zig",
    "lang": "zig",
-   "loc": 140,
+   "loc": 320,
    "owner": "backend-cuda-engine"
   },
   {
@@ -1692,7 +1701,7 @@
    "type": "file",
    "label": "src/engine.zig",
    "lang": "zig",
-   "loc": 15,
+   "loc": 16,
    "owner": "engine"
   },
   {
@@ -1748,7 +1757,7 @@
    "type": "file",
    "label": "src/engine/model.zig",
    "lang": "zig",
-   "loc": 256,
+   "loc": 283,
    "owner": "engine"
   },
   {
@@ -2188,7 +2197,7 @@
    "type": "file",
    "label": "tests/cli_tests.zig",
    "lang": "zig",
-   "loc": 395,
+   "loc": 399,
    "owner": "cli"
   },
   {
@@ -2252,7 +2261,7 @@
    "type": "file",
    "label": "tests/support/tiny_model.zig",
    "lang": "zig",
-   "loc": 348,
+   "loc": 368,
    "owner": "tests-suite"
   },
   {
@@ -2324,7 +2333,7 @@
    "type": "file",
    "label": "tests/test_gpu.zig",
    "lang": "zig",
-   "loc": 89,
+   "loc": 198,
    "owner": "tests-suite"
   },
   {
@@ -2468,7 +2477,7 @@
    "type": "file",
    "label": "tools/hk_cli.zig",
    "lang": "zig",
-   "loc": 2121,
+   "loc": 2118,
    "owner": "cli"
   },
   {
@@ -2500,7 +2509,7 @@
    "type": "file",
    "label": "tools/hk_probe.zig",
    "lang": "zig",
-   "loc": 341,
+   "loc": 352,
    "owner": "bench-tools"
   },
   {
@@ -3993,6 +4002,11 @@
   },
   {
    "s": "backend-cuda-engine",
+   "t": "file:src/cuda/engine.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "backend-cuda-engine",
    "t": "file:src/cuda_device.zig",
    "type": "implemented_by"
   },
@@ -4628,6 +4642,16 @@
   },
   {
    "s": "file:src/backend/backend.zig",
+   "t": "file:src/cuda.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/backend.zig",
+   "t": "file:src/cuda/engine.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/backend.zig",
    "t": "file:src/engine/config.zig",
    "type": "imports"
   },
@@ -4649,6 +4673,11 @@
   {
    "s": "file:src/backend/backend.zig",
    "t": "file:src/vk/vk.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/caps.zig",
+   "t": "file:src/cuda/engine.zig",
    "type": "imports"
   },
   {
@@ -4947,6 +4976,41 @@
    "type": "imports"
   },
   {
+   "s": "file:src/cuda/engine.zig",
+   "t": "file:src/cuda.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda/engine.zig",
+   "t": "file:src/engine/config.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda/engine.zig",
+   "t": "file:src/engine/kv.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda/engine.zig",
+   "t": "file:src/engine/ops.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda/engine.zig",
+   "t": "file:src/engine/weights.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda/engine.zig",
+   "t": "file:src/format.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda/engine.zig",
+   "t": "file:src/quant.zig",
+   "type": "imports"
+  },
+  {
    "s": "file:src/cuda_device.zig",
    "t": "file:src/format.zig",
    "type": "imports"
@@ -5124,6 +5188,11 @@
   {
    "s": "file:src/engine/model.zig",
    "t": "file:src/cores.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/model.zig",
+   "t": "file:src/cuda/engine.zig",
    "type": "imports"
   },
   {
@@ -6140,6 +6209,16 @@
   },
   {
    "s": "backend-abstraction",
+   "t": "backend-cuda-engine",
+   "imports": 2
+  },
+  {
+   "s": "backend-abstraction",
+   "t": "backend-cuda-standalone",
+   "imports": 1
+  },
+  {
+   "s": "backend-abstraction",
    "t": "backend-vulkan",
    "imports": 3
   },
@@ -6165,13 +6244,28 @@
   },
   {
    "s": "backend-cuda-engine",
+   "t": "backend-cuda-standalone",
+   "imports": 1
+  },
+  {
+   "s": "backend-cuda-engine",
+   "t": "engine",
+   "imports": 3
+  },
+  {
+   "s": "backend-cuda-engine",
    "t": "format-core",
+   "imports": 2
+  },
+  {
+   "s": "backend-cuda-engine",
+   "t": "kv-cache",
    "imports": 1
   },
   {
    "s": "backend-cuda-engine",
    "t": "quant-formats",
-   "imports": 2
+   "imports": 3
   },
   {
    "s": "backend-cuda-standalone",
@@ -6296,6 +6390,11 @@
   {
    "s": "engine",
    "t": "backend-abstraction",
+   "imports": 1
+  },
+  {
+   "s": "engine",
+   "t": "backend-cuda-engine",
    "imports": 1
   },
   {

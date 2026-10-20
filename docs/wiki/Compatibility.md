@@ -44,6 +44,7 @@ Byte level BPE and SentencePiece vocabularies, checked against llama.cpp on 301,
 | Windows, macOS | cross compiled; not run |
 | NVIDIA GPU through Vulkan | tested on one card (RTX 3050 Laptop) |
 | AMD, Intel and Apple GPUs through Vulkan | not tested |
-| Metal, ROCm, CUDA, TPU | no backend |
+| CUDA | first engine (`--backend cuda`): all 26 CPU weight formats, llama/qwen2/qwen3, one NVIDIA GPU; verified against the CPU on one RTX 3050; unoptimized and unbenchmarked |
+| Metal, ROCm, TPU | no backend |
 
 See [Hardware and Kernels](Hardware-and-Kernels.md) for how the kernels are chosen and what has and has not been verified.

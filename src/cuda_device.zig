@@ -67,6 +67,42 @@ inline fn blockSum(v: f32) f32 {
     return total;
 }
 
+/// Maximum of `v` over every thread of the block. All threads get the result.
+inline fn blockMax(v: f32) f32 {
+    var m = v;
+    var off: u32 = 16;
+    while (off > 0) : (off >>= 1) m = @max(m, shflDown(m, off));
+    const lane = tid() & 31;
+    const warp = tid() >> 5;
+    if (lane == 0) reduce_scratch[warp] = m;
+    barSync();
+    var r: f32 = -std.math.inf(f32);
+    if (warp == 0) {
+        r = if (lane < ((bdim() + 31) >> 5)) reduce_scratch[lane] else -std.math.inf(f32);
+        off = 16;
+        while (off > 0) : (off >>= 1) r = @max(r, shflDown(r, off));
+        if (lane == 0) reduce_scratch[0] = r;
+    }
+    barSync();
+    const total = reduce_scratch[0];
+    barSync();
+    return total;
+}
+
+/// e^x through the hardware 2^x instruction (NVPTX has no libm). Relative error is a few ulp, the same order as the
+/// polynomial the CPU engine uses.
+inline fn expf(x: f32) f32 {
+    const y = x * 1.4426950408889634;
+    return asm volatile ("ex2.approx.ftz.f32 %[r], %[v];"
+        : [r] "=f" (-> f32),
+        : [v] "f" (y),
+    );
+}
+
+inline fn globalId() u32 {
+    return bid() * bdim() + tid();
+}
+
 // -- matrix-vector product ---------------------------------------------------------------------------------------
 
 /// Decodes one block of `t` into `out`. Dense float types have one element per "block".
@@ -137,4 +173,148 @@ fn GemvKernel(comptime t: format.StorageType) type {
 
 comptime {
     for (gemv_formats) |t| @export(&GemvKernel(t).run, .{ .name = "gemv_" ++ @tagName(t) });
+}
+
+// -- normalization, rotary embedding, cache, attention, activation ------------------------------------------------
+
+/// out = x * w / rms(x) over one vector of `n`. Launch one block. `out` may alias `x`.
+fn rmsNormKernel(out: [*]f32, x: [*]const f32, w: [*]const f32, n: u32, eps: f32) callconv(.kernel) void {
+    var ss: f32 = 0;
+    var i: u32 = tid();
+    while (i < n) : (i += bdim()) ss += x[i] * x[i];
+    const total = blockSum(ss);
+    const inv = 1.0 / @sqrt(total / @as(f32, @floatFromInt(n)) + eps);
+    i = tid();
+    while (i < n) : (i += bdim()) out[i] = x[i] * inv * w[i];
+}
+
+/// In place RMS norm of every `head_dim` slice of `x` (Qwen3 q/k norm), one block per head, weight shared by heads.
+fn headNormKernel(x: [*]f32, w: [*]const f32, head_dim: u32, eps: f32) callconv(.kernel) void {
+    const hv = x + @as(usize, bid()) * head_dim;
+    var ss: f32 = 0;
+    var i: u32 = tid();
+    while (i < head_dim) : (i += bdim()) ss += hv[i] * hv[i];
+    const total = blockSum(ss);
+    const inv = 1.0 / @sqrt(total / @as(f32, @floatFromInt(head_dim)) + eps);
+    i = tid();
+    while (i < head_dim) : (i += bdim()) hv[i] = hv[i] * inv * w[i];
+}
+
+/// Rotates the first `2 * half` dims of every head of `x` in place. `neox` != 0: pairs (i, i + half); else (2i, 2i + 1).
+/// One block per head; `cos`/`sin` hold `half` values for this token's position.
+fn ropeKernel(x: [*]f32, cos: [*]const f32, sin: [*]const f32, head_dim: u32, half: u32, neox: u32) callconv(.kernel) void {
+    const hv = x + @as(usize, bid()) * head_dim;
+    var i: u32 = tid();
+    while (i < half) : (i += bdim()) {
+        const c = cos[i];
+        const s = sin[i];
+        if (neox != 0) {
+            const a = hv[i];
+            const b = hv[i + half];
+            hv[i] = a * c - b * s;
+            hv[i + half] = a * s + b * c;
+        } else {
+            const a = hv[2 * i];
+            const b = hv[2 * i + 1];
+            hv[2 * i] = a * c - b * s;
+            hv[2 * i + 1] = a * s + b * c;
+        }
+    }
+}
+
+/// Stores one token's keys and values (f32, `n_kv * head_dim` each) into the f16 cache of a slot at `pos`.
+/// Cache layout per layer: [kv head][position][head_dim].
+fn kvWriteKernel(k: [*]const f32, v: [*]const f32, ck: [*]f16, cv: [*]f16, pos: u32, ctx: u32, head_dim: u32, n: u32) callconv(.kernel) void {
+    const i = globalId();
+    if (i >= n) return;
+    const head = i / head_dim;
+    const d = i % head_dim;
+    const dst = (@as(usize, head) * ctx + pos) * head_dim + d;
+    ck[dst] = @floatCast(k[i]);
+    cv[dst] = @floatCast(v[i]);
+}
+
+/// Largest head width the attention kernel supports (its query lives in shared memory).
+const max_head_dim = 256;
+var attn_query: [max_head_dim]f32 addrspace(.shared) = undefined;
+
+/// Causal attention for one token, one block per query head: softmax(q . K^T * scale) V over positions 0..pos.
+/// `scores` is scratch of `n_heads * ctx` floats.
+fn attentionKernel(
+    q: [*]const f32,
+    ck: [*]const f16,
+    cv: [*]const f16,
+    out: [*]f32,
+    scores: [*]f32,
+    pos: u32,
+    ctx: u32,
+    head_dim: u32,
+    group: u32,
+    scale: f32,
+) callconv(.kernel) void {
+    const h = bid();
+    const kvh = h / group;
+    var d: u32 = tid();
+    while (d < head_dim) : (d += bdim()) attn_query[d] = q[@as(usize, h) * head_dim + d];
+    barSync();
+
+    const n = pos + 1;
+    const sc = scores + @as(usize, h) * ctx;
+    const kbase = ck + @as(usize, kvh) * ctx * head_dim;
+    const vbase = cv + @as(usize, kvh) * ctx * head_dim;
+
+    var mx: f32 = -std.math.inf(f32);
+    var p: u32 = tid();
+    while (p < n) : (p += bdim()) {
+        const kr = kbase + @as(usize, p) * head_dim;
+        var s: f32 = 0;
+        var j: u32 = 0;
+        while (j < head_dim) : (j += 1) s += attn_query[j] * @as(f32, @floatCast(kr[j]));
+        s *= scale;
+        sc[p] = s;
+        mx = @max(mx, s);
+    }
+    const gmax = blockMax(mx);
+
+    var sum: f32 = 0;
+    p = tid();
+    while (p < n) : (p += bdim()) {
+        const e = expf(sc[p] - gmax);
+        sc[p] = e;
+        sum += e;
+    }
+    const inv = 1.0 / blockSum(sum);
+
+    d = tid();
+    while (d < head_dim) : (d += bdim()) {
+        var acc: f32 = 0;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) acc += sc[i] * @as(f32, @floatCast(vbase[@as(usize, i) * head_dim + d]));
+        out[@as(usize, h) * head_dim + d] = acc * inv;
+    }
+}
+
+/// gate[i] = silu(gate[i]) * up[i]
+fn swigluKernel(gate: [*]f32, up: [*]const f32, n: u32) callconv(.kernel) void {
+    const i = globalId();
+    if (i >= n) return;
+    const g = gate[i];
+    gate[i] = (g / (1.0 + expf(-g))) * up[i];
+}
+
+/// x[i] += y[i]
+fn addKernel(x: [*]f32, y: [*]const f32, n: u32) callconv(.kernel) void {
+    const i = globalId();
+    if (i >= n) return;
+    x[i] += y[i];
+}
+
+comptime {
+    @export(&rmsNormKernel, .{ .name = "rms_norm" });
+    @export(&headNormKernel, .{ .name = "head_norm" });
+    @export(&ropeKernel, .{ .name = "rope" });
+    @export(&kvWriteKernel, .{ .name = "kv_write" });
+    @export(&attentionKernel, .{ .name = "attention" });
+    @export(&swigluKernel, .{ .name = "swiglu" });
+    @export(&addKernel, .{ .name = "add" });
 }
