@@ -93,21 +93,21 @@ HK_GPU_PROFILE=1  ... # host launch time and whole-pass GPU time;  HK_CUDA_EVENT
 zig-out/bin/hk-compare --llama-bin <dir> --pair m.hk:m.gguf --threads 6 --repeats 5   # against llama.cpp, with a real model
 ```
 
-Measured with `benchmarks/suite.py` (all engines interleaved, 3 repeats, median and min..max, prompt 512, generate 128, 6 threads) at hk `073bf89` against llama.cpp `d806193` on real GGUF files that both engines load byte for byte; the full tables with memory are in `benchmarks/results/2026-10-21-four-models.md`:
+Measured with `benchmarks/suite.py` (all engines interleaved, 3 repeats, median and min..max, prompt 512, generate 128, 6 threads) at hk `df38522` against llama.cpp `d806193` on real GGUF files that both engines load byte for byte; the full tables with memory are in `benchmarks/results/2026-10-21b-four-models.md`:
 
 | Model (GGUF) | Engine | Prompt tok/s | Generation tok/s |
 |:---|:---|--:|--:|
-| Qwen3-0.6B Q8_0 | hk CUDA / llama.cpp CUDA | 7,550 / 7,831 | 138.4 / 152.4 |
-| | hk Vulkan / llama.cpp Vulkan | 4,350 / 6,307 | 122.1 / 147.1 |
-| | hk CPU / llama.cpp CPU | 626 / 399 | 29.5 / 33.3 |
-| Llama-3.2-1B Q4_K_M | hk CUDA / llama.cpp CUDA | 4,292 / 6,046 | 121.4 / 137.5 |
-| | hk Vulkan / llama.cpp Vulkan | 2,889 / 5,217 | 81.5 / 132.5 |
-| | hk CPU / llama.cpp CPU | 353 / 327 | 25.3 / 27.2 |
-| Qwen2.5-1.5B Q4_K_M | hk CUDA / llama.cpp CUDA | 3,020 / 4,229 | 95.4 / 103.0 |
-| | hk Vulkan / llama.cpp Vulkan | 2,028 / 3,518 | 72.3 / 104.5 |
-| | hk CPU / llama.cpp CPU | 212 / 236 | 20.5 / 21.6 |
-| Llama-3.2-3B Q4_K_M | hk CUDA / llama.cpp CUDA | 1,599 / 2,395 | 50.2 / 56.7 |
-| | hk Vulkan / llama.cpp Vulkan | 1,016 / 2,309 | 32.7 / 55.8 |
-| | hk CPU / llama.cpp CPU | 99 / 112 | 10.1 / 10.8 |
+| Qwen3-0.6B Q8_0 | hk CUDA / llama.cpp CUDA | 7,577 / 7,786 | 143.2 / 152.2 |
+| | hk Vulkan / llama.cpp Vulkan | 4,252 / 5,779 | 121.3 / 147.1 |
+| | hk CPU / llama.cpp CPU | 613 / 383 | 23.5 / 24.5 |
+| Llama-3.2-1B Q4_K_M | hk CUDA / llama.cpp CUDA | 4,697 / 6,185 | 126.6 / 137.1 |
+| | hk Vulkan / llama.cpp Vulkan | 3,005 / 5,905 | 118.4 / 132.4 |
+| | hk CPU / llama.cpp CPU | 343 / 313 | 20.1 / 21.1 |
+| Qwen2.5-1.5B Q4_K_M | hk CUDA / llama.cpp CUDA | 3,306 / 4,287 | 100.8 / 103.1 |
+| | hk Vulkan / llama.cpp Vulkan | 2,057 / 3,756 | 71.9 / 104.4 |
+| | hk CPU / llama.cpp CPU | 226 / 235 | 16.6 / 17.3 |
+| Llama-3.2-3B Q4_K_M | hk CUDA / llama.cpp CUDA | 1,774 / 2,410 | 52.8 / 56.7 |
+| | hk Vulkan / llama.cpp Vulkan | 1,091 / 2,335 | 48.7 / 55.8 |
+| | hk CPU / llama.cpp CPU | 85 / 109 (74..124 / 106..111) | 8.1 / 8.5 |
 
-In words: hk's CUDA backend is level with llama.cpp's on Q8_0 prompts and 7-12 % behind on decode, about 30 % behind on K-quant prompts; hk's Vulkan backend is 30-55 % behind, most on K-quants; on the CPU hk is faster on Q8_0 prompts (+57 %) and within ~10 % elsewhere, with a smaller resident set (2.0 GiB against 3.4 GiB for the 3B model). Accuracy (`benchmarks/perplexity.py`, wikitext-2 test, 20 windows of 512 tokens, the llama-perplexity protocol): Qwen3-0.6B Q8_0 perplexity llama.cpp 23.67-23.68, hk 23.64-23.68, Transformers f32 on the original weights 23.73; Qwen2.5-1.5B Q4_K_M llama.cpp 11.64-11.71, hk 11.64-11.70. Transformers on the GPU was not measured here.
+In words: hk's CUDA backend is level with llama.cpp's on Q8_0 prompts (97 %) and 6 percent behind on decode; on the K-quant models it is 74 to 77 percent on prompts and 92 to 98 percent on decode. hk's Vulkan backend is 74 percent (Q8_0) down to 47 percent (K-quants) on prompts and 69 to 89 percent on decode. On the CPU hk is faster on Q8_0 prompts (+60 %), within a few percent on decode, and mixed on K-quant prompts (96 % and 110 % on two models, 78 % with a wide range on the third), with a smaller resident set (2.0 GiB against 3.4 GiB for the 3B model). The CPU numbers of this laptop swing by about 2x between sessions, so compare engines only within a table row. Accuracy (`benchmarks/perplexity.py`, wikitext-2 test, 20 windows of 512 tokens, the llama-perplexity protocol): Qwen3-0.6B Q8_0 perplexity llama.cpp 23.67-23.68, hk 23.64-23.68, Transformers f32 on the original weights 23.73; Qwen2.5-1.5B Q4_K_M llama.cpp 11.64-11.71, hk 11.64-11.70. Transformers on the GPU was not measured here.

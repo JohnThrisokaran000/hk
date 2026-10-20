@@ -49,10 +49,10 @@ On the GPU (one RTX 3050 6 GB laptop, 4 real models, hk and llama.cpp loading th
 
 | | hk CUDA vs llama.cpp CUDA | hk Vulkan vs llama.cpp Vulkan |
 |:---|:---|:---|
-| Prompt processing, Q8_0 | 96 % | 69 % |
-| Prompt processing, Q4_K_M (three models) | 67 to 71 % | 44 to 55 % |
-| Decode, Q8_0 | 91 to 94 % | 83 % |
-| Decode, Q4_K_M (three models) | 88 to 93 % | 59 to 81 % |
+| Prompt processing, Q8_0 | 97 % | 74 % |
+| Prompt processing, Q4_K_M (three models) | 74 to 77 % | 47 to 55 % |
+| Decode, Q8_0 | 94 % | 82 % |
+| Decode, Q4_K_M (three models) | 92 to 98 % | 69 to 89 % |
 
 Perplexity agrees with llama.cpp and Transformers (Qwen3-0.6B Q8_0 on wikitext-2: 23.64 to 23.68 for hk against 23.67 to 23.68 for llama.cpp and 23.73 for Transformers on the original weights). The numbers are one laptop; read them as "same ballpark, not yet equal".
 
