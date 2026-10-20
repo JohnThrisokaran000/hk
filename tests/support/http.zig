@@ -63,6 +63,12 @@ pub const Server = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
         try argv.appendSlice(gpa, &.{ proc.exePath(), "serve", model, "--port", port_s, "--threads", "2" });
+        // The tests are about the server, not about a device: keep them on the CPU unless a test names a backend.
+        var named = false;
+        for (extra) |e| {
+            if (std.mem.eql(u8, e, "--backend")) named = true;
+        }
+        if (!named) try argv.appendSlice(gpa, &.{ "--backend", "cpu" });
         try argv.appendSlice(gpa, extra);
         var child = try std.process.spawn(io, .{ .argv = argv.items, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
         errdefer child.kill(io);

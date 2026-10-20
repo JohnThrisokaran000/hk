@@ -89,6 +89,9 @@ pub const Model = struct {
     gpu: ?backend_mod.Device = null,
     /// Why the GPU is not in use, when it was asked for and could not be. Owned by the model.
     gpu_note: ?[]const u8 = null,
+    /// Whether `gpu_note` is worth telling a user who did not ask for a device: true when a device exists but cannot
+    /// take the model (format, memory), false when there simply is none.
+    gpu_note_notable: bool = false,
     /// When a device runs only the leading layers (partial offload), how many; 0 when it runs the whole network or
     /// there is no device. The CPU runs the layers after these, the embedding and the output.
     gpu_layers: usize = 0,
@@ -182,6 +185,9 @@ pub const Model = struct {
                 w.writeAll("the CPU was requested") catch {};
             }
             self.setNote(w.buffered());
+            for (plan.rejected()) |r| {
+                if (r.why != .unavailable) self.gpu_note_notable = true;
+            }
             return error.NoDevice;
         }
 
@@ -193,6 +199,7 @@ pub const Model = struct {
                 const eng = try self.allocator.create(gpu_mod.Engine);
                 errdefer self.allocator.destroy(eng);
                 eng.* = gpu_mod.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
+                    self.gpu_note_notable = true;
                     self.setNote(switch (e) {
                         error.UnsupportedType => "a weight format has no GPU kernel yet",
                         error.UnsupportedShape => "a tensor shape is not supported on the GPU",
@@ -212,6 +219,7 @@ pub const Model = struct {
                 const eng = try self.allocator.create(cuda_engine.Engine);
                 errdefer self.allocator.destroy(eng);
                 eng.* = cuda_engine.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
+                    self.gpu_note_notable = true;
                     self.setNote(switch (e) {
                         error.UnsupportedType => "a weight format has no CUDA kernel yet",
                         error.UnsupportedShape => "a tensor shape is not supported on CUDA",

@@ -1556,7 +1556,7 @@ const Loaded = struct {
                 } else {
                     std.debug.print("[gpu] running on {s} ({s})\n", .{ g.deviceName(), g.apiName() });
                 }
-            } else {
+            } else if (l.model.gpu_note_notable or l.model.gpu_note == null) {
                 std.debug.print("[gpu] not used: {s}; running on the CPU\n", .{l.model.gpu_note orelse "unknown reason"});
             }
         }
@@ -1776,13 +1776,14 @@ fn gpuSettings(gpu_layers: ?usize, backend: ?BackendChoice) !struct { gpu: hk.en
     return .{ .gpu = if (!w.device or off) .off else if (w.required) .on else .auto, .backend = c, .layers = layers };
 }
 
-/// Whether to use a GPU: `-ngl N` with N above 0, or HK_GPU=1 in the environment.
+/// Whether to use a GPU: `-ngl 0` or HK_GPU=0 turn it off; otherwise a device is used when there is one that takes the
+/// model (`auto`), and the CPU runs it, saying why only when a device existed but could not.
 fn gpuMode(gpu_layers: ?usize) hk.engine.model.GpuMode {
     if (gpu_layers) |n| return if (n > 0) .auto else .off;
     if (g_env) |e| if (e.get("HK_GPU")) |t| {
-        if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "on")) return .auto;
+        if (std.mem.eql(u8, t, "0") or std.mem.eql(u8, t, "off")) return .off;
     };
-    return .off;
+    return .auto;
 }
 
 const GenArgs = struct {
@@ -2010,6 +2011,7 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
     var opts = hk.engine.Options{};
     var alias: ?[]const u8 = null;
     var backend_flag: ?BackendChoice = null;
+    var ngl_flag: ?usize = null;
     cfg.api_key = env.get("HK_API_KEY");
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--host")) {
@@ -2027,8 +2029,7 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
             opts.n_threads = std.fmt.parseInt(usize, args.next() orelse return usageServe(), 10) catch return usageServe();
         } else if (std.mem.eql(u8, a, "-ngl") or std.mem.eql(u8, a, "--gpu-layers")) {
             const n = std.fmt.parseInt(usize, args.next() orelse return usageServe(), 10) catch return usageServe();
-            opts.gpu = if (n > 0) .auto else .off;
-            opts.gpu_layers = if (n > 0) n else null;
+            ngl_flag = n;
         } else if (std.mem.eql(u8, a, "--backend")) {
             backend_flag = try parseBackend(args.next() orelse return usageServe(), "--backend");
         } else if (std.mem.eql(u8, a, "--api-key")) {
@@ -2050,10 +2051,10 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
     opts.n_batch = @max(opts.n_batch, slots);
     opts.gpu_slots = slots;
     {
-        // `-ngl N` already set opts.gpu; --backend or the environment can still decide the target.
-        const gs = try gpuSettings(if (opts.gpu != .off) @as(?usize, 1) else null, backend_flag);
+        const gs = try gpuSettings(ngl_flag, backend_flag);
         opts.gpu = gs.gpu;
         opts.backend = gs.backend;
+        opts.gpu_layers = gs.layers;
     }
     const l = try Loaded.open(allocator, path, opts);
     defer l.close(allocator);

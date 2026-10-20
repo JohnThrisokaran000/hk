@@ -64,9 +64,19 @@ pub fn runEnv(
         stdin_file = try std.Io.Dir.cwd().openFile(io, p, .{});
     }
 
+    // Tests of the command line run on the CPU whatever devices the machine has (a device run is a different, separately
+    // tested numeric path); a test that wants a device passes its own environment.
+    var cpu_env: ?std.process.Environ.Map = null;
+    defer if (cpu_env) |*m| m.deinit();
+    if (env == null) {
+        var m = try std.testing.environ.createMap(gpa);
+        try m.put("HK_BACKEND", "cpu");
+        cpu_env = m;
+    }
+
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
-        .environ_map = env,
+        .environ_map = if (env) |e| e else &cpu_env.?,
         .stdin = if (stdin_file) |f| .{ .file = f } else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
