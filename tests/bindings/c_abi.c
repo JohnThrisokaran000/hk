@@ -16,6 +16,8 @@
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
 
 static int write_fixture(const char* path) {
+    /* A binding built against this header must be running against a library with the same ABI version. */
+    CHECK(hk_abi_version() == HK_ABI_VERSION);
     hk_writer_t* w = hk_writer_create(4096);
     CHECK(w);
     CHECK(hk_writer_add_metadata_string(w, "general.name", "fixture") == 0);

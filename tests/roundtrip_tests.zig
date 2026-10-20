@@ -2095,3 +2095,11 @@ test "the C ABI product functions poison their output on failure instead of leav
     hk.c_api.hk_gemv_q8_0(&w, &x, null, &y, 4, 33);
     for (y) |v| try std.testing.expect(std.math.isNan(v));
 }
+
+test "the C ABI version is exported and matches the header" {
+    try std.testing.expectEqual(@as(u32, 2), hk.c_api.hk_abi_version());
+    // The header is not inside the test's package path, so read it at run time (tests run from the repository root).
+    const header = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, "include/hk.h", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(header);
+    try std.testing.expect(std.mem.indexOf(u8, header, "#define HK_ABI_VERSION 2") != null);
+}

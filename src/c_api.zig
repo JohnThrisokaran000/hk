@@ -882,6 +882,13 @@ pub export fn hk_appendix_append_at(
 
 /// Verifies the container's SHA-256 seal by streaming the file (bounded memory).
 /// Returns 0 = sealed and valid, 1 = legacy file with no seal, -1 = seal mismatch or the file cannot be read.
+/// The C ABI version this library implements; see `HK_ABI_VERSION` in include/hk.h for what changes it.
+pub const abi_version: u32 = 2;
+
+pub export fn hk_abi_version() u32 {
+    return abi_version;
+}
+
 pub export fn hk_verify_integrity(file_path_c: [*:0]const u8) c_int {
     const file_path = std.mem.sliceTo(file_path_c, 0);
     const status = @import("integrity.zig").verifyFile(file_path, std.heap.page_allocator) catch return -1;

@@ -18,6 +18,13 @@ extern "C" {
   #define HK_API __attribute__((visibility("default")))
 #endif
 
+/* C ABI version. 1 is the unversioned ABI of the 1.x releases. It is incremented when an existing function changes
+ * incompatibly (a signature, or what its result means); adding functions does not change it. 2 is the 2.0 ABI: Q4_K is
+ * GGML's layout, the product functions report failure as NaN, and hk_verify_integrity / hk_appendix_append_at exist.
+ * Compare hk_abi_version() with HK_ABI_VERSION before calling anything else. */
+#define HK_ABI_VERSION 2
+HK_API uint32_t hk_abi_version(void);
+
 typedef enum {
     HK_STORAGE_F32 = 0x00,
     HK_STORAGE_F16 = 0x01,

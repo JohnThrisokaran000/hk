@@ -279,6 +279,9 @@ public:
         return hk_metadata_patch_in_place(path.c_str(), key.c_str(), val.c_str()) == 0;
     }
 
+    /// The C ABI version of the loaded library; it should equal `HK_ABI_VERSION` of the header you compiled against.
+    static uint32_t abi_version() { return hk_abi_version(); }
+
     /// Result of checking a container's SHA-256 seal.
     enum class Integrity { Valid, LegacyUnsealed, Invalid };
 
