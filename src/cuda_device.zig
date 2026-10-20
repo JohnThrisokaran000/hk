@@ -370,20 +370,57 @@ inline fn gemmTensor(comptime t: format.StorageType, w: [*]const u8, x: [*]const
         const len = @min(@as(u32, tc_round), k - k0);
 
         // Decode this round of weights for all rows of the block.
-        var idx: u32 = tid();
-        while (idx < tc_rows * units_per_row) : (idx += tc_threads) {
-            const rr = idx / units_per_row;
-            const off: u32 = (idx % units_per_row) * unit;
-            var tmp: [unit]f32 = undefined;
-            if (row0 + rr < m and off < len) {
-                const src = w + @as(usize, row0 + rr) * row_stride + (@as(usize, k0 + off) / info.elems) * info.bytes;
-                decodeUnit(t, unit, src[0..unit_bytes], &tmp);
-            } else {
-                for (&tmp) |*v| v.* = 0;
+        if (comptime t == .f16 or t == .bf16 or t == .f32) {
+            // Dense weights need no block decoder: 8 weights per 16 byte (f16, bf16) or two 16 byte (f32) loads.
+            const bytes_per: usize = comptime if (t == .f32) 4 else 2;
+            var vi: u32 = tid();
+            while (vi < tc_rows * (tc_round / 8)) : (vi += tc_threads) {
+                const rr = vi / (tc_round / 8);
+                const c8: u32 = (vi % (tc_round / 8)) * 8;
+                var out: @Vector(4, u32) = .{ 0, 0, 0, 0 };
+                if (row0 + rr < m and c8 < len) {
+                    const src = w + @as(usize, row0 + rr) * row_stride + @as(usize, k0 + c8) * bytes_per;
+                    if (comptime t == .f16) {
+                        const v: *align(2) const @Vector(4, u32) = @ptrCast(@alignCast(src));
+                        out = v.*;
+                    } else if (comptime t == .bf16) {
+                        const v: *align(2) const @Vector(4, u32) = @ptrCast(@alignCast(src));
+                        const raw = v.*;
+                        inline for (0..4) |i| {
+                            const lo: f32 = @bitCast(raw[i] << 16);
+                            const hi: f32 = @bitCast(raw[i] & 0xffff0000);
+                            out[i] = packHalves(lo, hi);
+                        }
+                    } else {
+                        const v: *align(4) const [2]@Vector(4, u32) = @ptrCast(@alignCast(src));
+                        inline for (0..2) |h| {
+                            inline for (0..2) |i| {
+                                const lo: f32 = @bitCast(v[h][2 * i]);
+                                const hi: f32 = @bitCast(v[h][2 * i + 1]);
+                                out[2 * h + i] = packHalves(lo, hi);
+                            }
+                        }
+                    }
+                }
+                const dst: *addrspace(.shared) align(4) @Vector(4, u32) = @ptrCast(wordsOf(&tc_a) + (rr * tc_a_ld + c8) / 2);
+                dst.* = out;
             }
-            const words = wordsOf(&tc_a) + (rr * tc_a_ld + off) / 2;
-            var e: usize = 0;
-            while (e < unit) : (e += 2) words[e / 2] = packHalves(tmp[e], tmp[e + 1]);
+        } else {
+            var idx: u32 = tid();
+            while (idx < tc_rows * units_per_row) : (idx += tc_threads) {
+                const rr = idx / units_per_row;
+                const off: u32 = (idx % units_per_row) * unit;
+                var tmp: [unit]f32 = undefined;
+                if (row0 + rr < m and off < len) {
+                    const src = w + @as(usize, row0 + rr) * row_stride + (@as(usize, k0 + off) / info.elems) * info.bytes;
+                    decodeUnit(t, unit, src[0..unit_bytes], &tmp);
+                } else {
+                    for (&tmp) |*v| v.* = 0;
+                }
+                const words = wordsOf(&tc_a) + (rr * tc_a_ld + off) / 2;
+                var e: usize = 0;
+                while (e < unit) : (e += 2) words[e / 2] = packHalves(tmp[e], tmp[e + 1]);
+            }
         }
 
         // Activations of tokens tok0.. for k in k0 + step .. + tc_step (already f16), `tc_vecs` copies of 16 bytes per
@@ -928,42 +965,30 @@ inline fn gemvDp4a(comptime t: format.StorageType, w: [*]const u8, xq: [*]const 
     const nb: u32 = k / 32;
     var acc: f32 = 0;
 
-    var k0: u32 = 0;
-    while (k0 < k) : (k0 += gemv_chunk) {
-        const len: u32 = @min(@as(u32, gemv_chunk), k - k0);
-        const xw: [*]const u32 = @ptrCast(@alignCast(xq + k0));
-        var i: u32 = tid();
-        while (i < len / 4) : (i += bdim()) dq_x[i] = xw[i];
-        i = tid();
-        while (i < len / 32) : (i += bdim()) {
-            dq_s[i] = xs[k0 / 32 + i];
-            if (has_min) dq_m[i] = xsum[k0 / 32 + i];
-        }
-        barSync();
-        if (valid) {
-            var b: u32 = lane;
-            while (b < len / 32) : (b += 32) {
-                const bl = k0 / 32 + b;
-                const a = @intFromPtr(w) + @as(usize, row) * row_bytes + @as(usize, bl / per_unit) * info.bytes;
-                const raw = immaFetch(t, a, bl % per_unit);
-                const blk = immaUnpack(t, &raw, bl % per_unit);
-                var lo: i32 = 0;
-                inline for (0..4) |u| lo = dp4a(blk.q[u], dq_x[b * 8 + u], lo);
-                var hi: i32 = 0;
-                inline for (4..8) |u| hi = dp4a(blk.q[u], dq_x[b * 8 + u], hi);
-                var v: f32 = undefined;
-                if (halves) {
-                    v = blk.sc[0] * @as(f32, @floatFromInt(lo)) + blk.sc[1] * @as(f32, @floatFromInt(hi));
-                } else {
-                    v = blk.sc[0] * @as(f32, @floatFromInt(lo + hi));
-                    if (has_min) v -= blk.mn * dq_m[b];
-                }
-                acc += dq_s[b] * v;
+    // No staging and no barrier: each lane reads its block's 32 quants of the activations (two 16 byte loads, cached
+    // after the first row) next to the weights it fetches.
+    if (valid) {
+        var bl: u32 = lane;
+        while (bl < nb) : (bl += 32) {
+            const a = @intFromPtr(w) + @as(usize, row) * row_bytes + @as(usize, bl / per_unit) * info.bytes;
+            const raw = immaFetch(t, a, bl % per_unit);
+            const xv: *align(16) const [2]@Vector(4, u32) = @ptrCast(@alignCast(xq + @as(usize, bl) * 32));
+            const sx = xs[bl];
+            const blk = immaUnpack(t, &raw, bl % per_unit);
+            var lo: i32 = 0;
+            inline for (0..4) |u| lo = dp4a(blk.q[u], xv[0][u], lo);
+            var hi: i32 = 0;
+            inline for (0..4) |u| hi = dp4a(blk.q[4 + u], xv[1][u], hi);
+            var v: f32 = undefined;
+            if (halves) {
+                v = blk.sc[0] * @as(f32, @floatFromInt(lo)) + blk.sc[1] * @as(f32, @floatFromInt(hi));
+            } else {
+                v = blk.sc[0] * @as(f32, @floatFromInt(lo + hi));
+                if (has_min) v -= blk.mn * xsum[bl];
             }
+            acc += sx * v;
         }
-        barSync();
     }
-    _ = nb;
     var off: u32 = 16;
     while (off > 0) : (off >>= 1) acc += shflDown(acc, off);
     if (lane == 0 and valid) y[row] = acc;
@@ -1250,6 +1275,80 @@ pub const gemm_formats = [_]format.StorageType{
     .iq1_s, .iq1_m, .iq4_xs,   .tq1_0,   .tq2_0,
 };
 
+/// Staged activations of the dense matrix-vector kernel, 16 byte aligned for vector reads.
+var dn_x: [gemv_chunk]f32 align(16) addrspace(.shared) = undefined;
+
+/// Single token product for dense weights (f32, f16, bf16): a warp owns a row, each lane takes 8 consecutive weights per
+/// step with one 16 byte load (two for f32), so a warp reads 512 contiguous bytes of the row per step instead of decoding
+/// one weight at a time through the block decoders.
+inline fn gemvDense(comptime t: format.StorageType, w: [*]const u8, x: [*]const f32, y: [*]f32, k: u32, m: u32) void {
+    const bytes_per: usize = comptime if (t == .f32) 4 else 2;
+    const warp = tid() >> 5;
+    const lane = tid() & 31;
+    const row = bid() * gemv_rows + warp;
+    const valid = row < m;
+    const row_ptr = w + @as(usize, row) * k * bytes_per;
+    var acc: f32 = 0;
+    if (valid) {
+        // No staging and no barrier: the activations are re-read from cache by every row, and a warp keeps four 16 byte
+        // loads per lane in flight before it starts on the arithmetic.
+        var off: u32 = lane * 8;
+        while (off < k) : (off += 4 * 256) {
+            var wv: [4][8]f32 = undefined;
+            inline for (0..4) |u| {
+                const o = off + u * 256;
+                if (o < k) {
+                    const src = row_ptr + @as(usize, o) * bytes_per;
+                    if (comptime t == .f32) {
+                        const v: *align(4) const [2]@Vector(4, f32) = @ptrCast(@alignCast(src));
+                        inline for (0..4) |j| {
+                            wv[u][j] = v[0][j];
+                            wv[u][4 + j] = v[1][j];
+                        }
+                    } else {
+                        const v: *align(2) const @Vector(4, u32) = @ptrCast(@alignCast(src));
+                        const raw = v.*;
+                        inline for (0..4) |j| {
+                            if (comptime t == .f16) {
+                                const pair = halfPair(raw[j]);
+                                wv[u][2 * j] = pair[0];
+                                wv[u][2 * j + 1] = pair[1];
+                            } else {
+                                wv[u][2 * j] = @bitCast(raw[j] << 16);
+                                wv[u][2 * j + 1] = @bitCast(raw[j] & 0xffff0000);
+                            }
+                        }
+                    }
+                } else {
+                    wv[u] = @splat(0);
+                }
+            }
+            inline for (0..4) |u| {
+                const o = off + u * 256;
+                if (o < k) {
+                    const xv: *align(16) const [2]@Vector(4, f32) = @ptrCast(@alignCast(x + o));
+                    inline for (0..4) |j| {
+                        acc += wv[u][j] * xv[0][j];
+                        acc += wv[u][4 + j] * xv[1][j];
+                    }
+                }
+            }
+        }
+    }
+    var off: u32 = 16;
+    while (off > 0) : (off >>= 1) acc += shflDown(acc, off);
+    if (lane == 0 and valid) y[row] = acc;
+}
+
+fn GemvDenseKernel(comptime t: format.StorageType) type {
+    return struct {
+        fn run(w: [*]const u8, x: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
+            _ = n;
+            gemvDense(t, w, x, y, k, m);
+        }
+    };
+}
+
 fn GemvKernel(comptime t: format.StorageType) type {
     return struct {
         fn run(w: [*]const u8, x: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
@@ -1269,7 +1368,11 @@ fn GemmTileKernel(comptime t: format.StorageType) type {
 
 comptime {
     for (gemm_formats) |t| {
-        @export(&GemvKernel(t).run, .{ .name = "gemv_" ++ @tagName(t) });
+        if (t == .f32 or t == .f16 or t == .bf16) {
+            @export(&GemvDenseKernel(t).run, .{ .name = "gemv_" ++ @tagName(t) });
+        } else {
+            @export(&GemvKernel(t).run, .{ .name = "gemv_" ++ @tagName(t) });
+        }
         @export(&GemmTileKernel(t).run, .{ .name = "gemm_" ++ @tagName(t) });
     }
 }
