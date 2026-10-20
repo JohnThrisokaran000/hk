@@ -190,7 +190,13 @@ fn readBody(req: *std.http.Server.Request, a: std.mem.Allocator, limit: usize) !
     const reader = try req.readerExpectContinue(buf);
     return reader.allocRemaining(a, .limited(limit)) catch |e| switch (e) {
         error.StreamTooLong => {
-            _ = reader.discard(.limited(drain_limit)) catch {};
+            // `discard` may stop after one chunk, so keep going until the body ends or the allowance is used up.
+            var left: usize = drain_limit;
+            while (left > 0) {
+                const n = reader.discard(.limited(left)) catch break;
+                if (n == 0) break;
+                left -= n;
+            }
             return error.BodyTooLarge;
         },
         else => error.ReadFailed,
