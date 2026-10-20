@@ -171,6 +171,7 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
 
     model.cpu.profile.enabled = true;
     const cuda_profile = cuda_events and isCuda(model);
+    if (vkEngine(model)) |g| if (gpu_profile) g.enableProfiling() catch {};
     if (gpu_profile) if (model.gpu) |dev| switch (dev) {
         .cuda => |e| e.enablePassTiming() catch {},
         .vulkan => {},
@@ -189,6 +190,12 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     _ = model.logitsFor((n_prompt - 1) % model.n_batch);
     const t1 = nowNs(io);
     printProfile("prefill", &model.cpu.profile);
+    if (vkEngine(model)) |g| if (g.tq != null) {
+        const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add" };
+        std.debug.print("gpu kernels, prefill (ms per pass of the whole prompt):", .{});
+        for (names, 0..) |nm, i| std.debug.print(" {s} {d:.2}", .{ nm, g.kind_ns[i] / 1e6 });
+        std.debug.print("\n", .{});
+    };
     if (cuda_profile) {
         std.debug.print("cuda kernels, prefill:\n", .{});
         printCudaProfile();
@@ -201,7 +208,6 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
         g.prof_wait = 0;
         g.prof_calls = 0;
     }
-    if (vkEngine(model)) |g| if (gpu_profile) g.enableProfiling() catch {};
     var tok: u32 = prompt[n_prompt - 1];
     for (0..n_gen) |_| {
         try model.forward(&.{tok}, pos);
