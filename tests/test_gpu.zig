@@ -411,3 +411,34 @@ test "the CUDA integer tensor core kernel on a Q8_0 model matches the CPU over a
     try checkPromptAttention(64, .cuda, true);
     try checkPromptAttention(128, .vulkan, true);
 }
+
+/// A row that is not a whole number of 32 weights is refused by the device engines (the kernels read in groups of 32)
+/// and the model runs on the CPU, with the reason.
+fn checkOddShape(backend: Choice) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+    const h = try makeModel(dir, "odd", .{ .arch = .qwen3, .dim = 48, .n_heads = 4, .n_kv = 2, .ffn = 96, .n_layers = 1 });
+    defer gpa.free(h);
+    var reader = try hk.HKReader.open(h, gpa);
+    defer reader.deinit();
+    // Asked for explicitly: a refusal.
+    if (load(h, .on, backend, 1, 128, &reader)) |m| {
+        var model = m;
+        model.deinit();
+        return error.ShapeNotRefused;
+    } else |e| {
+        try std.testing.expectEqual(error.GpuFailed, e);
+    }
+    // Left to the planner: the CPU runs it.
+    var model = try load(h, .auto, backend, 1, 128, &reader);
+    defer model.deinit();
+    try std.testing.expect(model.gpu == null);
+    try model.forward(&.{ 3, 5, 7 }, 0);
+}
+
+test "a device engine refuses rows that are not a whole number of 32 weights" {
+    try checkOddShape(.cuda);
+    try checkOddShape(.vulkan);
+}

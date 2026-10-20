@@ -491,6 +491,11 @@ pub const Engine = struct {
     };
 
     fn upload(self: *Engine, made: *Made, m: Mat) Error!DevMat {
+        // The kernels read weights in groups of 32 (blocks, or 8 elements at a time for the dense types) and the integer
+        // ones read the activations in blocks of 32, so a row must be a whole number of both. A model that violates this
+        // is refused here rather than read past the end of a row.
+        const info = quant.info(m.t) orelse return error.UnsupportedType;
+        if (m.cols % 32 != 0 or m.cols % info.elems != 0) return error.UnsupportedShape;
         if (self.gemm.get(m.t) == null) {
             const one = cuda.gemmKernel(m.t, 1) catch return error.UnsupportedType;
             const many = cuda.gemmKernel(m.t, 2) catch return error.UnsupportedType;
