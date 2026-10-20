@@ -166,6 +166,8 @@ pub const Engine = struct {
     p_norm: vk.Pipeline,
     p_rope: vk.Pipeline,
     p_attn: vk.Pipeline,
+    /// Cooperative matrix attention for prompt batches; null when the device or the head size does not allow it.
+    p_attn_cm: ?vk.Pipeline,
     p_swiglu: vk.Pipeline,
     p_swiglu_pair: vk.Pipeline,
     p_add: vk.Pipeline,
@@ -394,6 +396,15 @@ pub const Engine = struct {
         self.p_norm = try cx.createPipeline(@embedFile("spv/rmsnorm.spv"), 3, @sizeOf(NormPush));
         self.p_rope = try cx.createPipeline(@embedFile("spv/rope_kv.spv"), 9, @sizeOf(RopePush));
         self.p_attn = try cx.createPipeline(@embedFile("spv/attention.spv"), 5, @sizeOf(AttnPush));
+        self.p_attn_cm = null;
+        if (cx.caps.coopmat) {
+            const code: ?[]const u8 = switch (cfg.head_dim) {
+                64 => @embedFile("spv/attention_cm_64.spv"),
+                128 => @embedFile("spv/attention_cm_128.spv"),
+                else => null,
+            };
+            if (code) |bytes| self.p_attn_cm = try cx.createPipeline(bytes, 5, @sizeOf(AttnPush));
+        }
         self.p_swiglu = try cx.createPipeline(@embedFile("spv/swiglu.spv"), 2, @sizeOf(CountPush));
         self.p_add = try cx.createPipeline(@embedFile("spv/add.spv"), 2, @sizeOf(CountPush));
         self.p_swiglu_pair = try cx.createPipeline(@embedFile("spv/swiglu_pair.spv"), 2, @sizeOf(CountPush));
@@ -497,12 +508,18 @@ pub const Engine = struct {
         for (self.pipes_mm) |p| if (p) |pp| cx.destroyPipeline(pp);
         for (self.pipes_embed) |p| if (p) |pp| cx.destroyPipeline(pp);
         for ([_]vk.Pipeline{ self.p_norm, self.p_rope, self.p_attn, self.p_swiglu, self.p_swiglu_pair, self.p_add }) |p| cx.destroyPipeline(p);
+        if (self.p_attn_cm) |p| cx.destroyPipeline(p);
         self.allocator.free(self.owners);
         self.ctx.deinit();
     }
 
     pub fn deviceName(self: *const Engine) []const u8 {
         return self.ctx.caps.deviceName();
+    }
+
+    /// True when prompt batches of one sequence run the cooperative matrix attention kernel.
+    pub fn promptAttentionIsCooperative(self: *const Engine) bool {
+        return self.p_attn_cm != null;
     }
 
     /// The prompt (batch) matrix kernel in use: cooperative matrices with f16 operands, or the f32 shared-memory tile.
@@ -707,6 +724,17 @@ pub const Engine = struct {
             .mscale = self.mscale,
         };
         const attn = AttnPush{ .n_tokens = n, .n_heads = @intCast(cfg.n_heads), .n_kv = @intCast(cfg.n_kv_heads), .head_dim = @intCast(cfg.head_dim), .n_ctx = self.n_ctx, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim))) };
+        // The cooperative matrix kernel takes a batch that is consecutive positions of one sequence, which is what a
+        // prompt is; several sequences in one pass (the server) or a decode step run the per-token kernel.
+        var attn_cm: ?vk.Pipeline = null;
+        if (self.p_attn_cm != null and n >= 16) {
+            const first = items[0];
+            var single = true;
+            for (items, 0..) |it, t| {
+                if (it.kv != first.kv or it.pos != first.pos + t) single = false;
+            }
+            if (single) attn_cm = self.p_attn_cm;
+        }
         const count_dim = CountPush{ .n = n * @as(u32, @intCast(cfg.dim)) };
         const count_ffn = CountPush{ .n = n * @as(u32, @intCast(cfg.ffn_dim)) };
 
@@ -720,7 +748,11 @@ pub const Engine = struct {
             self.barrier();
             self.disp(.rope, self.p_rope, l.s_rope, std.mem.asBytes(&rope), @intCast(cfg.n_heads + 2 * cfg.n_kv_heads), n, 1);
             self.barrier();
-            self.disp(.attn, self.p_attn, l.s_attn, std.mem.asBytes(&attn), @intCast(cfg.n_heads), n, 1);
+            if (attn_cm) |pipe| {
+                self.disp(.attn, pipe, l.s_attn, std.mem.asBytes(&attn), (n + 63) / 64, @intCast(cfg.n_heads), 1);
+            } else {
+                self.disp(.attn, self.p_attn, l.s_attn, std.mem.asBytes(&attn), @intCast(cfg.n_heads), n, 1);
+            }
             self.barrier();
             // The output projection adds its result to the residual stream itself.
             self.mat(&l.wo, n, 0, 0, false, 1);
@@ -888,6 +920,97 @@ test "the cooperative matrix kernel agrees with the tiled f32 kernel on every fo
         for (ref, got) |a, b| worst = @max(worst, @abs(@as(f64, a) - b));
         std.testing.expect(std.math.isFinite(rms) and rms > 0 and worst <= 0.02 * rms) catch |err| {
             std.debug.print("{s}: worst difference {d:.5} against rms {d:.5}\n", .{ @tagName(t), worst, rms });
+            return err;
+        };
+    }
+}
+
+/// Runs one attention kernel over a synthetic prompt and returns [n][n_heads * hd].
+fn runAttention(ctx: *vk.Context, code: []const u8, cm: bool, hd: u32, qb: vk.Buffer, parb: vk.Buffer, kb: vk.Buffer, vb: vk.Buffer, n: u32, n_heads: u32, n_kv: u32, n_ctx: u32, out: []f32) !void {
+    const pipe = try ctx.createPipeline(code, 5, @sizeOf(AttnPush));
+    defer ctx.destroyPipeline(pipe);
+    const bytes = @as(u64, n) * n_heads * hd * 4;
+    const ob = try ctx.createBuffer(bytes, .readback);
+    defer ctx.destroyBuffer(ob);
+    @memset(ob.mapped.?[0..bytes], 0xff);
+    const set = try ctx.makeSet(pipe, &.{ .{ .buf = qb }, .{ .buf = parb }, .{ .buf = kb }, .{ .buf = vb }, .{ .buf = ob } });
+    const push = AttnPush{ .n_tokens = n, .n_heads = n_heads, .n_kv = n_kv, .head_dim = hd, .n_ctx = n_ctx, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))) };
+    const cb = ctx.xfer_cb;
+    try ctx.begin(cb, true);
+    if (cm) {
+        ctx.dispatch(cb, pipe, set, std.mem.asBytes(&push), (n + 63) / 64, n_heads, 1);
+    } else {
+        ctx.dispatch(cb, pipe, set, std.mem.asBytes(&push), n_heads, n, 1);
+    }
+    try ctx.end(cb);
+    try ctx.submitAndWait(cb);
+    @memcpy(std.mem.sliceAsBytes(out), ob.mapped.?[0..bytes]);
+}
+
+test "the cooperative matrix attention agrees with the per-token kernel, including when the running maximum climbs" {
+    const gpa = std.testing.allocator;
+    var ctx = vk.Context.init(gpa, null) catch |e| switch (e) {
+        error.NoVulkan, error.NoDevice, error.MissingFeature, error.NoComputeQueue => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+    if (!ctx.caps.coopmat) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0xa77);
+    const random = prng.random();
+    const n_heads: u32 = 4;
+    const n_kv: u32 = 2;
+    const n_ctx: u32 = 256;
+    const n: u32 = 100;
+    const pos0: u32 = 37; // a chunk that continues a prompt; the cache below pos0 is already there
+    inline for (.{ .{ 64, "spv/attention_cm_64.spv" }, .{ 128, "spv/attention_cm_128.spv" } }) |cfg| {
+        const hd: u32 = cfg[0];
+        const qd = n_heads * hd;
+        const qs = try gpa.alloc(f32, n * qd);
+        defer gpa.free(qs);
+        // Keys grow with position, so later blocks have larger scores than earlier ones and a row's maximum moves up by
+        // more than the kernel's rescale threshold several times.
+        const kv_len = @as(usize, n_ctx) * n_kv * hd;
+        const ks = try gpa.alloc(f16, kv_len);
+        defer gpa.free(ks);
+        const vs = try gpa.alloc(f16, kv_len);
+        defer gpa.free(vs);
+        for (qs) |*v| v.* = (random.float(f32) * 2 - 1) * 3;
+        for (0..n_ctx) |j| for (0..n_kv * hd) |i| {
+            const grow = 1.0 + @as(f32, @floatFromInt(j)) / 12.0;
+            ks[j * n_kv * hd + i] = @floatCast((random.float(f32) * 2 - 1) * grow);
+            vs[j * n_kv * hd + i] = @floatCast(random.float(f32) * 2 - 1);
+        };
+        const qb = try ctx.createBuffer(qs.len * 4, .upload);
+        defer ctx.destroyBuffer(qb);
+        @memcpy(qb.mapped.?[0 .. qs.len * 4], std.mem.sliceAsBytes(qs));
+        const kb = try ctx.createBuffer(kv_len * 2, .upload);
+        defer ctx.destroyBuffer(kb);
+        @memcpy(kb.mapped.?[0 .. kv_len * 2], std.mem.sliceAsBytes(ks));
+        const vb = try ctx.createBuffer(kv_len * 2, .upload);
+        defer ctx.destroyBuffer(vb);
+        @memcpy(vb.mapped.?[0 .. kv_len * 2], std.mem.sliceAsBytes(vs));
+        const parb = try ctx.createBuffer(2 * n * 4, .upload);
+        defer ctx.destroyBuffer(parb);
+        const par: [*]u32 = @ptrCast(@alignCast(parb.mapped.?));
+        for (0..n) |t| {
+            par[t] = pos0 + @as(u32, @intCast(t));
+            par[n + t] = 0;
+        }
+        const ref = try gpa.alloc(f32, n * qd);
+        defer gpa.free(ref);
+        const got = try gpa.alloc(f32, n * qd);
+        defer gpa.free(got);
+        try runAttention(&ctx, @embedFile("spv/attention.spv"), false, hd, qb, parb, kb, vb, n, n_heads, n_kv, n_ctx, ref);
+        try runAttention(&ctx, @embedFile(cfg[1]), true, hd, qb, parb, kb, vb, n, n_heads, n_kv, n_ctx, got);
+
+        var sq: f64 = 0;
+        var worst: f64 = 0;
+        for (ref) |v| sq += @as(f64, v) * v;
+        const rms = @sqrt(sq / @as(f64, @floatFromInt(ref.len)));
+        for (ref, got) |a, b| worst = @max(worst, @abs(@as(f64, a) - b));
+        std.testing.expect(std.math.isFinite(rms) and rms > 0 and worst <= 0.01 * rms + 0.004) catch |err| {
+            std.debug.print("head size {d}: worst difference {d:.5} against rms {d:.5}\n", .{ hd, worst, rms });
             return err;
         };
     }

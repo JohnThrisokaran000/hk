@@ -14,3 +14,7 @@ done
 for k in rmsnorm rope_kv attention swiglu swiglu_pair add vadd; do
     glslc --target-env=vulkan1.2 -O -I. "$k.comp" -o "$out/$k.spv"
 done
+# Cooperative matrix prompt attention, one binary per head size it supports.
+for hd in 64 128; do
+    glslc --target-env=vulkan1.2 -O -I. -DHD="$hd" attention_cm.comp -o "$out/attention_cm_$hd.spv"
+done

@@ -173,9 +173,50 @@ pub const Pipeline = struct {
     push_bytes: u32 = 0,
 };
 
+/// The loader and the instance, created once per process and never destroyed: see the test at the end of this file.
+const Shared = struct {
+    lib: DynLib,
+    get_inst: std.meta.Child(c.PFN_vkGetInstanceProcAddr),
+    instance: c.VkInstance,
+};
+
+var shared: ?Shared = null;
+var shared_lock: std.atomic.Value(u32) = .init(0);
+
+fn sharedInstance() Error!Shared {
+    while (shared_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    defer shared_lock.store(0, .release);
+    if (shared) |s| return s;
+
+    var lib: DynLib = undefined;
+    var opened = false;
+    for (loader_names) |name| {
+        if (DynLib.open(name)) |l| {
+            lib = l;
+            opened = true;
+            break;
+        } else |_| {}
+    }
+    if (!opened) return error.NoVulkan;
+    errdefer lib.close();
+
+    const get_inst = lib.lookup(std.meta.Child(c.PFN_vkGetInstanceProcAddr), "vkGetInstanceProcAddr") orelse return error.NoVulkan;
+    const create_instance: std.meta.Child(c.PFN_vkCreateInstance) = @ptrCast(get_inst(null, "vkCreateInstance") orelse return error.NoVulkan);
+    var app = std.mem.zeroes(c.VkApplicationInfo);
+    app.sType = c.VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "hk";
+    app.apiVersion = makeApiVersion(0, 1, 2, 0);
+    var ici = std.mem.zeroes(c.VkInstanceCreateInfo);
+    ici.sType = c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+    var instance: c.VkInstance = null;
+    check(create_instance(&ici, null, &instance)) catch return error.NoVulkan;
+    shared = .{ .lib = lib, .get_inst = get_inst, .instance = instance };
+    return shared.?;
+}
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
-    lib: DynLib,
     instance: c.VkInstance,
     phys: c.VkPhysicalDevice,
     device: c.VkDevice,
@@ -190,41 +231,15 @@ pub const Context = struct {
     xfer_cb: c.VkCommandBuffer,
     /// Host visible staging memory for uploads, created on first use.
     stage: ?Buffer = null,
-    destroyInstance: std.meta.Child(c.PFN_vkDestroyInstance),
     getMemoryBudget: ?std.meta.Child(c.PFN_vkGetPhysicalDeviceMemoryProperties2),
 
     /// Opens the loader, picks a device and creates the compute queue. `pick` selects the n-th
     /// device when several are present (HK_VK_DEVICE in the engine); otherwise a discrete GPU
     /// wins over an integrated one and software rasterizers are skipped.
     pub fn init(allocator: std.mem.Allocator, pick: ?usize) !Context {
-        var lib: DynLib = undefined;
-        var opened = false;
-        for (loader_names) |name| {
-            if (DynLib.open(name)) |l| {
-                lib = l;
-                opened = true;
-                break;
-            } else |_| {}
-        }
-        if (!opened) return error.NoVulkan;
-        errdefer lib.close();
-
-        const get_inst = lib.lookup(std.meta.Child(c.PFN_vkGetInstanceProcAddr), "vkGetInstanceProcAddr") orelse return error.NoVulkan;
-        const create_instance: std.meta.Child(c.PFN_vkCreateInstance) = @ptrCast(get_inst(null, "vkCreateInstance") orelse return error.NoVulkan);
-
-        var app = std.mem.zeroes(c.VkApplicationInfo);
-        app.sType = c.VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        app.pApplicationName = "hk";
-        app.apiVersion = makeApiVersion(0, 1, 2, 0);
-        var ici = std.mem.zeroes(c.VkInstanceCreateInfo);
-        ici.sType = c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        ici.pApplicationInfo = &app;
-        var instance: c.VkInstance = null;
-        check(create_instance(&ici, null, &instance)) catch return error.NoVulkan;
-        errdefer {
-            const d: std.meta.Child(c.PFN_vkDestroyInstance) = @ptrCast(get_inst(instance, "vkDestroyInstance").?);
-            d(instance, null);
-        }
+        const sh = try sharedInstance();
+        const get_inst = sh.get_inst;
+        const instance = sh.instance;
 
         const enumerate: std.meta.Child(c.PFN_vkEnumeratePhysicalDevices) = @ptrCast(get_inst(instance, "vkEnumeratePhysicalDevices") orelse return error.NoVulkan);
         const get_props: std.meta.Child(c.PFN_vkGetPhysicalDeviceProperties) = @ptrCast(get_inst(instance, "vkGetPhysicalDeviceProperties").?);
@@ -235,7 +250,6 @@ pub const Context = struct {
         const enum_ext: std.meta.Child(c.PFN_vkEnumerateDeviceExtensionProperties) = @ptrCast(get_inst(instance, "vkEnumerateDeviceExtensionProperties").?);
         const create_device: std.meta.Child(c.PFN_vkCreateDevice) = @ptrCast(get_inst(instance, "vkCreateDevice").?);
         const get_dev_proc: std.meta.Child(c.PFN_vkGetDeviceProcAddr) = @ptrCast(get_inst(instance, "vkGetDeviceProcAddr").?);
-        const destroy_instance: std.meta.Child(c.PFN_vkDestroyInstance) = @ptrCast(get_inst(instance, "vkDestroyInstance").?);
 
         var n_dev: u32 = 0;
         try check(enumerate(instance, &n_dev, null));
@@ -466,7 +480,6 @@ pub const Context = struct {
 
         return .{
             .allocator = allocator,
-            .lib = lib,
             .instance = instance,
             .phys = phys,
             .device = device,
@@ -479,7 +492,6 @@ pub const Context = struct {
             .desc_pool = desc_pool,
             .fence = fence,
             .xfer_cb = xfer,
-            .destroyInstance = destroy_instance,
             .getMemoryBudget = if (has_budget) @ptrCast(get_inst(instance, "vkGetPhysicalDeviceMemoryProperties2")) else null,
         };
     }
@@ -491,8 +503,6 @@ pub const Context = struct {
         self.f.destroyDescriptorPool(self.device, self.desc_pool, null);
         self.f.destroyCommandPool(self.device, self.cmd_pool, null);
         self.f.destroyDevice(self.device, null);
-        self.destroyInstance(self.instance, null);
-        self.lib.close();
     }
 
     /// Bytes of device memory the driver says are still available, or the heap size when it does
@@ -774,4 +784,18 @@ test "a compute shader runs on the device, or there is no device" {
     try ctx.submitAndWait(cb);
     const of: [*]const f32 = @ptrCast(@alignCast(out.mapped.?));
     for (0..n) |i| try std.testing.expectEqual(@as(f32, @floatFromInt(i)) + 0.5, of[i]);
+}
+
+test "a process can open the device many times over" {
+    // NVIDIA's Vulkan driver (615.x; plain C reproduces it) starts failing vkEnumeratePhysicalDevices with
+    // INITIALIZATION_FAILED once a process has created and destroyed about 25 instances. A model load opens two
+    // contexts (a planner probe and the engine), so a long running process would stop loading models after a dozen.
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        var ctx = Context.init(std.testing.allocator, null) catch |e| switch (e) {
+            error.NoVulkan, error.NoDevice, error.MissingFeature, error.NoComputeQueue => return error.SkipZigTest,
+            else => return e,
+        };
+        ctx.deinit();
+    }
 }
