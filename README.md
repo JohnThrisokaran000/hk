@@ -2,19 +2,27 @@
 
 # hk
 
-**A memory-first LLM runtime and universal model container, with research built in.**
+**Local LLMs that run lean, load instantly and keep getting smarter.**
 
-Zero-copy mmap loading, streaming Hugging Face to `.hk` conversion, CPU / CUDA / Vulkan engines and an OpenAI-compatible server, plus 2:4 structured sparsity, Net2Net model growth, in-file version history and self-learning loops for LLMs. Written in Zig.
+A from-scratch LLM runtime and model format in Zig: zero-copy mmap loading, CPU / CUDA / Vulkan engines, an OpenAI-compatible server, 2:4 sparsity, Net2Net model growth, in-file version history and self-learning loops, in one project.
 
 [![CI](https://github.com/harshitkhandelwal208/hk/actions/workflows/ci.yml/badge.svg)](https://github.com/harshitkhandelwal208/hk/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/harshitkhandelwal208/hk)](https://github.com/harshitkhandelwal208/hk/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
-[Quick start](#quick-start) · [What is inside](#what-is-inside) · [Why hk](#why-hk) · [How fast is it](#how-fast-is-it) · [What it does not do yet](#what-it-does-not-do-yet) · [Install](#install) · [Docs](#docs)
+[The pitch](#the-pitch) · [Quick start](#quick-start) · [What is inside](#what-is-inside) · [Why hk](#why-hk) · [How fast is it](#how-fast-is-it) · [What it does not do yet](#what-it-does-not-do-yet) · [Install](#install) · [Docs](#docs)
 
 </div>
 
 ---
+
+## The pitch
+
+I'm building hk because I think running a model on your own machine should feel like opening a file, not like moving house. Loading a 1B model took gigabytes of RAM for no good reason, getting a GGUF into another tool meant another conversion step, and a model was something you converted once and never touched again. I wanted a runtime where memory is the first thing that gets engineered, and a model format that can grow, remember its own history and be edited safely.
+
+It's a personal project, and it's moving fast. In one release cycle I went from a CPU engine to a full 2.0: my own CUDA engine (kernels written in Zig, no CUDA toolkit needed), a Vulkan engine, partial GPU offload, a sealed crash-safe container and a planner that picks the device for you. Prompt processing on the CUDA engine went from 350 to 7,577 tokens/s on Qwen3-0.6B on a laptop RTX 3050, with perplexity matching llama.cpp and Hugging Face Transformers. On the CPU it reads long prompts up to 2.4x faster than llama.cpp while using 5 to 9 times less private memory.
+
+The bigger bet is what comes after fast inference: a model file that carries its own version history, can be widened or given new vocabulary without retraining from zero, stores 2:4 sparse weights, and feeds a loop where the model generates, tests and learns from its own work. Some of that is working today, some is a prototype, and the table below says which is which. The plan runs through hardware backends (ROCm, Metal), more model families and a distributed server; 2.0 is the foundation, not the finish line.
 
 ## Quick start
 
@@ -35,7 +43,7 @@ A GGUF repository works the same way and picks Q4_K_M unless you ask for another
 
 ## What is inside
 
-hk is two things in one repository: a **runtime** that is fast and frugal with memory, and a **container and research toolkit** for the ideas around it. The status column is the honest part.
+hk is two things in one repository: a **runtime** that is fast and frugal with memory, and a **container** that carries the bigger ideas. The status column is the honest part.
 
 | | What it is | Status |
 |:---|:---|:---|
@@ -77,7 +85,7 @@ So: memory is a clear win, CPU prompt processing is mostly ahead, CUDA is close,
 
 ## What it does not do yet
 
-I would rather you hear this from me.
+I would rather you hear this from me than find it out.
 
 - Only Llama, Qwen2 and Qwen3 style dense models run. No Gemma, Phi, sliding window attention, mixture of experts or vision models.
 - GPU support was tested on **one NVIDIA laptop GPU**. Nothing was run on AMD, Intel or Apple GPUs, and there is no Metal, ROCm or TPU backend.
