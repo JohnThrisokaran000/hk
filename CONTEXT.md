@@ -88,7 +88,7 @@ HK_KERNELS=avx2 hk run model.hk "hi"        # force a kernel level;  HK_GPU=1 or
 python3 docs/graph/gen_graph.py --check     # refresh/verify the knowledge graph
 ```
 
-Zig 0.17 specifics that bite (on this machine the pacman `zig` is 0.16 — use `~/.local/bin/zig17`): optimize modes are `.debug/.safe/.fast/.small`; reflection is `field_names`/`field_values` (use `std.meta.fieldNames`, `std.enums.fromInt`); no `@bitCast` bytes→extern struct (use `std.mem.bytesToValue`); `b.getInstallPath` is gone, so e2e tests get the binary from `HK_EXE`; I/O goes through `std.Io` (`std.Options.debug_io`, `std.process.Init` for `main`),
+Zig 0.17 specifics that bite (on this machine `zig` and `~/.local/bin/zig17` are both 0.17.0; `zig version` to be sure): optimize modes are `.debug/.safe/.fast/.small`; reflection is `field_names`/`field_values` (use `std.meta.fieldNames`, `std.enums.fromInt`); no `@bitCast` bytes→extern struct (use `std.mem.bytesToValue`); `b.getInstallPath` is gone, so e2e tests get the binary from `HK_EXE`; I/O goes through `std.Io` (`std.Options.debug_io`, `std.process.Init` for `main`),
 `std.Io.Dir.cwd().createFile(io, path, …)`; `build.zig` fans the kernel library out once per ISA level
 (`src/kernels/variants.zig`); never rely on the build machine's CPU features.
 
