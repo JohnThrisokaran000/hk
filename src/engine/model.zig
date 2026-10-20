@@ -65,6 +65,10 @@ pub const Item = kv_mod.Item;
 
 pub const Profile = cpu_mod.Profile;
 
+fn cuda_engine_tensor_cores() bool {
+    return @import("../cuda.zig").hasTensorCores();
+}
+
 pub const Model = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -156,12 +160,17 @@ pub const Model = struct {
             self.setNote("0 layers were requested on the device");
             return error.NoDevice;
         };
-        // Vulkan first: its engine has batched kernels and is the measured one. CUDA is chosen by `--backend cuda`
-        // until it is benchmarked ahead of Vulkan.
-        const candidates = [_]backend_mod.select.Candidate{
-            backend_mod.probeVulkan(self.allocator, &self.weights, self.cfg, vopts),
-            backend_mod.probeCuda(&self.weights, self.cfg, copts),
-        };
+        // Order of preference, from measurement (benchmarks/results, RTX 3050 laptop, four models): with tensor cores
+        // (compute capability 8.0+) CUDA is ahead of Vulkan on prompts and on decode for every format tried, so it goes
+        // first there; on anything older, or without CUDA, Vulkan goes first (the CUDA kernels below sm_80 are the
+        // portable tiled ones, about 5x slower than Vulkan's on prompts). `--backend` overrides the order.
+        const vk_cand = backend_mod.probeVulkan(self.allocator, &self.weights, self.cfg, vopts);
+        const cuda_cand = backend_mod.probeCuda(&self.weights, self.cfg, copts);
+        const cuda_first = cuda_cand.unusable == null and cuda_engine_tensor_cores();
+        const candidates = if (cuda_first)
+            [_]backend_mod.select.Candidate{ cuda_cand, vk_cand }
+        else
+            [_]backend_mod.select.Candidate{ vk_cand, cuda_cand };
         const plan = backend_mod.select.plan(.{ .choice = opts.backend, .n_ctx = self.n_ctx, .candidates = &candidates, .force_layers = opts.gpu_layers });
 
         if (plan.target == .cpu) {
