@@ -442,3 +442,40 @@ test "a device engine refuses rows that are not a whole number of 32 weights" {
     try checkOddShape(.cuda);
     try checkOddShape(.vulkan);
 }
+
+/// The server runs every request on a worker thread, not the one that loaded the model. A CUDA context is current per
+/// thread, so an engine used from another thread must bind it first (it did not, and every request failed).
+fn checkOtherThread(backend: Choice) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+    const h = try makeModel(dir, "thread", .{ .arch = .qwen3 });
+    defer gpa.free(h);
+    var reader = try hk.HKReader.open(h, gpa);
+    defer reader.deinit();
+    var dev = load(h, .on, backend, 1, 128, &reader) catch |e| switch (e) {
+        error.GpuFailed => return error.SkipZigTest,
+        else => return e,
+    };
+    defer dev.deinit();
+
+    const Job = struct {
+        model: *hk.engine.Model,
+        ok: bool = false,
+        fn run(self: *@This()) void {
+            self.model.forward(&.{ 3, 17, 5, 5, 29 }, 0) catch return;
+            const lg = self.model.logitsFor(4);
+            self.ok = lg.len > 0 and std.math.isFinite(lg[0]);
+        }
+    };
+    var job = Job{ .model = &dev };
+    const th = try std.Thread.spawn(.{}, Job.run, .{&job});
+    th.join();
+    try std.testing.expect(job.ok);
+}
+
+test "a device engine works from a thread other than the one that loaded it" {
+    try checkOtherThread(.cuda);
+    try checkOtherThread(.vulkan);
+}

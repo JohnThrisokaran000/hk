@@ -91,6 +91,7 @@ const DriverApi = struct {
     cuDeviceTotalMem_v2: *const fn (bytes: *usize, dev: CuDevice) callconv(.c) CuResult,
     cuMemGetInfo_v2: *const fn (free: *usize, total: *usize) callconv(.c) CuResult,
     cuCtxCreate_v2: *const fn (pctx: *CuContext, flags: c_uint, dev: CuDevice) callconv(.c) CuResult,
+    cuCtxSetCurrent: *const fn (ctx: CuContext) callconv(.c) CuResult,
     cuCtxDestroy_v2: *const fn (ctx: CuContext) callconv(.c) CuResult,
     cuCtxSynchronize: *const fn () callconv(.c) CuResult,
     cuMemAlloc_v2: *const fn (dptr: *CuDeviceptr, bytesize: usize) callconv(.c) CuResult,
@@ -186,12 +187,23 @@ const Mutex = struct {
 var global_state: DriverState = .{};
 var global_mutex: Mutex = .{};
 
+/// Whether this thread has made the process's context current. A CUDA context is current per thread: the thread that
+/// created it has it, a server worker thread does not (and every call it made failed with "invalid context").
+threadlocal var thread_bound: bool = false;
+
 fn ensureDriver() !*DriverState {
     if (!enabled) return CudaError.CudaNotCompiledIn;
+    if (thread_bound and global_state.initialized) return &global_state;
     global_mutex.lock();
     defer global_mutex.unlock();
 
-    if (global_state.initialized) return &global_state;
+    if (global_state.initialized) {
+        if (!thread_bound) {
+            if (global_state.api.?.cuCtxSetCurrent(global_state.context) != 0) return CudaError.CudaCallFailed;
+            thread_bound = true;
+        }
+        return &global_state;
+    }
     if (global_state.init_attempted) return CudaError.DriverNotLoaded;
     global_state.init_attempted = true;
 
@@ -221,6 +233,7 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
         .cuDeviceTotalMem_v2 = getProc(*const fn (*usize, CuDevice) callconv(.c) CuResult, handle, "cuDeviceTotalMem_v2") orelse return CudaError.DriverNotLoaded,
         .cuMemGetInfo_v2 = getProc(*const fn (*usize, *usize) callconv(.c) CuResult, handle, "cuMemGetInfo_v2") orelse return CudaError.DriverNotLoaded,
         .cuCtxCreate_v2 = getProc(*const fn (*CuContext, c_uint, CuDevice) callconv(.c) CuResult, handle, "cuCtxCreate_v2") orelse return CudaError.DriverNotLoaded,
+        .cuCtxSetCurrent = getProc(*const fn (CuContext) callconv(.c) CuResult, handle, "cuCtxSetCurrent") orelse return CudaError.DriverNotLoaded,
         .cuCtxDestroy_v2 = getProc(*const fn (CuContext) callconv(.c) CuResult, handle, "cuCtxDestroy_v2") orelse return CudaError.DriverNotLoaded,
         .cuCtxSynchronize = getProc(*const fn () callconv(.c) CuResult, handle, "cuCtxSynchronize") orelse return CudaError.DriverNotLoaded,
         .cuMemAlloc_v2 = getProc(*const fn (*CuDeviceptr, usize) callconv(.c) CuResult, handle, "cuMemAlloc_v2") orelse return CudaError.DriverNotLoaded,
@@ -294,6 +307,7 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
     _ = api.cuModuleGetFunction(&global_state.fn_add_residual, mod, "addResidualKernel");
 
     global_state.initialized = true;
+    thread_bound = true; // the creating thread has the context current already
     return &global_state;
 }
 
