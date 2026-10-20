@@ -113,6 +113,10 @@ Start with [Getting Started](docs/wiki/Getting-Started.md). The [wiki](docs/wiki
 
 The repository also ships a [knowledge graph](graphify-out/GRAPH_REPORT.md) of the code (`graphify-out/`), handy for finding your way around.
 
+## Contact
+
+hk is built by me, Harshit Khandelwal. Questions, ideas, bug reports and "I want to help" are all welcome: open an issue or a Discussion, or email `harshitkhandelwal208@gmail.com`.
+
 ## License
 
 Apache 2.0, see [LICENSE](LICENSE).
