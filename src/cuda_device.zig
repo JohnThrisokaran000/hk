@@ -634,6 +634,16 @@ inline fn streamWords(addr: usize, comptime nw: usize, out: []u32) void {
     }
 }
 
+/// Like `streamWords` for a stream that starts on a 16 byte boundary and is a whole number of 16 byte pieces: vector
+/// loads, a quarter of the instructions (the K-quant block sizes 144 and 176 keep every block 16 byte aligned).
+inline fn streamWords16(addr: usize, comptime nw: usize, out: []u32) void {
+    inline for (0..nw / 4) |i| {
+        const p: *align(16) const @Vector(4, u32) = @ptrFromInt(addr + 16 * i);
+        const v = p.*;
+        inline for (0..4) |j| out[4 * i + j] = v[j];
+    }
+}
+
 const m0f: u32 = 0x0f0f0f0f;
 inline fn signedBytes(x: u32, comptime bias: u32) u32 {
     // Per byte x - bias (x < 256 - 128), as a signed byte, without borrows between bytes.
@@ -664,13 +674,13 @@ inline fn immaFetch(comptime t: format.StorageType, baddr: usize, sub: u32) Imma
         .q4_0, .q4_1 => streamWords(baddr, 5, raw[0..]),
         .q5_0, .q5_1 => streamWords(baddr, 6, raw[0..]),
         .q4_k => {
-            streamWords(baddr, 4, raw[0..]);
-            streamWords(baddr + 16 + 32 * (sub >> 1), 8, raw[4..]);
+            streamWords16(baddr, 4, raw[0..]);
+            streamWords16(baddr + 16 + 32 * (sub >> 1), 8, raw[4..]);
         },
         .q5_k => {
-            streamWords(baddr, 4, raw[0..]);
-            streamWords(baddr + 16, 8, raw[4..]);
-            streamWords(baddr + 48 + 32 * (sub >> 1), 8, raw[12..]);
+            streamWords16(baddr, 4, raw[0..]);
+            streamWords16(baddr + 16, 8, raw[4..]);
+            streamWords16(baddr + 48 + 32 * (sub >> 1), 8, raw[12..]);
         },
         .q6_k => {
             const h = sub >> 2;
