@@ -1551,7 +1551,7 @@ const Loaded = struct {
         errdefer l.model.deinit();
         if (opts.gpu != .off) {
             if (l.model.gpu) |g| {
-                std.debug.print("[gpu] running on {s} (Vulkan)\n", .{g.deviceName()});
+                std.debug.print("[gpu] running on {s} ({s})\n", .{ g.deviceName(), g.apiName() });
             } else {
                 std.debug.print("[gpu] not used: {s}; running on the CPU\n", .{l.model.gpu_note orelse "unknown reason"});
             }

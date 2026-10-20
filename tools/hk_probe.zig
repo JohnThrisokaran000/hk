@@ -168,13 +168,13 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     const t1 = nowNs(io);
     printProfile("prefill", &model.profile);
     model.profile = .{ .enabled = true };
-    if (model.gpu) |g| {
+    if (vkEngine(model)) |g| {
         g.kind_ns = @splat(0);
         g.prof_record = 0;
         g.prof_wait = 0;
         g.prof_calls = 0;
     }
-    if (model.gpu) |g| if (gpu_profile) g.enableProfiling() catch {};
+    if (vkEngine(model)) |g| if (gpu_profile) g.enableProfiling() catch {};
     var tok: u32 = prompt[n_prompt - 1];
     for (0..n_gen) |_| {
         try model.forward(&.{tok}, pos);
@@ -188,13 +188,13 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     }
     const t2 = nowNs(io);
     printProfile("decode ", &model.profile);
-    if (model.gpu) |g| if (g.tq != null) {
+    if (vkEngine(model)) |g| if (g.tq != null) {
         const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add" };
         std.debug.print("gpu kernels (ms per token):", .{});
         for (names, 0..) |nm, i| std.debug.print(" {s} {d:.2}", .{ nm, g.kind_ns[i] / 1e6 / @as(f64, @floatFromInt(@max(1, n_gen))) });
         std.debug.print("\n", .{});
     };
-    if (model.gpu) |g| std.debug.print("gpu: {d} passes, record {d:.1} ms, device {d:.1} ms\n", .{ g.prof_calls, g.prof_record * 1e3, g.prof_wait * 1e3 });
+    if (vkEngine(model)) |g| std.debug.print("gpu: {d} passes, record {d:.1} ms, device {d:.1} ms\n", .{ g.prof_calls, g.prof_record * 1e3, g.prof_wait * 1e3 });
     printMem(io, "after run");
     const pf = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
     const dc = @as(f64, @floatFromInt(t2 - t1)) / 1e9;
@@ -330,4 +330,12 @@ fn renderTemplate(allocator: std.mem.Allocator, io: std.Io, tpl_path: []const u8
 
 fn usage() void {
     std.debug.print("usage: hk-probe model.hk id,id,... [out.f32]\n       hk-probe model.hk --ppl ids.u32 [ctx]\n", .{});
+}
+
+/// The Vulkan engine behind the model's device, for the profiling counters only it has.
+fn vkEngine(model: *hk.engine.Model) ?*hk.gpu.Engine {
+    const dev = model.gpu orelse return null;
+    return switch (dev) {
+        .vulkan => |e| e,
+    };
 }

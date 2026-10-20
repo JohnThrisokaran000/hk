@@ -21,6 +21,7 @@ const attention_mod = @import("attention.zig");
 const kernels = @import("../kernels.zig");
 const cores = @import("../cores.zig");
 const gpu_mod = @import("../vk/engine.zig");
+const backend_mod = @import("../backend/backend.zig");
 const ops = @import("ops.zig");
 
 pub const Config = config_mod.Config;
@@ -118,8 +119,8 @@ pub const Model = struct {
     q8k_stride: usize,
     profile: Profile = .{},
     attn_part: attention_mod.Partials = .{},
-    /// The GPU engine, when the network runs on a device.
-    gpu: ?*gpu_mod.Engine = null,
+    /// The device backend, when the network runs on one (the CPU path lives in this struct).
+    gpu: ?backend_mod.Device = null,
     /// Why the GPU is not in use, when it was asked for and could not be.
     gpu_note: ?[]const u8 = null,
 
@@ -271,7 +272,7 @@ pub const Model = struct {
             };
             return e;
         };
-        self.gpu = eng;
+        self.gpu = .{ .vulkan = eng };
         self.n_ctx = go.n_ctx;
     }
 
@@ -298,10 +299,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
-        if (self.gpu) |g| {
-            g.deinit();
-            self.allocator.destroy(g);
-        }
+        if (self.gpu) |g| g.destroy(self.allocator);
         self.freeScratch(13);
         self.allocator.free(self.cos);
         self.allocator.free(self.sin);
@@ -492,7 +490,7 @@ pub const Model = struct {
         if (n == 0) return &.{};
         if (n > self.n_batch) return error.BatchTooLarge;
         if (self.gpu) |g| {
-            if (n > g.max_rows) return error.BatchTooLarge;
+            if (n > g.maxRows()) return error.BatchTooLarge;
             return g.logits(indices) catch error.GpuFailed;
         }
         if (self.logits_many.len < n * cfg.vocab) {

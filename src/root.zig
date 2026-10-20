@@ -10,6 +10,7 @@ pub const pool = @import("pool.zig");
 pub const kernels = @import("kernels.zig");
 pub const vk = @import("vk/vk.zig");
 pub const gpu = @import("vk/engine.zig");
+pub const backend = @import("backend/backend.zig");
 pub const cores = @import("cores.zig");
 /// Instruction set levels built into this binary, comma separated.
 pub const build_options_kernel_levels = @import("build_options").kernel_levels;

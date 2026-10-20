@@ -5,9 +5,9 @@
  "stats": {
   "curated_nodes": 79,
   "curated_edges": 153,
-  "file_nodes": 167,
-  "import_edges": 371,
-  "unowned_files": 0,
+  "file_nodes": 168,
+  "import_edges": 375,
+  "unowned_files": 1,
   "status_counts": {
    "done": 8,
    "partial": 14,
@@ -1516,6 +1516,14 @@
    "owner": "format-core"
   },
   {
+   "id": "file:src/backend/backend.zig",
+   "type": "file",
+   "label": "src/backend/backend.zig",
+   "lang": "zig",
+   "loc": 82,
+   "owner": null
+  },
+  {
    "id": "file:src/buf.zig",
    "type": "file",
    "label": "src/buf.zig",
@@ -1528,7 +1536,7 @@
    "type": "file",
    "label": "src/c_api.zig",
    "lang": "zig",
-   "loc": 1916,
+   "loc": 1913,
    "owner": "c-abi"
   },
   {
@@ -1704,7 +1712,7 @@
    "type": "file",
    "label": "src/engine/model.zig",
    "lang": "zig",
-   "loc": 515,
+   "loc": 513,
    "owner": "engine"
   },
   {
@@ -1976,7 +1984,7 @@
    "type": "file",
    "label": "src/root.zig",
    "lang": "zig",
-   "loc": 80,
+   "loc": 81,
    "owner": "c-abi"
   },
   {
@@ -2168,7 +2176,7 @@
    "type": "file",
    "label": "tests/roundtrip_tests.zig",
    "lang": "zig",
-   "loc": 1862,
+   "loc": 1863,
    "owner": "tests-suite"
   },
   {
@@ -2176,7 +2184,7 @@
    "type": "file",
    "label": "tests/server_tests.zig",
    "lang": "zig",
-   "loc": 371,
+   "loc": 372,
    "owner": "server"
   },
   {
@@ -2200,7 +2208,7 @@
    "type": "file",
    "label": "tests/support/proc.zig",
    "lang": "zig",
-   "loc": 86,
+   "loc": 91,
    "owner": "tests-suite"
   },
   {
@@ -2336,7 +2344,7 @@
    "type": "file",
    "label": "tests/test_quant.zig",
    "lang": "zig",
-   "loc": 484,
+   "loc": 483,
    "owner": "quant-formats"
   },
   {
@@ -2456,7 +2464,7 @@
    "type": "file",
    "label": "tools/hk_probe.zig",
    "lang": "zig",
-   "loc": 333,
+   "loc": 341,
    "owner": "bench-tools"
   },
   {
@@ -4548,6 +4556,16 @@
    "type": "imports"
   },
   {
+   "s": "file:src/backend/backend.zig",
+   "t": "file:src/engine/kv.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/backend.zig",
+   "t": "file:src/vk/engine.zig",
+   "type": "imports"
+  },
+  {
    "s": "file:src/c_api.zig",
    "t": "file:src/adaptive.zig",
    "type": "imports"
@@ -4925,6 +4943,11 @@
   {
    "s": "file:src/engine/matmul.zig",
    "t": "file:src/quant.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/model.zig",
+   "t": "file:src/backend/backend.zig",
    "type": "imports"
   },
   {
@@ -5410,6 +5433,11 @@
   {
    "s": "file:src/root.zig",
    "t": "file:src/arrays.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/root.zig",
+   "t": "file:src/backend/backend.zig",
    "type": "imports"
   },
   {
@@ -6325,5 +6353,7 @@
    "imports": 1
   }
  ],
- "unowned_files": []
+ "unowned_files": [
+  "src/backend/backend.zig"
+ ]
 }
