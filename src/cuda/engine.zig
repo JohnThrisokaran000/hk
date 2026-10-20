@@ -196,6 +196,7 @@ pub const Engine = struct {
     /// The same activations quantized to int8 (`xq`) with a scale per 32 (`xs`), for the integer kernels.
     xq: cuda.DeviceMem,
     xs: cuda.DeviceMem,
+    xsum: cuda.DeviceMem,
     cos_dev: cuda.DeviceMem,
     sin_dev: cuda.DeviceMem,
     logits_dev: cuda.DeviceMem,
@@ -346,6 +347,7 @@ pub const Engine = struct {
         self.x16 = try made.empty(rows * max_in * 2);
         self.xq = try made.empty(rows * max_in);
         self.xs = try made.empty(rows * (max_in / 32 + 1) * 4);
+        self.xsum = try made.empty(rows * (max_in / 32 + 1) * 4);
         const half = cfg.rope_dim / 2;
         self.cos_dev = try made.empty(o.n_batch * half * f);
         self.sin_dev = try made.empty(o.n_batch * half * f);
@@ -419,6 +421,8 @@ pub const Engine = struct {
             return self.track(cuda.deviceAlloc(nbytes) catch |e| return mapErr(e));
         }
 
+        /// Weights are padded by a few bytes: the integer kernels read whole words around blocks that are only 2-byte
+        /// aligned, so the last block of a tensor is followed by up to 4 bytes of slack that are read and ignored.
         fn bytes(self: *Made, src: []const u8) Error!cuda.DeviceMem {
             const m = try self.empty(src.len);
             cuda.copyToDevice(m.addr, src) catch |e| return mapErr(e);
@@ -476,7 +480,7 @@ pub const Engine = struct {
             cuda.deviceFree(self.out_norm);
             cuda.deviceFree(self.output.mem);
         }
-        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.x16, self.xq, self.xs, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
+        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.x16, self.xq, self.xs, self.xsum, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
         for (self.kcache, self.vcache) |kc, vc| {
             cuda.deviceFree(kc);
             cuda.deviceFree(vc);
@@ -535,7 +539,7 @@ pub const Engine = struct {
         if (n >= cuda.tensor_min_tokens) if (kernels.imma) |im| {
             const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
             const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
-            return cuda.launchKernel2D(im, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.xq.addr, self.xs.addr, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
+            return cuda.launchKernel2D(im, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.xq.addr, self.xs.addr, self.xsum.addr, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
         };
         if (n >= cuda.tensor_min_tokens) if (kernels.tensor) |tc| {
             const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
@@ -565,7 +569,7 @@ pub const Engine = struct {
         }
         if (need_int) {
             const blocks: u32 = @intCast(count / 32);
-            cuda.launchKernel(self.k.quantize_act, (blocks * 32 + 127) / 128, 128, .{ self.xq.addr, self.xs.addr, x, blocks }) catch |e| return mapErr(e);
+            cuda.launchKernel(self.k.quantize_act, (blocks * 32 + 127) / 128, 128, .{ self.xq.addr, self.xs.addr, self.xsum.addr, x, blocks }) catch |e| return mapErr(e);
         }
     }
 

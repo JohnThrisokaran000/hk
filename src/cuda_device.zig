@@ -477,10 +477,12 @@ comptime {
 
 // -- integer tensor core matrix product (sm_80 and newer) ------------------------------------------------------------
 //
-// Quantized weights multiplied against activations quantized to 8 bits per 32 values, on `mma.sync.m16n8k32.s8`: the
-// weights are not decoded at all (Q8_0 quants are already int8), the products are exact in int32, and the scales are
-// applied once per 32 values. This is the arithmetic the CPU engine uses (`vecdot`), and on Ampere the integer units
-// run at four times the rate of f16 with f32 accumulation.
+// Quantized weights multiplied against activations quantized to 8 bits per 32 values, on `mma.sync.m16n8k32.s8` (or
+// two `m16n8k16` where a format has a scale per 16 values): the products are exact in int32 and the scales are applied
+// once per 32 values. This is the arithmetic the CPU engine uses (`vecdot`), and on Ampere the integer units run at four
+// times the rate of f16 with f32 accumulation. Every 32 weights of a row become 32 signed bytes in shared memory plus a
+// scale (and a minimum, for formats that have one): w = sc * q - mn, so a block's contribution to a token is
+// d_x * (sc * sum(q * xq) - mn * sum(xq)).
 
 inline fn shflXor(v: f32, mask: u32) f32 {
     return asm volatile ("shfl.sync.bfly.b32 %[r], %[v], %[o], 31, 0xffffffff;"
@@ -497,9 +499,10 @@ inline fn roundToInt(v: f32) i32 {
     );
 }
 
-/// Quantizes activations to int8 with one f32 scale per 32 values (`xs[b] = max|x| / 127`, `xq = round(x / scale)`).
-/// One warp per block of 32; `x` is [n][k] with k a multiple of 32, so block `b` is elements 32b .. 32b + 31.
-fn quantizeActKernel(xq: [*]i8, xs: [*]f32, x: [*]const f32, blocks_total: u32) callconv(.kernel) void {
+/// Quantizes activations to int8 with one f32 scale per 32 values (`xs[b] = max|x| / 127`, `xq = round(x / scale)`) and
+/// the sum of each block's quants (`xsum`, for formats with a minimum). One warp per block of 32; `x` is [n][k] with k a
+/// multiple of 32, so block `b` is elements 32b .. 32b + 31.
+fn quantizeActKernel(xq: [*]i8, xs: [*]f32, xsum: [*]f32, x: [*]const f32, blocks_total: u32) callconv(.kernel) void {
     const wid = globalId() >> 5;
     if (wid >= blocks_total) return; // the warp leaves together, so the shuffles below see all lanes
     const lane = tid() & 31;
@@ -509,7 +512,12 @@ fn quantizeActKernel(xq: [*]i8, xs: [*]f32, x: [*]const f32, blocks_total: u32) 
     const inv: f32 = if (amax > 0) 127.0 / amax else 0;
     const q = std.math.clamp(roundToInt(v * inv), -127, 127);
     xq[@as(usize, wid) * 32 + lane] = @intCast(q);
-    if (lane == 0) xs[wid] = amax / 127.0;
+    var sum: f32 = @floatFromInt(q);
+    inline for (.{ 16, 8, 4, 2, 1 }) |m| sum += shflXor(sum, m);
+    if (lane == 0) {
+        xs[wid] = amax / 127.0;
+        xsum[wid] = sum;
+    }
 }
 
 inline fn mmaS8(d: *[4]i32, a: [4]u32, b: [2]u32) void {
@@ -532,6 +540,24 @@ inline fn mmaS8(d: *[4]i32, a: [4]u32, b: [2]u32) void {
     d.* = .{ d0, d1, d2, d3 };
 }
 
+/// The k16 form: A rows g and g + 8 of 16 values, B 16 values for token g.
+inline fn mmaS8k16(d: *[4]i32, a0: u32, a1: u32, b0: u32) void {
+    var d0 = d[0];
+    var d1 = d[1];
+    var d2 = d[2];
+    var d3 = d[3];
+    asm volatile ("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%[d0], %[d1], %[d2], %[d3]}, {%[a0], %[a1]}, {%[b0]}, {%[d0], %[d1], %[d2], %[d3]};"
+        : [d0] "+r" (d0),
+          [d1] "+r" (d1),
+          [d2] "+r" (d2),
+          [d3] "+r" (d3),
+        : [a0] "r" (a0),
+          [a1] "r" (a1),
+          [b0] "r" (b0),
+    );
+    d.* = .{ d0, d1, d2, d3 };
+}
+
 /// Blocks (rows, tokens) of the integer kernel and the k32 blocks staged per step.
 const im_rows = 64;
 const im_tokens = 128;
@@ -541,20 +567,181 @@ const im_blocks = 4;
 const im_ld = im_blocks * 8 + 4;
 var im_a: [im_rows * im_ld]u32 addrspace(.shared) = undefined;
 var im_b: [im_tokens * im_ld]u32 addrspace(.shared) = undefined;
-var im_sw: [im_rows * im_blocks]f32 addrspace(.shared) = undefined;
+/// Scale per (row, block, half) and minimum per (row, block) of the weights; scale, sum of quants per (token, block).
+var im_sw: [im_rows * im_blocks * 2]f32 addrspace(.shared) = undefined;
+var im_sm: [im_rows * im_blocks]f32 addrspace(.shared) = undefined;
 var im_sx: [im_tokens * im_blocks]f32 addrspace(.shared) = undefined;
+var im_ss: [im_tokens * im_blocks]f32 addrspace(.shared) = undefined;
+
+/// Storage types with an integer kernel.
+pub const imma_formats = [_]format.StorageType{ .q8_0, .q4_0, .q4_1, .q5_0, .q5_1, .q4_k, .q5_k, .q6_k };
 
 fn loadWord(p: usize) u32 {
     const ptr: *const u32 = @ptrFromInt(p);
     return ptr.*;
 }
 
-/// y[token][row] = sum over blocks of d_w * d_x * dot_int8(w_block, x_block) for Q8_0 weights: a block of 64 rows and 128
-/// tokens, eight warps in a 2 x 4 grid of 32 x 32 sub-tiles, `im_blocks` blocks of 32 along k per step. The next step's
-/// data is fetched into registers while the current one is multiplied and parked in shared memory afterwards.
-inline fn gemmImmaQ8_0(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) void {
+/// `nw` words of the byte stream that starts at `addr` (2-byte aligned), into `out[0..nw]`. Reads one word more than it
+/// returns when the stream is not word aligned; weight buffers carry slack for that.
+inline fn streamWords(addr: usize, comptime nw: usize, out: []u32) void {
+    const base = addr & ~@as(usize, 3);
+    if (addr & 2 == 0) {
+        inline for (0..nw) |i| out[i] = loadWord(base + 4 * i);
+    } else {
+        var prev = loadWord(base);
+        inline for (0..nw) |i| {
+            const next = loadWord(base + 4 * (i + 1));
+            out[i] = (prev >> 16) | (next << 16);
+            prev = next;
+        }
+    }
+}
+
+const m0f: u32 = 0x0f0f0f0f;
+inline fn signedBytes(x: u32, comptime bias: u32) u32 {
+    // Per byte x - bias (x < 256 - 128), as a signed byte, without borrows between bytes.
+    return ((x | 0x80808080) -% (bias * 0x01010101)) ^ 0x80808080;
+}
+inline fn spreadBits(bits: u32) u32 {
+    // The low four bits of `bits`, one per byte.
+    return (bits & 1) | (((bits >> 1) & 1) << 8) | (((bits >> 2) & 1) << 16) | (((bits >> 3) & 1) << 24);
+}
+inline fn f16lo(w: u32) f32 {
+    return @floatCast(@as(f16, @bitCast(@as(u16, @truncate(w)))));
+}
+inline fn f16hi(w: u32) f32 {
+    return @floatCast(@as(f16, @bitCast(@as(u16, @truncate(w >> 16)))));
+}
+inline fn byteOf(w: u32, i: u32) u32 {
+    return (w >> @intCast(8 * (i & 3))) & 0xff;
+}
+
+const ImmaRaw = [20]u32;
+const ImmaBlock = struct { q: [8]u32, sc: [2]f32, mn: f32 };
+
+/// Reads what block `sub` (0-based among the 32-blocks of the quant block at `baddr`) needs, in registers.
+inline fn immaFetch(comptime t: format.StorageType, baddr: usize, sub: u32) ImmaRaw {
+    var raw: ImmaRaw = @splat(0);
+    switch (t) {
+        .q8_0 => streamWords(baddr, 9, raw[0..]),
+        .q4_0, .q4_1 => streamWords(baddr, 5, raw[0..]),
+        .q5_0, .q5_1 => streamWords(baddr, 6, raw[0..]),
+        .q4_k => {
+            streamWords(baddr, 4, raw[0..]);
+            streamWords(baddr + 16 + 32 * (sub >> 1), 8, raw[4..]);
+        },
+        .q5_k => {
+            streamWords(baddr, 4, raw[0..]);
+            streamWords(baddr + 16, 8, raw[4..]);
+            streamWords(baddr + 48 + 32 * (sub >> 1), 8, raw[12..]);
+        },
+        .q6_k => {
+            const h = sub >> 2;
+            const i = sub & 3;
+            streamWords(baddr + 64 * h + 32 * (i & 1), 8, raw[0..]);
+            streamWords(baddr + 128 + 32 * h, 8, raw[8..]);
+            streamWords(baddr + 192 + 8 * h + 2 * i, 1, raw[16..]);
+            streamWords(baddr + 208, 1, raw[17..]);
+        },
+        else => @compileError("no integer kernel for " ++ @tagName(t)),
+    }
+    return raw;
+}
+
+/// The 32 signed quants of the block, its scale(s) and minimum, from what `immaFetch` read.
+inline fn immaUnpack(comptime t: format.StorageType, raw: *const ImmaRaw, sub: u32) ImmaBlock {
+    var b: ImmaBlock = .{ .q = @splat(0), .sc = .{ 0, 0 }, .mn = 0 };
+    switch (t) {
+        .q8_0 => {
+            b.sc[0] = f16lo(raw[0]);
+            inline for (0..8) |i| b.q[i] = (raw[i] >> 16) | (raw[i + 1] << 16);
+        },
+        .q4_0 => {
+            b.sc[0] = f16lo(raw[0]);
+            inline for (0..4) |i| {
+                const w = (raw[i] >> 16) | (raw[i + 1] << 16);
+                b.q[i] = signedBytes(w & m0f, 8);
+                b.q[4 + i] = signedBytes((w >> 4) & m0f, 8);
+            }
+        },
+        .q4_1 => {
+            b.sc[0] = f16lo(raw[0]);
+            b.mn = -f16hi(raw[0]);
+            inline for (0..4) |i| {
+                b.q[i] = raw[1 + i] & m0f;
+                b.q[4 + i] = (raw[1 + i] >> 4) & m0f;
+            }
+        },
+        .q5_0, .q5_1 => {
+            const one = t == .q5_1;
+            b.sc[0] = f16lo(raw[0]);
+            const qh = if (one) raw[1] else (raw[0] >> 16) | (raw[1] << 16);
+            if (one) b.mn = -f16hi(raw[0]);
+            inline for (0..4) |i| {
+                const w = if (one) raw[2 + i] else (raw[1 + i] >> 16) | (raw[2 + i] << 16);
+                const lo = (w & m0f) | (spreadBits(qh >> (4 * i)) << 4);
+                const hi = ((w >> 4) & m0f) | (spreadBits(qh >> (4 * i + 16)) << 4);
+                b.q[i] = if (one) lo else signedBytes(lo, 16);
+                b.q[4 + i] = if (one) hi else signedBytes(hi, 16);
+            }
+        },
+        .q4_k, .q5_k => {
+            const d = f16lo(raw[0]);
+            const dmin = f16hi(raw[0]);
+            // 6-bit scale and minimum of sub-block `sub` out of the 12 packed bytes in raw[1..4].
+            const sb = struct {
+                inline fn at(r: *const ImmaRaw, i: u32) u32 {
+                    return byteOf(r[1 + i / 4], i);
+                }
+            };
+            var sc: u32 = undefined;
+            var mn: u32 = undefined;
+            if (sub < 4) {
+                sc = sb.at(raw, sub) & 63;
+                mn = sb.at(raw, sub + 4) & 63;
+            } else {
+                sc = (sb.at(raw, sub + 4) & 15) | ((sb.at(raw, sub - 4) >> 6) << 4);
+                mn = (sb.at(raw, sub + 4) >> 4) | ((sb.at(raw, sub) >> 6) << 4);
+            }
+            b.sc[0] = d * @as(f32, @floatFromInt(sc));
+            b.mn = dmin * @as(f32, @floatFromInt(mn));
+            const shift: u5 = @intCast(4 * (sub & 1));
+            // Q4_K: qs at raw[4..12]. Q5_K: qh at raw[4..12], qs at raw[12..20], and bit `sub` of qh is the fifth bit.
+            const qs_at: usize = if (t == .q5_k) 12 else 4;
+            inline for (0..8) |i| {
+                var v = (raw[qs_at + i] >> shift) & m0f;
+                if (t == .q5_k) v |= ((raw[4 + i] >> @as(u5, @intCast(sub))) & 0x01010101) << 4;
+                b.q[i] = v;
+            }
+        },
+        .q6_k => {
+            const i = sub & 3;
+            const d = f16lo(raw[17]);
+            const sa: i32 = @as(i8, @bitCast(@as(u8, @truncate(raw[16]))));
+            const sbv: i32 = @as(i8, @bitCast(@as(u8, @truncate(raw[16] >> 8))));
+            b.sc[0] = d * @as(f32, @floatFromInt(sa));
+            b.sc[1] = d * @as(f32, @floatFromInt(sbv));
+            const shift: u5 = @intCast(4 * (i >> 1));
+            inline for (0..8) |w| {
+                const v = ((raw[w] >> shift) & m0f) | (((raw[8 + w] >> @as(u5, @intCast(2 * i))) & 0x03030303) << 4);
+                b.q[w] = signedBytes(v, 32);
+            }
+        },
+        else => @compileError("no integer kernel for " ++ @tagName(t)),
+    }
+    return b;
+}
+
+/// y[token][row] = sum over 32-blocks of d_x * (sc * dot_int8(q, xq) - mn * sum(xq)): a block of 64 rows and 128 tokens,
+/// eight warps in a 2 x 4 grid of 32 x 32 sub-tiles, `im_blocks` blocks of 32 along k per step. The next step's data is
+/// fetched into registers while the current one is multiplied and parked in shared memory afterwards.
+inline fn gemmImma(comptime t: format.StorageType, w: [*]const u8, xq: [*]const i8, xs: [*]const f32, xsum: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) void {
+    const info = comptime blocks.info(t).?;
+    const per_unit: u32 = comptime if (info.elems == 256) 8 else 1; // 32-blocks per quant block
+    const has_min = comptime (t == .q4_1 or t == .q5_1 or t == .q4_k or t == .q5_k);
+    const halves = comptime (t == .q6_k);
     const nb: u32 = k / 32;
-    const row_bytes: usize = @as(usize, nb) * 34;
+    const row_bytes: usize = @as(usize, k / info.elems) * info.bytes;
     const row0 = bid() * im_rows;
     const tok0 = bidY() * im_tokens;
     const warp = tid() >> 5;
@@ -569,64 +756,54 @@ inline fn gemmImmaQ8_0(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, y: [*]
         b.* = .{ 0, 0, 0, 0 };
     };
 
-    // This thread stages one weight block (row tid / 4, block tid % 4 of the step) and 4 sixteen byte pieces and 2
-    // scales of the activations.
+    // This thread stages one weight block (row tid / 4, block tid % 4 of the step), 4 sixteen byte pieces of the
+    // activations and 2 scales and sums.
     const wrow = tid() / im_blocks;
     const wblk = tid() % im_blocks;
-    const Fetched = struct { words: [9]u32, off: u32, valid: bool, act: [4]@Vector(4, u32), sx: [2]f32 };
+    const Fetched = struct { raw: ImmaRaw, valid: bool, act: [4]@Vector(4, u32), sx: [2]f32, ss: [2]f32 };
     const stage = struct {
-        inline fn fetch(wp: [*]const u8, xqp: [*]const i8, xsp: [*]const f32, b0: u32, nb_: u32, k_: u32, m_: u32, n_: u32, row0_: u32, tok0_: u32, wrow_: u32, wblk_: u32, rb: usize) Fetched {
+        inline fn fetch(wp: [*]const u8, xqp: [*]const i8, xsp: [*]const f32, xsump: [*]const f32, b0: u32, nb_: u32, k_: u32, m_: u32, n_: u32, row0_: u32, tok0_: u32, wrow_: u32, wblk_: u32, rb: usize) Fetched {
             var f: Fetched = undefined;
             const bl = b0 + wblk_;
             f.valid = row0_ + wrow_ < m_ and bl < nb_;
-            f.words = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-            f.off = 0;
+            f.raw = @splat(0);
             if (f.valid) {
-                const a = @intFromPtr(wp) + @as(usize, row0_ + wrow_) * rb + @as(usize, bl) * 34;
-                const ab = a & ~@as(usize, 3);
-                f.off = @intCast(a & 3);
-                inline for (0..8) |i| f.words[i] = loadWord(ab + 4 * i);
-                // Word 8 is only needed when the block starts on a word boundary and ends 2 bytes into it.
-                if (f.off == 0) {
-                    const hp: *const u16 = @ptrFromInt(ab + 32);
-                    f.words[8] = hp.*;
-                } else {
-                    f.words[8] = loadWord(ab + 32);
-                }
+                const a = @intFromPtr(wp) + @as(usize, row0_ + wrow_) * rb + @as(usize, bl / per_unit) * info.bytes;
+                f.raw = immaFetch(t, a, bl % per_unit);
             }
             inline for (0..4) |u| {
                 const p: u32 = tid() + @as(u32, u) * tc_threads;
-                const t = p / 8;
+                const tk = p / 8;
                 const v8 = p % 8;
                 f.act[u] = .{ 0, 0, 0, 0 };
-                if (tok0_ + t < n_ and b0 + v8 / 2 < nb_) {
-                    const src: *align(16) const @Vector(4, u32) = @ptrCast(@alignCast(xqp + @as(usize, tok0_ + t) * k_ + @as(usize, b0) * 32 + v8 * 16));
+                if (tok0_ + tk < n_ and b0 + v8 / 2 < nb_) {
+                    const src: *align(16) const @Vector(4, u32) = @ptrCast(@alignCast(xqp + @as(usize, tok0_ + tk) * k_ + @as(usize, b0) * 32 + v8 * 16));
                     f.act[u] = src.*;
                 }
             }
             inline for (0..2) |u| {
                 const p: u32 = tid() + @as(u32, u) * tc_threads;
-                const t = p / 4;
+                const tk = p / 4;
                 const bi = p % 4;
                 f.sx[u] = 0;
-                if (tok0_ + t < n_ and b0 + bi < nb_) f.sx[u] = xsp[@as(usize, tok0_ + t) * nb_ + b0 + bi];
+                f.ss[u] = 0;
+                if (tok0_ + tk < n_ and b0 + bi < nb_) {
+                    const idx = @as(usize, tok0_ + tk) * nb_ + b0 + bi;
+                    f.sx[u] = xsp[idx];
+                    if (has_min) f.ss[u] = xsump[idx];
+                }
             }
             return f;
         }
 
-        inline fn park(f: *const Fetched, wrow_: u32, wblk_: u32) void {
-            // Weights: the block's 32 quants start 2 bytes after the block does.
-            var d: f32 = 0;
-            if (f.valid) {
-                const d16: u16 = @truncate(if (f.off == 0) f.words[0] else f.words[0] >> 16);
-                d = @floatCast(@as(f16, @bitCast(d16)));
-            }
-            const dst = &im_a[wrow_ * im_ld + wblk_ * 8];
-            inline for (0..8) |i| {
-                const v: u32 = if (!f.valid) 0 else if (f.off == 0) (f.words[i] >> 16) | (f.words[i + 1] << 16) else f.words[i + 1];
-                @as([*]addrspace(.shared) u32, @ptrCast(dst))[i] = v;
-            }
-            im_sw[wrow_ * im_blocks + wblk_] = d;
+        inline fn park(f: *const Fetched, b0: u32, wrow_: u32, wblk_: u32) void {
+            var blk: ImmaBlock = .{ .q = @splat(0), .sc = .{ 0, 0 }, .mn = 0 };
+            if (f.valid) blk = immaUnpack(t, &f.raw, (b0 + wblk_) % per_unit);
+            const dst: [*]addrspace(.shared) u32 = @ptrCast(&im_a[wrow_ * im_ld + wblk_ * 8]);
+            inline for (0..8) |i| dst[i] = blk.q[i];
+            im_sw[(wrow_ * im_blocks + wblk_) * 2] = blk.sc[0];
+            im_sw[(wrow_ * im_blocks + wblk_) * 2 + 1] = blk.sc[1];
+            if (has_min) im_sm[wrow_ * im_blocks + wblk_] = blk.mn;
             inline for (0..4) |u| {
                 const p: u32 = tid() + @as(u32, u) * tc_threads;
                 const dstv: *addrspace(.shared) align(4) @Vector(4, u32) = @ptrCast(&im_b[(p / 8) * im_ld + (p % 8) * 4]);
@@ -635,21 +812,23 @@ inline fn gemmImmaQ8_0(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, y: [*]
             inline for (0..2) |u| {
                 const p: u32 = tid() + @as(u32, u) * tc_threads;
                 im_sx[p] = f.sx[u];
+                if (has_min) im_ss[p] = f.ss[u];
             }
         }
     };
 
-    var f = stage.fetch(w, xq, xs, 0, nb, k, m, n, row0, tok0, wrow, wblk, row_bytes);
-    stage.park(&f, wrow, wblk);
+    var f = stage.fetch(w, xq, xs, xsum, 0, nb, k, m, n, row0, tok0, wrow, wblk, row_bytes);
+    stage.park(&f, 0, wrow, wblk);
     barSync();
 
     var b0: u32 = 0;
     while (b0 < nb) : (b0 += im_blocks) {
         const more = b0 + im_blocks < nb;
-        if (more) f = stage.fetch(w, xq, xs, b0 + im_blocks, nb, k, m, n, row0, tok0, wrow, wblk, row_bytes);
+        if (more) f = stage.fetch(w, xq, xs, xsum, b0 + im_blocks, nb, k, m, n, row0, tok0, wrow, wblk, row_bytes);
 
         inline for (0..im_blocks) |blk| {
             var ci: [2][4][4]i32 = undefined;
+            var cj: [2][4][4]i32 = undefined; // second 16 values, for formats with a scale per 16
             var af: [2][4]u32 = undefined;
             inline for (0..2) |mi| {
                 const r = wr + mi * 16 + g;
@@ -665,26 +844,46 @@ inline fn gemmImmaQ8_0(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, y: [*]
                 const bf = [2]u32{ im_b[c * im_ld + blk * 8 + q], im_b[c * im_ld + blk * 8 + q + 4] };
                 inline for (0..2) |mi| {
                     ci[mi][ni] = .{ 0, 0, 0, 0 };
-                    mmaS8(&ci[mi][ni], af[mi], bf);
+                    if (halves) {
+                        cj[mi][ni] = .{ 0, 0, 0, 0 };
+                        mmaS8k16(&ci[mi][ni], af[mi][0], af[mi][1], bf[0]);
+                        mmaS8k16(&cj[mi][ni], af[mi][2], af[mi][3], bf[1]);
+                    } else {
+                        mmaS8(&ci[mi][ni], af[mi], bf);
+                    }
                 }
             }
             inline for (0..2) |mi| {
                 const r = wr + mi * 16 + g;
-                const swa = im_sw[r * im_blocks + blk];
-                const swb = im_sw[(r + 8) * im_blocks + blk];
+                const swa = im_sw[(r * im_blocks + blk) * 2];
+                const swb = im_sw[((r + 8) * im_blocks + blk) * 2];
+                const swa2 = if (halves) im_sw[(r * im_blocks + blk) * 2 + 1] else 0;
+                const swb2 = if (halves) im_sw[((r + 8) * im_blocks + blk) * 2 + 1] else 0;
+                const mna = if (has_min) im_sm[r * im_blocks + blk] else 0;
+                const mnb = if (has_min) im_sm[(r + 8) * im_blocks + blk] else 0;
                 inline for (0..4) |ni| {
                     const c = wc + ni * 8 + q * 2;
-                    const sx0 = im_sx[c * im_blocks + blk];
-                    const sx1 = im_sx[(c + 1) * im_blocks + blk];
-                    acc[mi][ni][0] += @as(f32, @floatFromInt(ci[mi][ni][0])) * (swa * sx0);
-                    acc[mi][ni][1] += @as(f32, @floatFromInt(ci[mi][ni][1])) * (swa * sx1);
-                    acc[mi][ni][2] += @as(f32, @floatFromInt(ci[mi][ni][2])) * (swb * sx0);
-                    acc[mi][ni][3] += @as(f32, @floatFromInt(ci[mi][ni][3])) * (swb * sx1);
+                    inline for (0..2) |e| {
+                        const sx = im_sx[(c + e) * im_blocks + blk];
+                        const ss = if (has_min) im_ss[(c + e) * im_blocks + blk] else 0;
+                        var va: f32 = swa * @as(f32, @floatFromInt(ci[mi][ni][e]));
+                        var vb: f32 = swb * @as(f32, @floatFromInt(ci[mi][ni][2 + e]));
+                        if (halves) {
+                            va += swa2 * @as(f32, @floatFromInt(cj[mi][ni][e]));
+                            vb += swb2 * @as(f32, @floatFromInt(cj[mi][ni][2 + e]));
+                        }
+                        if (has_min) {
+                            va -= mna * ss;
+                            vb -= mnb * ss;
+                        }
+                        acc[mi][ni][e] += sx * va;
+                        acc[mi][ni][2 + e] += sx * vb;
+                    }
                 }
             }
         }
         barSync(); // everyone has read this step
-        if (more) stage.park(&f, wrow, wblk);
+        if (more) stage.park(&f, b0 + im_blocks, wrow, wblk);
         barSync();
     }
 
@@ -699,10 +898,10 @@ inline fn gemmImmaQ8_0(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, y: [*]
     };
 }
 
-fn GemmImmaQ8_0Kernel() type {
+fn GemmImmaKernel(comptime t: format.StorageType) type {
     return struct {
-        fn run(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
-            gemmImmaQ8_0(w, xq, xs, y, k, m, n);
+        fn run(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, xsum: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
+            gemmImma(t, w, xq, xs, xsum, y, k, m, n);
         }
     };
 }
@@ -710,7 +909,7 @@ fn GemmImmaQ8_0Kernel() type {
 comptime {
     @export(&quantizeActKernel, .{ .name = "quantize_act" });
     if (has_tensor_cores) {
-        @export(&GemmImmaQ8_0Kernel().run, .{ .name = "gemm_imma_q8_0" });
+        for (imma_formats) |t| @export(&GemmImmaKernel(t).run, .{ .name = "gemm_imma_" ++ @tagName(t) });
     }
 }
 

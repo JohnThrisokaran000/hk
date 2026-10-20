@@ -1082,10 +1082,12 @@ pub fn deviceGemmImma(fmt: format.StorageType, w: anytype, x: anytype, y: anytyp
     defer deviceFree(xq);
     const xs = try deviceAlloc(n * (k / 32) * 4);
     defer deviceFree(xs);
+    const xsum = try deviceAlloc(n * (k / 32) * 4);
+    defer deviceFree(xsum);
     const nblocks: u32 = @intCast(n * (k / 32));
-    try launchKernel(try deviceKernel("quantize_act"), (nblocks * 32 + 127) / 128, 128, .{ xq.addr, xs.addr, @as(u64, toDevicePtr(x)), nblocks });
+    try launchKernel(try deviceKernel("quantize_act"), (nblocks * 32 + 127) / 128, 128, .{ xq.addr, xs.addr, xsum.addr, @as(u64, toDevicePtr(x)), nblocks });
     try launchKernel2D(kernel, @intCast((m + tensor_tile_rows - 1) / tensor_tile_rows), @intCast((n + tensor_tile_tokens - 1) / tensor_tile_tokens), tensor_block_threads, .{
-        @as(u64, toDevicePtr(w)), xq.addr, xs.addr, @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+        @as(u64, toDevicePtr(w)), xq.addr, xs.addr, xsum.addr, @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
     });
 }
 
@@ -1123,7 +1125,8 @@ const cuda_error_out_of_memory: CuResult = 2;
 pub fn deviceAlloc(nbytes: usize) !DeviceMem {
     const s = try ensureDriver();
     var p: CuDeviceptr = 0;
-    const r = s.api.?.cuMemAlloc_v2(&p, @max(nbytes, 1));
+    // 16 bytes of slack: kernels that read whole words around unaligned blocks may touch the bytes after the last one.
+    const r = s.api.?.cuMemAlloc_v2(&p, @max(nbytes, 1) + 16);
     if (r == cuda_error_out_of_memory) return CudaError.OutOfDeviceMemory;
     if (r != 0 or p == 0) return CudaError.CudaCallFailed;
     return .{ .addr = p, .len = nbytes };
