@@ -57,11 +57,11 @@ What a release promises, per the project plan (section 148). Every row says what
 
 | Backend | Selected by | Verified | Known gaps |
 |:---|:---|:---|:---|
-| CPU | default; `--backend cpu` | unit tests at four instruction-set levels; logits byte-identical before/after the executor extraction in 70 comparisons; llama/qwen2/qwen3 | ARM and Windows not run |
-| Vulkan | `-ngl N`, `--backend vulkan` | parity with the CPU for llama, wide MHA, qwen2 and qwen3 in f32 and Q8_0, multi-sequence slots and a 700-token context, on one RTX 3050 | one device; 15 of 26 formats; no partial offload |
-| CUDA | `--backend cuda` | the same parity set as Vulkan, plus all 26 formats against an f64 reference, on the same card | one device; prompt processing about 4.8x slower than Vulkan on the synthetic benchmark; no fusion, CUDA graphs or Tensor Cores; heads up to 256 wide |
+| CPU | default; `--backend cpu` | unit tests at four instruction-set levels; logits byte-identical before/after the executor extraction in 70 comparisons; llama/qwen2/qwen3; perplexity within 0.3 % of llama.cpp and Transformers | ARM and Windows not run on hardware |
+| Vulkan | `-ngl N`, `--backend vulkan` | parity with the CPU for llama, wide MHA, qwen2 and qwen3 in f32 and Q8_0, multi-sequence slots, a 700-token context, head sizes 16/64/128, partial offload; kernel-level tests of the cooperative-matrix GEMM (15 formats) and attention against the f32 kernels; one RTX 3050 Laptop | one device; 15 of 26 formats; K-quant decode is ~40 % behind llama.cpp's Vulkan backend; cooperative matrices need a 32-wide subgroup (NVIDIA; AMD/Intel not run) |
+| CUDA | `--backend cuda`; first choice in `auto` on compute capability 8.0+ | the same parity set, all 26 formats against an f64 reference (f32, f16 tensor core and int8 tensor core kernels each), head sizes 16/64/128, partial offload, graph replay; one RTX 3050 Laptop (sm_86) | one device; the integer tensor core and `dp4a` kernels cover 8 formats (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K), the rest use f16 tensor cores; prompts of K-quant models are ~30 % behind llama.cpp's CUDA backend; sm_70/75 devices get the portable kernels (no tensor core path), untested |
 
-`--backend auto` (the default when a GPU flag is given) tries Vulkan, then CUDA, and keeps the CPU if neither fits, printing why. The preference order is fixed, not measured: Vulkan comes first because it is currently the faster of the two.
+`--backend auto` (the default when a GPU flag is given) tries CUDA first when the card has tensor cores (compute capability 8.0 and newer), because it was ahead of Vulkan on prompts and on decode for every format tried (see the benchmark below), then Vulkan, and keeps the CPU if neither fits, printing why. Otherwise Vulkan goes first. A model that does not fit in device memory runs its leading layers on the device and the rest on the CPU (`-ngl N` fixes the number of layers; without it the planner takes as many as fit in 90 % of free device memory, keeping the requested context).
 
 ### Versions
 
@@ -74,11 +74,11 @@ What a release promises, per the project plan (section 148). Every row says what
 ### Known limitations
 
 - Dense decoders only: llama, mistral without sliding window, qwen2, qwen3. No MoE, sliding window, state-space or multimodal models.
-- One device per run; the whole model must fit on it (no partial offload). The context is halved to fit and the result is reported.
+- One device per run, plus the CPU for layers that do not fit (partial offload runs the *leading* layers on the device; the context is kept, or a whole-model plan halves it but not below 2048 positions before going partial).
 - Run and verified on one Linux x86-64 machine with one NVIDIA GPU. Windows, macOS, ARM, AMD and Intel GPUs, Metal, ROCm and multi-GPU have not been run.
 - No signatures: the seal detects accidental damage and an unfinished edit, not tampering (anyone can recompute it).
 - Sealing and verifying are O(file) in time (about 1.7 GiB/s here) at a constant 13 MiB of memory.
-- No benchmark against llama.cpp was run for CUDA or for the synthetic model, and there was no real model on the test machine. Do not read the synthetic numbers as engine-versus-engine comparisons.
+- All speed numbers come from one laptop (Ryzen 7 7445HS, RTX 3050 6 GB Laptop, 6 CPU threads); a different GPU or CPU can reorder the engines. The GPU clocks of this laptop vary by tens of percent between sessions, so only numbers from one interleaved run are compared.
 
 ### Benchmark suite
 
@@ -93,12 +93,21 @@ HK_GPU_PROFILE=1  ... # host launch time and whole-pass GPU time;  HK_CUDA_EVENT
 zig-out/bin/hk-compare --llama-bin <dir> --pair m.hk:m.gguf --threads 6 --repeats 5   # against llama.cpp, with a real model
 ```
 
-Measured with that recipe (136M-parameter Qwen3-shaped Q8_0 model with random weights, RTX 3050 6 GB Laptop, prompt 512 and 64 generated tokens, 5 interleaved repeats in one session):
+Measured with `benchmarks/suite.py` (all engines interleaved, 3 repeats, median and min..max, prompt 512, generate 128, 6 threads) at hk `073bf89` against llama.cpp `d806193` on real GGUF files that both engines load byte for byte; the full tables with memory are in `benchmarks/results/2026-10-21-four-models.md`:
 
-| Backend | Prompt tok/s (min..max) | Generation tok/s (min..max) |
-|:---|:---|:---|
-| CPU, 6 threads | 1,906 (1,686..2,019) | 91 (85..97) |
-| Vulkan | 5,719 (5,490..5,830) | 406 (393..416) |
-| CUDA | 1,190 (1,187..1,192) | 360 (356..362) |
+| Model (GGUF) | Engine | Prompt tok/s | Generation tok/s |
+|:---|:---|--:|--:|
+| Qwen3-0.6B Q8_0 | hk CUDA / llama.cpp CUDA | 7,550 / 7,831 | 138.4 / 152.4 |
+| | hk Vulkan / llama.cpp Vulkan | 4,350 / 6,307 | 122.1 / 147.1 |
+| | hk CPU / llama.cpp CPU | 626 / 399 | 29.5 / 33.3 |
+| Llama-3.2-1B Q4_K_M | hk CUDA / llama.cpp CUDA | 4,292 / 6,046 | 121.4 / 137.5 |
+| | hk Vulkan / llama.cpp Vulkan | 2,889 / 5,217 | 81.5 / 132.5 |
+| | hk CPU / llama.cpp CPU | 353 / 327 | 25.3 / 27.2 |
+| Qwen2.5-1.5B Q4_K_M | hk CUDA / llama.cpp CUDA | 3,020 / 4,229 | 95.4 / 103.0 |
+| | hk Vulkan / llama.cpp Vulkan | 2,028 / 3,518 | 72.3 / 104.5 |
+| | hk CPU / llama.cpp CPU | 212 / 236 | 20.5 / 21.6 |
+| Llama-3.2-3B Q4_K_M | hk CUDA / llama.cpp CUDA | 1,599 / 2,395 | 50.2 / 56.7 |
+| | hk Vulkan / llama.cpp Vulkan | 1,016 / 2,309 | 32.7 / 55.8 |
+| | hk CPU / llama.cpp CPU | 99 / 112 | 10.1 / 10.8 |
 
-The CPU numbers on this laptop swing about 2x between sessions; compare backends only within one run.
+In words: hk's CUDA backend is level with llama.cpp's on Q8_0 prompts and 7-12 % behind on decode, about 30 % behind on K-quant prompts; hk's Vulkan backend is 30-55 % behind, most on K-quants; on the CPU hk is faster on Q8_0 prompts (+57 %) and within ~10 % elsewhere, with a smaller resident set (2.0 GiB against 3.4 GiB for the 3B model). Accuracy (`benchmarks/perplexity.py`, wikitext-2 test, 20 windows of 512 tokens, the llama-perplexity protocol): Qwen3-0.6B Q8_0 perplexity llama.cpp 23.67-23.68, hk 23.64-23.68, Transformers f32 on the original weights 23.73; Qwen2.5-1.5B Q4_K_M llama.cpp 11.64-11.71, hk 11.64-11.70. Transformers on the GPU was not measured here.
