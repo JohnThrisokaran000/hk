@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the **HK Neural Tensor Framework** will be documented in this file.
+All notable changes to **hk** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## [Unreleased]
+
+### Changed
+- Repository root cleaned up for the public repo: `README.md` is rewritten as a landing page (measured 2.0 numbers, including where hk is behind llama.cpp, and the limits); `CONTRIBUTING.md` describes the current source layout; the agent orientation file `CONTEXT.md` moved to `docs/plan/CONTEXT.md`.
+- `graphify-out/` (a generated knowledge graph of the code: `graph.json`, `GRAPH_REPORT.md`, `graph.html`, `manifest.json`) is now part of the repository.
+
+### Removed
+- `install.sh` and `install.ps1`: they were pinned to v1.0.0 and downloaded CLI binaries that releases do not publish. Install from source (`zig build -Doptimize=ReleaseFast`), `pip install hknt`, `npm install hkntf` or `cargo add hknt`.
+- The four `run_*_demo.py` scripts and `PERFORMANCE_REPORT_KERNELS.md` at the repository root (the latter described a different repository's commit). The old demos are still in the git history of 1.1.x.
 
 ## [2.0.0] - 2026-10-21 - Unified runtime: backend abstraction, CUDA engine with tensor cores, partial offload, container integrity
 
