@@ -4,7 +4,7 @@ const metadata = @import("metadata.zig");
 const tensor_toc = @import("tensor_toc.zig");
 const platform = @import("platform.zig");
 const nf4 = @import("nf4.zig");
-const quantization = @import("quantization.zig");
+const research = @import("quant/research.zig");
 const sparsity = @import("sparsity.zig");
 const tiling = @import("tiling.zig");
 const quant = @import("quant.zig");
@@ -221,18 +221,8 @@ pub const HKReader = struct {
             return;
         }
 
-        if (entry.storage_type == .f16) {
-            quantization.dequantizeF16(data_bytes, out.len, out);
-            return;
-        }
-
-        if (entry.storage_type == .bf16) {
-            quantization.dequantizeBF16(data_bytes, out.len, out);
-            return;
-        }
-
         if (entry.storage_type == .fp8_e4m3) {
-            quantization.dequantizeFP8_E4M3(data_bytes, out.len, out);
+            research.dequantizeFP8_E4M3(data_bytes, out.len, out);
             return;
         }
 
@@ -328,7 +318,7 @@ pub const HKReader = struct {
                 const block_scale = if (b < scales.len) scales[b] else 1.0;
                 const packed_block = data_bytes[(b * (bsize / 2))..];
 
-                quantization.dequantizeBlockNF4(packed_block, block_scale, count, out[start..end]);
+                research.dequantizeBlockNF4(packed_block, block_scale, count, out[start..end]);
             }
 
             // Apply residual recovery if requested
@@ -357,7 +347,7 @@ pub const HKReader = struct {
                 const count = end - start;
                 const block_scale = if (b < scales.len) scales[b] else 1.0;
 
-                quantization.dequantizeBlockDQ8(i8_data[start..end], block_scale, count, out[start..end]);
+                research.dequantizeBlockDQ8(i8_data[start..end], block_scale, count, out[start..end]);
             }
 
             if (with_residual) {
@@ -385,7 +375,7 @@ pub const HKReader = struct {
                 const block_scale = if (b < scales.len) scales[b] else 1.0;
                 const packed_block = data_bytes[(b * (bsize / 4))..];
 
-                quantization.dequantizeBlockDQT(packed_block, block_scale, count, out[start..end]);
+                research.dequantizeBlockDQT(packed_block, block_scale, count, out[start..end]);
             }
 
             if (with_residual) {
@@ -399,151 +389,7 @@ pub const HKReader = struct {
             return;
         }
 
-        if (entry.storage_type == .q4_0) {
-            const block_size: usize = quantization.QK4_0;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ4_0);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ4_0 = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeBlockQ4_0(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .q8_0) {
-            const block_size: usize = quantization.QK8_0;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ8_0);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ8_0 = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeBlockQ8_0(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .q5_k) {
-            const block_size = quantization.QK_K;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ5_K);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ5_K = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeSuperBlockQ5_K(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .q3_k) {
-            const block_size = quantization.QK_K;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ3_K);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ3_K = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeSuperBlockQ3_K(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .q4_k) {
-            const block_size = quantization.QK_K;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ4_K);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ4_K = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeSuperBlockQ4_K(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .q8_k) {
-            const block_size = quantization.QK_K;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ8_K);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ8_K = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeSuperBlockQ8_K(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .q6_k) {
-            const block_size = quantization.QK_K;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ6_K);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ6_K = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeSuperBlockQ6_K(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .q2_k) {
-            const block_size = quantization.QK_K;
-            const num_blocks = (out.len + block_size - 1) / block_size;
-            const bytes_per_block = @sizeOf(quantization.BlockQ2_K);
-
-            for (0..num_blocks) |b| {
-                const start = b * block_size;
-                const end = @min(start + block_size, out.len);
-                const count = end - start;
-                const block_offset = b * bytes_per_block;
-                if (block_offset + bytes_per_block <= data_bytes.len) {
-                    const block_ptr: *const quantization.BlockQ2_K = @ptrCast(@alignCast(data_bytes[block_offset..].ptr));
-                    quantization.dequantizeSuperBlockQ2_K(block_ptr, count, out[start..end]);
-                }
-            }
-            return;
-        }
-
-        if (entry.storage_type == .iq4_nl) {
+        if (entry.storage_type == .iq4_nl and entry.scale_size != 0) {
             const scale_bytes = self.getTensorScales(entry) orelse return error.MissingScales;
             const scales: []const f32 = @as([*]const f32, @ptrCast(@alignCast(scale_bytes.ptr)))[0..(scale_bytes.len / 4)];
             const bsize: usize = entry.block_size;
@@ -555,12 +401,12 @@ pub const HKReader = struct {
                 const count = end - start;
                 const block_scale = if (b < scales.len) scales[b] else 1.0;
                 const packed_block = data_bytes[(b * (bsize / 2))..];
-                quantization.dequantizeBlockIQ4_NL(packed_block, block_scale, count, out[start..end]);
+                research.dequantizeBlockIQ4_NL(packed_block, block_scale, count, out[start..end]);
             }
             return;
         }
 
-        if (entry.storage_type == .mxfp4) {
+        if (entry.storage_type == .mxfp4 and entry.scale_size != 0) {
             const scale_bytes = self.getTensorScales(entry) orelse return error.MissingScales;
             const bsize: usize = 32;
             const num_blocks = (out.len + bsize - 1) / bsize;
@@ -571,12 +417,12 @@ pub const HKReader = struct {
                 const count = end - start;
                 const e8m0_scale = if (b < scale_bytes.len) scale_bytes[b] else 127;
                 const packed_block = data_bytes[(b * 16)..];
-                quantization.dequantizeBlockMXFP4(packed_block, e8m0_scale, count, out[start..end]);
+                research.dequantizeBlockMXFP4(packed_block, e8m0_scale, count, out[start..end]);
             }
             return;
         }
 
-        if (entry.storage_type == .nvfp4) {
+        if (entry.storage_type == .nvfp4 and entry.scale_size != 0) {
             const scale_bytes = self.getTensorScales(entry) orelse return error.MissingScales;
             const bsize: usize = 16;
             const num_blocks = (out.len + bsize - 1) / bsize;
@@ -587,7 +433,7 @@ pub const HKReader = struct {
                 const count = end - start;
                 const fp8_scale = if (b < scale_bytes.len) scale_bytes[b] else 0x38;
                 const packed_block = data_bytes[(b * 8)..];
-                quantization.dequantizeBlockNVFP4(packed_block, fp8_scale, count, out[start..end]);
+                research.dequantizeBlockNVFP4(packed_block, fp8_scale, count, out[start..end]);
             }
             return;
         }

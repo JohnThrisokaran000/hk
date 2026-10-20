@@ -2,7 +2,7 @@ const std = @import("std");
 const format = @import("format.zig");
 const writer_mod = @import("writer.zig");
 const platform = @import("platform.zig");
-const quantization = @import("quantization.zig");
+const quantization = @import("quant/compat.zig");
 
 pub const SafeTensorMeta = struct {
     dtype: []const u8,

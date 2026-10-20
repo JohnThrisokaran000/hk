@@ -6,6 +6,8 @@ pub const isa = @import("quant/isa.zig");
 pub const unpack = @import("quant/unpack.zig");
 pub const vecdot = @import("quant/vecdot.zig");
 pub const gemm = @import("quant/gemm.zig");
+pub const encode = @import("quant/encode.zig");
+pub const research = @import("quant/research.zig");
 
 pub const info = blocks.info;
 pub const byteSize = blocks.byteSize;

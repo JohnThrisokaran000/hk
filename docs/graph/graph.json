@@ -5,8 +5,8 @@
  "stats": {
   "curated_nodes": 79,
   "curated_edges": 153,
-  "file_nodes": 173,
-  "import_edges": 405,
+  "file_nodes": 175,
+  "import_edges": 411,
   "unowned_files": 0,
   "status_counts": {
    "done": 8,
@@ -261,10 +261,9 @@
     20
    ],
    "paths": [
-    "src/tensor_ops.zig",
-    "src/quantization.zig"
+    "src/tensor_ops.zig"
    ],
-   "note": "Holds v1.1.0 gemmF32 zero-skip, RoPE table, FP8 LUT. Not used by the engine."
+   "note": "Dense/quantized gemv, gemm, dot and small f32 ops behind the C ABI. The duplicate block formats and the quantizers moved to src/quant (encode, research, compat) and are verified against the engine decoders; this file is next to be retired (owner decision 2026-10-20)."
   },
   {
    "id": "kv-cache",
@@ -1949,7 +1948,7 @@
    "type": "file",
    "label": "src/quant.zig",
    "lang": "zig",
-   "loc": 12,
+   "loc": 14,
    "owner": "quant-formats"
   },
   {
@@ -1961,11 +1960,27 @@
    "owner": "quant-formats"
   },
   {
+   "id": "file:src/quant/compat.zig",
+   "type": "file",
+   "label": "src/quant/compat.zig",
+   "lang": "zig",
+   "loc": 87,
+   "owner": "quant-formats"
+  },
+  {
    "id": "file:src/quant/dequant.zig",
    "type": "file",
    "label": "src/quant/dequant.zig",
    "lang": "zig",
    "loc": 604,
+   "owner": "quant-formats"
+  },
+  {
+   "id": "file:src/quant/encode.zig",
+   "type": "file",
+   "label": "src/quant/encode.zig",
+   "lang": "zig",
+   "loc": 588,
    "owner": "quant-formats"
   },
   {
@@ -1982,6 +1997,14 @@
    "label": "src/quant/isa.zig",
    "lang": "zig",
    "loc": 275,
+   "owner": "quant-formats"
+  },
+  {
+   "id": "file:src/quant/research.zig",
+   "type": "file",
+   "label": "src/quant/research.zig",
+   "lang": "zig",
+   "loc": 394,
    "owner": "quant-formats"
   },
   {
@@ -2009,19 +2032,11 @@
    "owner": "quant-formats"
   },
   {
-   "id": "file:src/quantization.zig",
-   "type": "file",
-   "label": "src/quantization.zig",
-   "lang": "zig",
-   "loc": 1224,
-   "owner": "kernels-legacy"
-  },
-  {
    "id": "file:src/reader.zig",
    "type": "file",
    "label": "src/reader.zig",
    "lang": "zig",
-   "loc": 639,
+   "loc": 485,
    "owner": "format-core"
   },
   {
@@ -2221,7 +2236,7 @@
    "type": "file",
    "label": "tests/roundtrip_tests.zig",
    "lang": "zig",
-   "loc": 1863,
+   "loc": 1964,
    "owner": "tests-suite"
   },
   {
@@ -3362,7 +3377,17 @@
   },
   {
    "s": "quant-formats",
+   "t": "file:src/quant/compat.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "quant-formats",
    "t": "file:src/quant/dequant.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "quant-formats",
+   "t": "file:src/quant/encode.zig",
    "type": "implemented_by"
   },
   {
@@ -3373,6 +3398,11 @@
   {
    "s": "quant-formats",
    "t": "file:src/quant/isa.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "quant-formats",
+   "t": "file:src/quant/research.zig",
    "type": "implemented_by"
   },
   {
@@ -3493,11 +3523,6 @@
   {
    "s": "kernels-engine",
    "t": "file:src/kernels_impl.zig",
-   "type": "implemented_by"
-  },
-  {
-   "s": "kernels-legacy",
-   "t": "file:src/quantization.zig",
    "type": "implemented_by"
   },
   {
@@ -4772,7 +4797,7 @@
   },
   {
    "s": "file:src/c_api.zig",
-   "t": "file:src/quantization.zig",
+   "t": "file:src/quant/compat.zig",
    "type": "imports"
   },
   {
@@ -5457,12 +5482,22 @@
   },
   {
    "s": "file:src/quant.zig",
+   "t": "file:src/quant/encode.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant.zig",
    "t": "file:src/quant/gemm.zig",
    "type": "imports"
   },
   {
    "s": "file:src/quant.zig",
    "t": "file:src/quant/isa.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant.zig",
+   "t": "file:src/quant/research.zig",
    "type": "imports"
   },
   {
@@ -5486,6 +5521,21 @@
    "type": "imports"
   },
   {
+   "s": "file:src/quant/compat.zig",
+   "t": "file:src/quant/dequant.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant/compat.zig",
+   "t": "file:src/quant/encode.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant/compat.zig",
+   "t": "file:src/quant/research.zig",
+   "type": "imports"
+  },
+  {
    "s": "file:src/quant/dequant.zig",
    "t": "file:src/format.zig",
    "type": "imports"
@@ -5498,6 +5548,16 @@
   {
    "s": "file:src/quant/dequant.zig",
    "t": "file:src/quant/tables.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant/encode.zig",
+   "t": "file:src/quant/blocks.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant/encode.zig",
+   "t": "file:src/quant/dequant.zig",
    "type": "imports"
   },
   {
@@ -5588,11 +5648,6 @@
   {
    "s": "file:src/quant/vecdot.zig",
    "t": "file:src/quant/unpack.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/quantization.zig",
-   "t": "file:src/format.zig",
    "type": "imports"
   },
   {
@@ -5627,7 +5682,7 @@
   },
   {
    "s": "file:src/reader.zig",
-   "t": "file:src/quantization.zig",
+   "t": "file:src/quant/research.zig",
    "type": "imports"
   },
   {
@@ -5777,7 +5832,7 @@
   },
   {
    "s": "file:src/root.zig",
-   "t": "file:src/quantization.zig",
+   "t": "file:src/quant/compat.zig",
    "type": "imports"
   },
   {
@@ -5862,7 +5917,7 @@
   },
   {
    "s": "file:src/safetensors.zig",
-   "t": "file:src/quantization.zig",
+   "t": "file:src/quant/compat.zig",
    "type": "imports"
   },
   {
@@ -5937,7 +5992,7 @@
   },
   {
    "s": "file:src/tensor_ops.zig",
-   "t": "file:src/quantization.zig",
+   "t": "file:src/quant/compat.zig",
    "type": "imports"
   },
   {
@@ -6325,7 +6380,7 @@
   {
    "s": "c-abi",
    "t": "kernels-legacy",
-   "imports": 2
+   "imports": 1
   },
   {
    "s": "c-abi",
@@ -6335,6 +6390,11 @@
   {
    "s": "c-abi",
    "t": "platform-mmap",
+   "imports": 1
+  },
+  {
+   "s": "c-abi",
+   "t": "quant-formats",
    "imports": 1
   },
   {
@@ -6374,18 +6434,13 @@
   },
   {
    "s": "converters",
-   "t": "kernels-legacy",
-   "imports": 1
-  },
-  {
-   "s": "converters",
    "t": "platform-mmap",
    "imports": 3
   },
   {
    "s": "converters",
    "t": "quant-formats",
-   "imports": 1
+   "imports": 2
   },
   {
    "s": "engine",
@@ -6429,11 +6484,6 @@
   },
   {
    "s": "format-core",
-   "t": "kernels-legacy",
-   "imports": 1
-  },
-  {
-   "s": "format-core",
    "t": "nf4-dq",
    "imports": 1
   },
@@ -6445,7 +6495,7 @@
   {
    "s": "format-core",
    "t": "quant-formats",
-   "imports": 1
+   "imports": 2
   },
   {
    "s": "format-core",
@@ -6500,11 +6550,16 @@
   {
    "s": "kernels-legacy",
    "t": "format-core",
-   "imports": 2
+   "imports": 1
   },
   {
    "s": "kernels-legacy",
    "t": "nf4-dq",
+   "imports": 1
+  },
+  {
+   "s": "kernels-legacy",
+   "t": "quant-formats",
    "imports": 1
   },
   {

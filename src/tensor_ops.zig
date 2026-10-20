@@ -1,7 +1,7 @@
 const std = @import("std");
 const format = @import("format.zig");
 const nf4 = @import("nf4.zig");
-const quantization = @import("quantization.zig");
+const quantization = @import("quant/compat.zig");
 
 pub const Vec4f = @Vector(4, f32);
 pub const Vec8f = @Vector(8, f32);

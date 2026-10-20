@@ -1267,7 +1267,7 @@ test "k-quants q4_k super-block roundtrip" {
         weights[i] = @as(f32, @floatFromInt(i)) / 256.0 - 0.5;
     }
 
-    var block: hk.quantization.BlockQ4_K = .{};
+    var block: hk.quantization.BlockQ4_K = std.mem.zeroes(hk.quantization.BlockQ4_K);
     hk.quantization.quantizeSuperBlockQ4_K(&weights, &block);
 
     var dequant: [256]f32 = undefined;
@@ -1285,7 +1285,7 @@ test "k-quants q8_k super-block roundtrip" {
         weights[i] = (@as(f32, @floatFromInt(i)) - 128.0) / 128.0;
     }
 
-    var block: hk.quantization.BlockQ8_K = .{};
+    var block: hk.quantization.BlockQ8_K = std.mem.zeroes(hk.quantization.BlockQ8_K);
     hk.quantization.quantizeSuperBlockQ8_K(&weights, &block);
 
     var dequant: [256]f32 = undefined;
@@ -1860,4 +1860,105 @@ test "a failed HKWriter write leaves the existing container untouched" {
     const after = try fx.bytes(allocator);
     defer allocator.free(after);
     try std.testing.expectEqualSlices(u8, before, after);
+}
+
+// -- GGML block formats through the reader and the C-ABI-level quantizers --------------------------------------------
+
+/// Writes one tensor of `weights.len` values stored as `t` blocks produced by `encodeAll`, reads it back through
+/// `HKReader.dequantizeToF32`, and returns the maximum difference from decoding the same bytes directly with the
+/// engine's decoder. Zero means the reader and the engine agree on what the bytes mean.
+fn readerVsEngine(comptime t: hk.format.StorageType, block_bytes: []const u8, n_elems: usize, test_path: []const u8) !f32 {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    defer std.Io.Dir.cwd().deleteFile(io, test_path) catch {};
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    try writer.addTensor(.{
+        .name = "w",
+        .storage_type = t,
+        .ndim = 1,
+        .shape = .{ n_elems, 0, 0, 0, 0, 0, 0, 0 },
+        .data = block_bytes,
+    });
+    try writer.writeToFile(test_path);
+    var reader = try hk.HKReader.open(test_path, allocator);
+    defer reader.deinit();
+    const via_reader = try allocator.alloc(f32, n_elems);
+    defer allocator.free(via_reader);
+    try reader.dequantizeToF32(reader.toc.find("w").?, false, via_reader);
+    const direct = try allocator.alloc(f32, n_elems);
+    defer allocator.free(direct);
+    try hk.quant.dequantizeRow(t, block_bytes, direct);
+    var worst: f32 = 0;
+    for (via_reader, direct) |a, b| worst = @max(worst, @abs(a - b));
+    return worst;
+}
+
+test "reader decodes real GGML Q4_K, Q3_K, Q6_K and Q5_K tensors with the engine decoders" {
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    inline for (.{ .{ hk.format.StorageType.q4_k, "Q4_K" }, .{ hk.format.StorageType.q3_k, "Q3_K" }, .{ hk.format.StorageType.q6_k, "Q6_K" }, .{ hk.format.StorageType.q5_k, "Q5_K" } }) |spec| {
+        var w: [512]f32 = undefined;
+        for (&w) |*x| x.* = rand.floatNorm(f32);
+        var bytes: [2 * 256]u8 = undefined; // large enough for two blocks of any of these formats
+        const info = hk.quant.blocks.info(spec[0]).?;
+        const used = 2 * info.bytes;
+        for (0..2) |b| {
+            const dst = bytes[b * info.bytes ..][0..info.bytes];
+            const src = w[b * 256 ..][0..256];
+            // Encode into a properly aligned block, then copy its bytes (the buffer itself is only byte aligned).
+            switch (spec[0]) {
+                .q4_k => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ4_K);
+                    hk.quant.encode.quantizeSuperBlockQ4_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+                .q3_k => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ3_K);
+                    hk.quant.encode.quantizeSuperBlockQ3_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+                .q6_k => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ6_K);
+                    hk.quant.encode.quantizeSuperBlockQ6_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+                else => {
+                    var blk = std.mem.zeroes(hk.quant.encode.BlockQ5_K);
+                    hk.quant.encode.quantizeSuperBlockQ5_K(src, &blk);
+                    @memcpy(dst, std.mem.asBytes(&blk));
+                },
+            }
+        }
+        const diff = try readerVsEngine(spec[0], bytes[0..used], 512, "test_reader_" ++ spec[1] ++ ".hk");
+        try std.testing.expectEqual(@as(f32, 0), diff);
+    }
+}
+
+test "reader decodes scale-less GGML IQ4_NL and MXFP4 blocks instead of reporting missing scales" {
+    var iq: [18]u8 = undefined; // f16 scale + 16 bytes of nibbles
+    std.mem.writeInt(u16, iq[0..2], @bitCast(@as(f16, 0.5)), .little);
+    for (iq[2..], 0..) |*b, i| b.* = @intCast((i * 17 + 3) & 0xFF);
+    try std.testing.expectEqual(@as(f32, 0), try readerVsEngine(.iq4_nl, &iq, 32, "test_reader_iq4nl.hk"));
+
+    var mx: [17]u8 = undefined; // e8m0 scale + 16 bytes of nibbles
+    mx[0] = 127;
+    for (mx[1..], 0..) |*b, i| b.* = @intCast((i * 29 + 5) & 0xFF);
+    try std.testing.expectEqual(@as(f32, 0), try readerVsEngine(.mxfp4, &mx, 32, "test_reader_mxfp4.hk"));
+}
+
+test "a block shorter than its tensor is an error, not silently skipped" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const path = "test_reader_short_q4k.hk";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var blocks: [144]u8 = @splat(0); // one Q4_K block, but the tensor claims two
+    var writer = hk.HKWriter.init(allocator);
+    defer writer.deinit();
+    try writer.addTensor(.{ .name = "w", .storage_type = .q4_k, .ndim = 1, .shape = .{ 512, 0, 0, 0, 0, 0, 0, 0 }, .data = &blocks });
+    try writer.writeToFile(path);
+    var reader = try hk.HKReader.open(path, allocator);
+    defer reader.deinit();
+    var out: [512]f32 = undefined;
+    try std.testing.expectError(error.UnsupportedStorageType, reader.dequantizeToF32(reader.toc.find("w").?, false, &out));
 }
