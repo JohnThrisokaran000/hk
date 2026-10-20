@@ -81,6 +81,11 @@ const EmbedPush = extern struct { dim: u32, row_bytes: u32 };
 const NormPush = extern struct { dim: u32, eps: f32 };
 const RopePush = extern struct { n_tokens: u32, n_heads: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, qk_norm: u32, n_ctx: u32, eps: f32, mscale: f32 };
 const AttnPush = extern struct { n_tokens: u32, n_heads: u32, n_kv: u32, head_dim: u32, n_ctx: u32, scale: f32 };
+const AttnSplitPush = extern struct { n_tokens: u32, n_heads: u32, n_kv: u32, head_dim: u32, n_ctx: u32, scale: f32, splits: u32 };
+
+/// Most slices the context of one (head, token) is cut into for decode, and the tokens such a pass may have.
+const max_splits = 16;
+const split_max_tokens = 4;
 const CountPush = extern struct { n: u32 };
 
 /// A weight matrix on the device.
@@ -119,6 +124,7 @@ const Layer = struct {
     s_norm1: c.VkDescriptorSet = null,
     s_rope: c.VkDescriptorSet = null,
     s_attn: c.VkDescriptorSet = null,
+    s_attn_part: c.VkDescriptorSet = null,
     s_add1: c.VkDescriptorSet = null,
     s_norm2: c.VkDescriptorSet = null,
     s_swiglu: c.VkDescriptorSet = null,
@@ -179,6 +185,11 @@ pub const Engine = struct {
     p_norm: vk.Pipeline,
     p_rope: vk.Pipeline,
     p_attn: vk.Pipeline,
+    /// Split-KV attention for decode: slices of the context in `p_attn_part`, merged by `p_attn_combine`.
+    p_attn_part: vk.Pipeline,
+    p_attn_combine: vk.Pipeline,
+    attn_part: vk.Buffer,
+    s_attn_combine: c.VkDescriptorSet,
     /// Cooperative matrix attention for prompt batches; null when the device or the head size does not allow it.
     p_attn_cm: ?vk.Pipeline,
     p_swiglu: vk.Pipeline,
@@ -423,6 +434,8 @@ pub const Engine = struct {
         self.p_norm = try cx.createPipeline(@embedFile("spv/rmsnorm.spv"), 3, @sizeOf(NormPush));
         self.p_rope = try cx.createPipeline(@embedFile("spv/rope_kv.spv"), 9, @sizeOf(RopePush));
         self.p_attn = try cx.createPipeline(@embedFile("spv/attention.spv"), 5, @sizeOf(AttnPush));
+        self.p_attn_part = try cx.createPipeline(@embedFile("spv/attention_part.spv"), 5, @sizeOf(AttnSplitPush));
+        self.p_attn_combine = try cx.createPipeline(@embedFile("spv/attention_combine.spv"), 5, @sizeOf(AttnSplitPush));
         self.p_attn_cm = null;
         if (cx.caps.coopmat) {
             const code: ?[]const u8 = switch (cfg.head_dim) {
@@ -453,6 +466,7 @@ pub const Engine = struct {
         self.logits_dev = try cx.createBuffer(@as(u64, self.max_rows) * cfg.vocab * 4, .device);
         self.logits_host = try cx.createBuffer(@as(u64, self.max_rows) * cfg.vocab * 4, .readback);
         self.hid_host = try cx.createBuffer(nb * cfg.dim * 4, .readback);
+        self.attn_part = try cx.createBuffer(@as(u64, split_max_tokens) * cfg.n_heads * max_splits * (cfg.head_dim + 2) * 4, .device);
         self.dummy = try cx.createBuffer(64, .device);
         self.out_norm = try f32Buffer(cx, w.out_norm);
         self.inv_freq = try f32Buffer(cx, inv_freq);
@@ -536,7 +550,7 @@ pub const Engine = struct {
         for (self.layers) |l| self.freeLayer(l);
         self.allocator.free(self.layers);
         const cx = &self.ctx;
-        for ([_]vk.Buffer{ self.x, self.xb, self.xn, self.tmp, self.q, self.att, self.k, self.v, self.gate, self.up, self.gu, self.par, self.toks, self.logits_dev, self.logits_host, self.hid_host, self.dummy, self.out_norm, self.inv_freq }) |b| cx.destroyBuffer(b);
+        for ([_]vk.Buffer{ self.x, self.xb, self.xn, self.tmp, self.q, self.att, self.k, self.v, self.gate, self.up, self.gu, self.par, self.toks, self.logits_dev, self.logits_host, self.hid_host, self.attn_part, self.dummy, self.out_norm, self.inv_freq }) |b| cx.destroyBuffer(b);
         if (!self.partial) {
             cx.destroyBuffer(self.tok_embd.buf);
             if (!self.tied_output) cx.destroyBuffer(self.output.buf);
@@ -544,7 +558,7 @@ pub const Engine = struct {
         for (self.pipes_mmv) |p| if (p) |pp| cx.destroyPipeline(pp);
         for (self.pipes_mm) |p| if (p) |pp| cx.destroyPipeline(pp);
         for (self.pipes_embed) |p| if (p) |pp| cx.destroyPipeline(pp);
-        for ([_]vk.Pipeline{ self.p_norm, self.p_rope, self.p_attn, self.p_swiglu, self.p_swiglu_pair, self.p_add }) |p| cx.destroyPipeline(p);
+        for ([_]vk.Pipeline{ self.p_norm, self.p_rope, self.p_attn, self.p_attn_part, self.p_attn_combine, self.p_swiglu, self.p_swiglu_pair, self.p_add }) |p| cx.destroyPipeline(p);
         if (self.p_attn_cm) |p| cx.destroyPipeline(p);
         self.allocator.free(self.owners);
         self.ctx.deinit();
@@ -608,6 +622,7 @@ pub const Engine = struct {
             self.s_final_norm = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = self.out_norm }, .{ .buf = self.xn } });
             try self.matSet(&self.output, self.xn, self.logits_dev, null);
         }
+        self.s_attn_combine = try cx.makeSet(self.p_attn_combine, &.{ .{ .buf = self.attn_part }, .{ .buf = self.dummy }, .{ .buf = self.dummy }, .{ .buf = self.dummy }, .{ .buf = self.att } });
         for (self.layers) |*l| {
             l.s_norm1 = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = l.attn_norm }, .{ .buf = self.xb } });
             try self.matSet(&l.wq, self.xb, self.q, l.bq);
@@ -619,6 +634,7 @@ pub const Engine = struct {
                 .{ .buf = l.k_norm orelse self.dummy }, .{ .buf = l.kc }, .{ .buf = l.vc },
             });
             l.s_attn = try cx.makeSet(self.p_attn, &.{ .{ .buf = self.q }, .{ .buf = self.par }, .{ .buf = l.kc }, .{ .buf = l.vc }, .{ .buf = self.att } });
+            l.s_attn_part = try cx.makeSet(self.p_attn_part, &.{ .{ .buf = self.q }, .{ .buf = self.par }, .{ .buf = l.kc }, .{ .buf = l.vc }, .{ .buf = self.attn_part } });
             try self.matSet(&l.wo, self.att, self.x, null);
             l.s_norm2 = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = l.ffn_norm }, .{ .buf = self.xb } });
             if (l.fused_gu) {
@@ -789,6 +805,15 @@ pub const Engine = struct {
             }
             if (single) attn_cm = self.p_attn_cm;
         }
+        // Decode has a handful of (head, token) workgroups; cutting the context into slices gives the device enough
+        // of them. Slices of fewer than 32 positions are not worth a workgroup.
+        var splits: u32 = 1;
+        if (n <= split_max_tokens) {
+            var max_pos: u32 = 0;
+            for (items) |it| max_pos = @max(max_pos, it.pos);
+            const want = (96 + n * @as(u32, @intCast(cfg.n_heads)) - 1) / (n * @as(u32, @intCast(cfg.n_heads)));
+            splits = std.math.clamp(@min(want, (max_pos + 1) / 32), 1, max_splits);
+        }
         const count_dim = CountPush{ .n = n * @as(u32, @intCast(cfg.dim)) };
         const count_ffn = CountPush{ .n = n * @as(u32, @intCast(cfg.ffn_dim)) };
 
@@ -804,6 +829,11 @@ pub const Engine = struct {
             self.barrier();
             if (attn_cm) |pipe| {
                 self.disp(.attn, pipe, l.s_attn, std.mem.asBytes(&attn), (n + 63) / 64, @intCast(cfg.n_heads), 1);
+            } else if (splits > 1) {
+                const sp = AttnSplitPush{ .n_tokens = attn.n_tokens, .n_heads = attn.n_heads, .n_kv = attn.n_kv, .head_dim = attn.head_dim, .n_ctx = attn.n_ctx, .scale = attn.scale, .splits = splits };
+                self.disp(.attn, self.p_attn_part, l.s_attn_part, std.mem.asBytes(&sp), @intCast(cfg.n_heads), n, splits);
+                self.barrier();
+                self.disp(.attn, self.p_attn_combine, self.s_attn_combine, std.mem.asBytes(&sp), @intCast(cfg.n_heads), n, 1);
             } else {
                 self.disp(.attn, self.p_attn, l.s_attn, std.mem.asBytes(&attn), @intCast(cfg.n_heads), n, 1);
             }

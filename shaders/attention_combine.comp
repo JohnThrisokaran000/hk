@@ -1,0 +1,39 @@
+#version 450
+// Second half of split-KV attention: merges the `splits` softmax states of each (token, head) exactly, rescaling each
+// slice by its maximum, and writes the normalized output. One workgroup per (head, token).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Part { float part[]; };
+layout(std430, binding = 4) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P {
+    uint n_tokens;
+    uint n_heads;
+    uint n_kv;
+    uint head_dim;
+    uint n_ctx;
+    float scale;
+    uint splits;
+} p;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint hd = p.head_dim;
+    uint base = (t * p.n_heads + h) * p.splits * (hd + 2u);
+    float gm = -3.0e38;
+    for (uint s = 0u; s < p.splits; s++) gm = max(gm, part[base + s * (hd + 2u) + hd]);
+    float l = 0.0;
+    for (uint s = 0u; s < p.splits; s++) {
+        uint b = base + s * (hd + 2u);
+        l += part[b + hd + 1u] * exp(part[b + hd] - gm);
+    }
+    float inv = l > 0.0 ? 1.0 / l : 0.0;
+    uint qd = p.n_heads * hd;
+    for (uint d = gl_LocalInvocationID.x; d < hd; d += 256u) {
+        float v = 0.0;
+        for (uint s = 0u; s < p.splits; s++) {
+            uint b = base + s * (hd + 2u);
+            v += part[b + d] * exp(part[b + hd] - gm);
+        }
+        o[t * qd + h * hd + d] = v * inv;
+    }
+}
