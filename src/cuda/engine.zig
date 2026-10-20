@@ -62,7 +62,7 @@ const block_threads: u32 = 128;
 
 /// The matrix kernels of one weight format: matrix-vector for a single token, the tiled kernel for small batches and,
 /// on GPUs of compute capability 8.0 and up, the tensor core kernel for prompts.
-const GemmKernels = struct { decode: cuda.Kernel, tiled: cuda.Kernel, tensor: ?cuda.Kernel };
+const GemmKernels = struct { decode: cuda.Kernel, tiled: cuda.Kernel, tensor: ?cuda.Kernel, imma: ?cuda.Kernel };
 /// Threads per block of the elementwise kernels.
 const elem_threads: u32 = 256;
 /// Threads per block of the attention kernel: one per position of a tile (`attn_tile` in the device code).
@@ -121,6 +121,7 @@ const Kernels = struct {
     swiglu: cuda.Kernel,
     add: cuda.Kernel,
     to_half: cuda.Kernel,
+    quantize_act: cuda.Kernel,
 };
 
 /// Bytes the engine needs on the device for `w` with options `o`, with a margin for the driver.
@@ -192,6 +193,9 @@ pub const Engine = struct {
     hidden: cuda.DeviceMem,
     /// Input of the next tensor core matrix product, as halves.
     x16: cuda.DeviceMem,
+    /// The same activations quantized to int8 (`xq`) with a scale per 32 (`xs`), for the integer kernels.
+    xq: cuda.DeviceMem,
+    xs: cuda.DeviceMem,
     cos_dev: cuda.DeviceMem,
     sin_dev: cuda.DeviceMem,
     logits_dev: cuda.DeviceMem,
@@ -292,6 +296,7 @@ pub const Engine = struct {
             .swiglu = cuda.deviceKernel("swiglu") catch return error.DeviceFailed,
             .add = cuda.deviceKernel("add") catch return error.DeviceFailed,
             .to_half = cuda.deviceKernel("to_half") catch return error.DeviceFailed,
+            .quantize_act = cuda.deviceKernel("quantize_act") catch return error.DeviceFailed,
         };
         self.gemm = std.EnumArray(StorageType, ?GemmKernels).initFill(null);
 
@@ -337,7 +342,10 @@ pub const Engine = struct {
         self.gate = try made.empty(rows * cfg.ffn_dim * f);
         self.up = try made.empty(rows * cfg.ffn_dim * f);
         self.hidden = try made.empty(rows * cfg.dim * f);
-        self.x16 = try made.empty(rows * @max(cfg.dim, @max(cfg.qDim(), cfg.ffn_dim)) * 2);
+        const max_in = @max(cfg.dim, @max(cfg.qDim(), cfg.ffn_dim));
+        self.x16 = try made.empty(rows * max_in * 2);
+        self.xq = try made.empty(rows * max_in);
+        self.xs = try made.empty(rows * (max_in / 32 + 1) * 4);
         const half = cfg.rope_dim / 2;
         self.cos_dev = try made.empty(o.n_batch * half * f);
         self.sin_dev = try made.empty(o.n_batch * half * f);
@@ -445,7 +453,7 @@ pub const Engine = struct {
         if (self.gemm.get(m.t) == null) {
             const one = cuda.gemmKernel(m.t, 1) catch return error.UnsupportedType;
             const many = cuda.gemmKernel(m.t, 2) catch return error.UnsupportedType;
-            self.gemm.set(m.t, .{ .decode = one, .tiled = many, .tensor = cuda.tensorKernel(m.t) });
+            self.gemm.set(m.t, .{ .decode = one, .tiled = many, .tensor = cuda.tensorKernel(m.t), .imma = cuda.immaKernel(m.t) });
         }
         return .{ .mem = try made.bytes(m.data), .t = m.t, .rows = m.rows, .cols = m.cols };
     }
@@ -468,7 +476,7 @@ pub const Engine = struct {
             cuda.deviceFree(self.out_norm);
             cuda.deviceFree(self.output.mem);
         }
-        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.x16, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
+        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.x16, self.xq, self.xs, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
         for (self.kcache, self.vcache) |kc, vc| {
             cuda.deviceFree(kc);
             cuda.deviceFree(vc);
@@ -524,6 +532,11 @@ pub const Engine = struct {
     /// y[token][0..rows] = m * x[token] for `n` tokens.
     fn mm(self: *Engine, m: DevMat, x: u64, y: u64, n: usize) Error!void {
         const kernels = self.gemm.get(m.t).?;
+        if (n >= cuda.tensor_min_tokens) if (kernels.imma) |im| {
+            const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
+            const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
+            return cuda.launchKernel2D(im, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.xq.addr, self.xs.addr, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
+        };
         if (n >= cuda.tensor_min_tokens) if (kernels.tensor) |tc| {
             const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
             const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
@@ -535,13 +548,25 @@ pub const Engine = struct {
         cuda.launchKernel2D(kern, g[0], g[1], block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
     }
 
-    /// Converts `count` activations at `x` into `x16` when the coming products run on tensor cores (a pass of at least
-    /// `tensor_min_tokens` tokens on a device that has them); every `mm` of that pass reads `x16`, so call this after
-    /// each producer of a matrix input and before the products that read it.
-    fn halve(self: *Engine, x: u64, count: usize, n: usize) Error!void {
+    /// Prepares the input of the coming matrix products for the tensor core kernels of a pass of at least
+    /// `tensor_min_tokens` tokens: halves in `x16` for those that multiply in f16, int8 with scales in `xq`/`xs` for the
+    /// integer ones. `count` is the number of activations in all (`n` rows); `mats` are the products that will read them.
+    /// Call it after each producer of a matrix input and before the products.
+    fn prepare(self: *Engine, x: u64, count: usize, n: usize, mats: []const DevMat) Error!void {
         if (n < cuda.tensor_min_tokens or !cuda.hasTensorCores()) return;
-        const pairs: u32 = @intCast(count / 2);
-        cuda.launchKernel(self.k.to_half, grid(pairs, elem_threads), elem_threads, .{ self.x16.addr, x, pairs }) catch |e| return mapErr(e);
+        var need_half = false;
+        var need_int = false;
+        for (mats) |m| {
+            if (self.gemm.get(m.t).?.imma != null) need_int = true else need_half = true;
+        }
+        if (need_half) {
+            const pairs: u32 = @intCast(count / 2);
+            cuda.launchKernel(self.k.to_half, grid(pairs, elem_threads), elem_threads, .{ self.x16.addr, x, pairs }) catch |e| return mapErr(e);
+        }
+        if (need_int) {
+            const blocks: u32 = @intCast(count / 32);
+            cuda.launchKernel(self.k.quantize_act, (blocks * 32 + 127) / 128, 128, .{ self.xq.addr, self.xs.addr, x, blocks }) catch |e| return mapErr(e);
+        }
     }
 
     fn rmsNorm(self: *Engine, out: u64, x: u64, w: u64, rows: usize) Error!void {
@@ -575,7 +600,7 @@ pub const Engine = struct {
 
         for (self.layers, 0..) |l, li| {
             try self.rmsNorm(self.xb.addr, x, l.attn_norm.addr, n);
-            try self.halve(self.xb.addr, n * cfg.dim, n);
+            try self.prepare(self.xb.addr, n * cfg.dim, n, &.{ l.wq, l.wk, l.wv });
             try self.mm(l.wq, self.xb.addr, self.q.addr, n);
             try self.mm(l.wk, self.xb.addr, self.kk.addr, n);
             try self.mm(l.wv, self.xb.addr, self.vv.addr, n);
@@ -602,16 +627,16 @@ pub const Engine = struct {
                 cuda.launchKernel(self.k.attention_combine, @intCast(n * cfg.n_heads), attn_threads, .{ self.attn_part.addr, self.att.addr, hd, splits }) catch |e| return mapErr(e);
             }
 
-            try self.halve(self.att.addr, n * cfg.qDim(), n);
+            try self.prepare(self.att.addr, n * cfg.qDim(), n, &.{l.wo});
             try self.mm(l.wo, self.att.addr, self.tmp.addr, n);
             try self.addInto(x, self.tmp.addr, n * cfg.dim);
 
             try self.rmsNorm(self.xb.addr, x, l.ffn_norm.addr, n);
-            try self.halve(self.xb.addr, n * cfg.dim, n);
+            try self.prepare(self.xb.addr, n * cfg.dim, n, &.{ l.w_gate, l.w_up });
             try self.mm(l.w_gate, self.xb.addr, self.gate.addr, n);
             try self.mm(l.w_up, self.xb.addr, self.up.addr, n);
             cuda.launchKernel(self.k.swiglu, grid(n * cfg.ffn_dim, elem_threads), elem_threads, .{ self.gate.addr, self.up.addr, @as(u32, @intCast(n * cfg.ffn_dim)) }) catch |e| return mapErr(e);
-            try self.halve(self.gate.addr, n * cfg.ffn_dim, n);
+            try self.prepare(self.gate.addr, n * cfg.ffn_dim, n, &.{l.w_down});
             try self.mm(l.w_down, self.gate.addr, self.tmp.addr, n);
             try self.addInto(x, self.tmp.addr, n * cfg.dim);
         }
@@ -682,7 +707,7 @@ pub const Engine = struct {
             try self.rmsNorm(self.xb.at(r * cfg.dim * f), self.hidden.at(idx * cfg.dim * f), self.out_norm.addr, 1);
         }
         // One pass over the output matrix for every requested row.
-        try self.halve(self.xb.addr, indices.len * cfg.dim, indices.len);
+        try self.prepare(self.xb.addr, indices.len * cfg.dim, indices.len, &.{self.output});
         try self.mm(self.output, self.xb.addr, self.logits_dev.addr, indices.len);
         const out = self.logits_h[0 .. indices.len * cfg.vocab];
         const t0 = nowSecs();

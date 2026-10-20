@@ -1035,6 +1035,15 @@ pub const tensor_tile_rows: usize = 64;
 pub const tensor_tile_tokens: usize = 128;
 pub const tensor_block_threads: c_uint = 256;
 
+/// The integer tensor core kernel for `fmt` (activations quantized to int8, see `quantize_act`), or null when the device
+/// has none or the format has no integer kernel yet.
+pub fn immaKernel(fmt: format.StorageType) ?Kernel {
+    if (!hasTensorCores()) return null;
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "gemm_imma_{s}", .{@tagName(fmt)}) catch return null;
+    return deviceKernel(name) catch null;
+}
+
 /// The tensor core matrix kernel for `fmt`, or null when the device has none.
 pub fn tensorKernel(fmt: format.StorageType) ?Kernel {
     if (!hasTensorCores()) return null;
@@ -1062,6 +1071,21 @@ pub fn deviceGemm(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m
     const g = gemmGrid(m, n);
     try launchKernel2D(kernel, g[0], g[1], gemm_block_threads, .{
         @as(u64, toDevicePtr(w)), @as(u64, toDevicePtr(x)), @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+    });
+}
+
+/// Like `deviceGemm`, on the integer tensor core kernel: activations are quantized to int8 first, products accumulate
+/// in int32. Fails where the device has none or `fmt` has no such kernel.
+pub fn deviceGemmImma(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize, n: usize) !void {
+    const kernel = immaKernel(fmt) orelse return CudaError.KernelNotFound;
+    const xq = try deviceAlloc(n * k);
+    defer deviceFree(xq);
+    const xs = try deviceAlloc(n * (k / 32) * 4);
+    defer deviceFree(xs);
+    const nblocks: u32 = @intCast(n * (k / 32));
+    try launchKernel(try deviceKernel("quantize_act"), (nblocks * 32 + 127) / 128, 128, .{ xq.addr, xs.addr, @as(u64, toDevicePtr(x)), nblocks });
+    try launchKernel2D(kernel, @intCast((m + tensor_tile_rows - 1) / tensor_tile_rows), @intCast((n + tensor_tile_tokens - 1) / tensor_tile_tokens), tensor_block_threads, .{
+        @as(u64, toDevicePtr(w)), xq.addr, xs.addr, @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
     });
 }
 

@@ -315,14 +315,17 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
             // One token takes the decode kernel, several the batch kernel, and on sm_80 and newer the tensor core kernel
             // takes a prompt; each must match the reference. The tensor core kernel rounds both operands to f16, so its
             // bound is looser (2^-10 of the sum of magnitudes at worst).
-            const runs = [_]struct { n: usize, tensor: bool }{
+            const runs = [_]struct { n: usize, tensor: bool, imma: bool = false }{
                 .{ .n = 1, .tensor = false },
                 .{ .n = 19, .tensor = false },
                 .{ .n = 19, .tensor = true },
                 .{ .n = max_tokens, .tensor = true },
+                .{ .n = 19, .tensor = false, .imma = true },
+                .{ .n = max_tokens, .tensor = false, .imma = true },
             };
             for (runs) |run| {
-                if (run.tensor and !cuda.hasTensorCores()) continue;
+                if ((run.tensor or run.imma) and !cuda.hasTensorCores()) continue;
+                if (run.imma and cuda.immaKernel(t) == null) continue;
                 const N = run.n;
                 const dec = try allocator.alloc(f32, K);
                 defer allocator.free(dec);
@@ -330,6 +333,9 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
                 defer allocator.free(want);
                 const scale = try allocator.alloc(f64, N * M);
                 defer allocator.free(scale);
+                // Integer kernel: activations are rounded to int8 per 32 values, an error of at most amax / 254 each.
+                const qbound = try allocator.alloc(f64, N * M);
+                defer allocator.free(qbound);
                 for (0..M) |r| {
                     try hk.quant.dequantizeRow(t, w[r * row_bytes ..][0..row_bytes], dec);
                     for (0..N) |tok| {
@@ -342,12 +348,24 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
                         }
                         want[tok * M + r] = s;
                         scale[tok * M + r] = mag;
+                        var qb: f64 = 0;
+                        var b0: usize = 0;
+                        while (b0 < K) : (b0 += 32) {
+                            var amax: f64 = 0;
+                            var wsum: f64 = 0;
+                            for (b0..b0 + 32) |i| {
+                                amax = @max(amax, @abs(@as(f64, xs[i])));
+                                wsum += @abs(@as(f64, dec[i]));
+                            }
+                            qb += wsum * amax / 254.0;
+                        }
+                        qbound[tok * M + r] = qb;
                     }
                 }
 
                 const d_w = try cuda.DeviceBuffer.upload(w);
                 defer d_w.free();
-                if (run.tensor) try cuda.deviceGemmTensor(t, d_w, d_x, d_y, M, K, N) else try cuda.deviceGemm(t, d_w, d_x, d_y, M, K, N);
+                if (run.imma) try cuda.deviceGemmImma(t, d_w, d_x, d_y, M, K, N) else if (run.tensor) try cuda.deviceGemmTensor(t, d_w, d_x, d_y, M, K, N) else try cuda.deviceGemm(t, d_w, d_x, d_y, M, K, N);
                 try cuda.synchronize();
                 const got = try allocator.alloc(f32, N * M);
                 defer allocator.free(got);
@@ -356,7 +374,7 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
                 for (0..N * M) |i| {
                     // f32 accumulation in a different order: error scales with the sum of magnitudes, not the result.
                     const rel: f64 = if (run.tensor) 1.1e-3 else 1e-4;
-                    const tol = rel * scale[i] + 1e-6;
+                    const tol = rel * scale[i] + 1e-6 + (if (run.imma) 1.02 * qbound[i] else 0);
                     if (@abs(@as(f64, got[i]) - want[i]) > tol) {
                         std.debug.print("format {s} token {d} row {d}: device {d} cpu {d} (tol {d})\n", .{ @tagName(t), i / M, i % M, got[i], want[i], tol });
                         return error.DeviceMismatch;

@@ -262,12 +262,12 @@ test "the CUDA engine matches the CPU on a long context (split-KV attention)" {
 /// Prompt attention has a matrix-unit kernel (Vulkan cooperative matrices, CUDA tensor cores) for head sizes 64 and 128
 /// (the tiny models elsewhere use 16, which runs the per-token kernel). The prompt arrives in two chunks, so the second starts at a position that is not a
 /// multiple of the kernel's 16 / 32 / 64 position tiles and attends over a cache the first one wrote.
-fn checkPromptAttention(head_dim: usize, backend: Choice) !void {
+fn checkPromptAttention(head_dim: usize, backend: Choice, q8: bool) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer gpa.free(dir);
-    const h = try makeModel(dir, "hd", .{ .arch = .qwen3, .dim = 4 * head_dim, .n_heads = 4, .n_kv = 2, .ffn = 256, .n_layers = 2, .ctx = 512 });
+    const h = try makeModel(dir, "hd", .{ .arch = .qwen3, .dim = 4 * head_dim, .n_heads = 4, .n_kv = 2, .ffn = 256, .n_layers = 2, .ctx = 512, .q8_0 = q8 });
     defer gpa.free(h);
     var reader = try hk.HKReader.open(h, gpa);
     defer reader.deinit();
@@ -291,31 +291,33 @@ fn checkPromptAttention(head_dim: usize, backend: Choice) !void {
     try cpu.forward(prompt[0..split], 0);
     const a = try gpa.dupe(f32, dev.logitsFor(split - 1));
     defer gpa.free(a);
-    try std.testing.expect(cosine(a, cpu.logitsFor(split - 1)) > 0.9999);
+    // Quantized weights: both engines quantize the activations to 8 bits, in different places, so they agree to ~3 digits.
+    const bar: f64 = if (q8) 0.999 else 0.9999;
+    try std.testing.expect(cosine(a, cpu.logitsFor(split - 1)) > bar);
     try dev.forward(prompt[split..], split);
     try cpu.forward(prompt[split..], split);
     // Every row of the second chunk, not just the last: each query attends over a different number of positions.
     for (0..prompt.len - split) |i| {
         const row = try gpa.dupe(f32, dev.logitsFor(i));
         defer gpa.free(row);
-        try std.testing.expect(cosine(row, cpu.logitsFor(i)) > 0.9999);
+        try std.testing.expect(cosine(row, cpu.logitsFor(i)) > bar);
     }
 }
 
 test "the Vulkan prompt attention matches the CPU at head size 64" {
-    try checkPromptAttention(64, .vulkan);
+    try checkPromptAttention(64, .vulkan, false);
 }
 
 test "the Vulkan prompt attention matches the CPU at head size 128" {
-    try checkPromptAttention(128, .vulkan);
+    try checkPromptAttention(128, .vulkan, false);
 }
 
 test "the CUDA prompt attention matches the CPU at head size 64" {
-    try checkPromptAttention(64, .cuda);
+    try checkPromptAttention(64, .cuda, false);
 }
 
 test "the CUDA prompt attention matches the CPU at head size 128" {
-    try checkPromptAttention(128, .cuda);
+    try checkPromptAttention(128, .cuda, false);
 }
 
 /// Partial offload: the first layers run on the device, the rest (and the embedding and output) on the CPU. The result
@@ -378,4 +380,9 @@ test "the Vulkan engine runs the leading layers and the CPU the rest" {
 test "the CUDA engine runs the leading layers and the CPU the rest" {
     try checkPartial(.cuda, 1);
     try checkPartial(.cuda, 3);
+}
+
+test "the CUDA integer tensor core kernel on a Q8_0 model matches the CPU over a prompt" {
+    try checkPromptAttention(64, .cuda, true);
+    try checkPromptAttention(128, .vulkan, true);
 }
