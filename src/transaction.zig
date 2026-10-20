@@ -94,7 +94,7 @@ pub fn begin(path: []const u8, allocator: std.mem.Allocator, scope: Scope) Error
     const size = (try file.stat(io)).size;
     var hdr_bytes: [header_len]u8 = undefined;
     if (size < header_len or (try file.readPositionalAll(io, &hdr_bytes, 0)) != header_len) return error.FileTooSmall;
-    const hdr: format.FileHeader = @bitCast(hdr_bytes);
+    const hdr = std.mem.bytesToValue(format.FileHeader, &hdr_bytes);
     if (!hdr.isValid()) return error.InvalidMagicOrVersion;
 
     const prefix_len: u64 = switch (scope) {

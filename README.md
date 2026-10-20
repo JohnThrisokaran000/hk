@@ -17,7 +17,7 @@ I built it because running models locally on an ordinary laptop was a bad experi
 ## Try it
 
 ```bash
-zig build -Doptimize=ReleaseFast        # needs Zig 0.16.0 or newer
+zig build -Doptimize=ReleaseFast        # needs Zig 0.17.0 or newer
 
 ./zig-out/bin/hk pull Qwen/Qwen3-0.6B
 ./zig-out/bin/hk run Qwen/Qwen3-0.6B "What is the capital of France?" --chat --temp 0
@@ -65,7 +65,7 @@ The `.hk` container and the Python package carry a number of research features t
 
 | What | How |
 |:---|:---|
-| CLI and server | build from source: `zig build -Doptimize=ReleaseFast` (Zig 0.16.0 or newer) |
+| CLI and server | build from source: `zig build -Doptimize=ReleaseFast` (Zig 0.17.0 or newer) |
 | Python package | `pip install hknt` (1.1.1 and later bundle the current native library and CLI; 1.1.0 has the old engine) |
 | Node.js | `npm install hkntf` |
 | C, C++, Rust, Go, C#, Java | bindings in [bindings/](bindings/) over the C header [include/hk.h](include/hk.h) |

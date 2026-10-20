@@ -62,7 +62,7 @@ pub const Server = struct {
         const port_s = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(gpa);
-        try argv.appendSlice(gpa, &.{ proc.exe_path, "serve", model, "--port", port_s, "--threads", "2" });
+        try argv.appendSlice(gpa, &.{ proc.exePath(), "serve", model, "--port", port_s, "--threads", "2" });
         try argv.appendSlice(gpa, extra);
         var child = try std.process.spawn(io, .{ .argv = argv.items, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
         errdefer child.kill(io);

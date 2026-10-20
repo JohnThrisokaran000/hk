@@ -9,7 +9,7 @@
 
 ## 1. What HK is
 
-A local LLM runtime and universal model container written in **Zig 0.16**. One binary pulls a model from
+A local LLM runtime and universal model container written in **Zig 0.17**. One binary pulls a model from
 Hugging Face, converts it to `.hk` while downloading (bounded memory), and runs it (CLI, chat, OpenAI-compatible
 server). Weights are memory-mapped and never copied. The owner's stated reason for existing: *memory efficiency
 done seriously* — "the most efficient option out there".
@@ -87,7 +87,7 @@ HK_KERNELS=avx2 hk run model.hk "hi"        # force a kernel level;  HK_GPU=1 or
 python3 docs/graph/gen_graph.py --check     # refresh/verify the knowledge graph
 ```
 
-Zig 0.16 specifics that bite: I/O goes through `std.Io` (`std.Options.debug_io`, `std.process.Init` for `main`),
+Zig 0.17 specifics that bite (on this machine the pacman `zig` is 0.16 — use `~/.local/bin/zig17`): optimize modes are `.debug/.safe/.fast/.small`; reflection is `field_names`/`field_values` (use `std.meta.fieldNames`, `std.enums.fromInt`); no `@bitCast` bytes→extern struct (use `std.mem.bytesToValue`); `b.getInstallPath` is gone, so e2e tests get the binary from `HK_EXE`; I/O goes through `std.Io` (`std.Options.debug_io`, `std.process.Init` for `main`),
 `std.Io.Dir.cwd().createFile(io, path, …)`; `build.zig` fans the kernel library out once per ISA level
 (`src/kernels/variants.zig`); never rely on the build machine's CPU features.
 

@@ -22,6 +22,11 @@ Work toward HK 2.0 (plan §150). Not released; no version number has been assign
 - C ABI additions: `hk_verify_integrity`, `hk_appendix_append_at` (explicit timestamp). `hk_appendix_append` now rejects an unknown entry type instead of casting the byte to an enum.
 - **Python:** `metadata_set`, `append_record` and `rollback_appendix` now run in the native library. The pure-Python implementations are removed (the metadata patcher left a stale seal and could corrupt an appendix; the appendix writers read the whole file into memory and rewrote it non-atomically). Without the native library they raise instead of falling back. `read_appendix` no longer loads the whole file when the native library is present.
 
+### Toolchain
+- **Zig 0.17 is now required** (0.16 no longer builds this repository). Mechanical changes: optimize modes `.debug/.fast`, reflection via `field_names`/`field_values`, no `**` array repetition, no `@bitCast` from bytes to an extern struct, and the install prefix is unknown while configuring (the e2e tests now receive the binary path in `HK_EXE`).
+- `test-e2e` runs are no longer result-cached. The cache key covered the test binary but not the `hk` executable it spawns, so after changing `hk` the suite could report green without running.
+- Why now: Zig 0.17's NVPTX target can compile kernels written in Zig (0.16 cannot export a kernel), which is how the CUDA backend will be built with no `nvcc`.
+
 ### Verification
 Unit tests 148/148 in Debug, ReleaseFast, `-Dcpu=x86_64_v3` and `-Dcpu=x86_64`; e2e 24/24; bindings 8 suites, 0 failed; Python 97 passed, 3 skipped (missing optional `openai`, `jax`, `tkinter`). Each new guard was disabled once to confirm its test fails. Not run: Windows, macOS, ARM.
 

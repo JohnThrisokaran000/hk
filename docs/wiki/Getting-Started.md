@@ -2,7 +2,7 @@
 
 ## Build
 
-hk needs [Zig 0.16](https://ziglang.org/download/) and nothing else. There are no system libraries to install.
+hk needs [Zig 0.17](https://ziglang.org/download/) and nothing else. There are no system libraries to install.
 
 ```bash
 git clone https://github.com/harshitkhandelwal208/hk.git

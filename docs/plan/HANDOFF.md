@@ -42,6 +42,14 @@ post-crash state by hand, no kill-9/power-loss harness; `hk_verify_integrity` is
 no `hk compact`/`hk fsck`; no signatures (an attacker can recompute the seal); `hk run` does not verify the seal at load (O(file) cost) —
 decide whether `hk pull` should.
 
+### A2. Toolchain moved to Zig 0.17 (branch `feat/hk-2.0-backends`)
+
+Owner asked for 0.17. `zig` on PATH is still 0.16 (pacman); 0.17 is `~/.local/bin/zig17`. Repo builds and passes on 0.17: unit 148/148 (Debug, ReleaseFast, v3, baseline),
+e2e 24/24 (now never cached), bindings 8/8 (needs a `zig`→0.17 shim on PATH), pytest 97/3. CI action pin changed to 0.17.0 but **CI was not run**.
+**Stage 0 spike result: GO** — a Zig-authored Q8_0 GEMV (shared memory, `shfl.sync`, `bar.sync`) compiled with
+`zig17 build-obj -target nvptx64-cuda -mcpu sm_86 -O ReleaseFast k.zig -fno-emit-bin -femit-asm=k.ptx`, loaded with `cuModuleLoadData`, ran on the RTX 3050
+and matched a CPU reference (rel err 1.25e-7). Shared memory must be file-scope `var x: [N]T addrspace(.shared)`. Spike files were in the scratchpad (not kept).
+
 ### B. Next: HK 2.0 — Unified Runtime (plan §150, §151)
 
 Milestone items: backend abstraction · CUDA engine · CUDA decode · CUDA prefill · CUDA attention · Vulkan under the common API ·

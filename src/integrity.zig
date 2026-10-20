@@ -43,7 +43,7 @@ fn canonicalHeader(header: format.FileHeader) [header_len]u8 {
 /// Computes the canonical container digest of an in-memory (usually mapped) container.
 pub fn digest(bytes: []const u8) Error![digest_len]u8 {
     if (bytes.len < header_len) return error.FileTooSmall;
-    const header: format.FileHeader = @bitCast(bytes[0..header_len].*);
+    const header = std.mem.bytesToValue(format.FileHeader, bytes[0..header_len]);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(&canonicalHeader(header));
     hasher.update(bytes[header_len..]);
@@ -62,7 +62,7 @@ fn digestFile(path: []const u8, allocator: std.mem.Allocator) Error!struct { hea
     if (size < header_len) return error.FileTooSmall;
     var header_bytes: [header_len]u8 = undefined;
     if ((try file.readPositionalAll(io, &header_bytes, 0)) != header_len) return error.FileTooSmall;
-    const header: format.FileHeader = @bitCast(header_bytes);
+    const header = std.mem.bytesToValue(format.FileHeader, &header_bytes);
     if (!header.isValid()) return error.InvalidMagicOrVersion;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -90,7 +90,7 @@ fn matches(header: format.FileHeader, computed: [digest_len]u8) bool {
 
 pub fn verify(bytes: []const u8) Error!Verification {
     if (bytes.len < header_len) return error.FileTooSmall;
-    const header: format.FileHeader = @bitCast(bytes[0..header_len].*);
+    const header = std.mem.bytesToValue(format.FileHeader, bytes[0..header_len]);
     if (!header.isValid()) return error.InvalidMagicOrVersion;
     if ((header.flags & format.HeaderFlags.HAS_SHA256_CHECKSUM) == 0) return .legacy_missing;
     return if (matches(header, try digest(bytes))) .valid else .invalid;

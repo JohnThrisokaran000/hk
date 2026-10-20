@@ -1,10 +1,10 @@
 name: 'Setup Zig'
-description: 'Install official Zig 0.16.0 binaries directly from ziglang.org'
+description: 'Install official Zig 0.17.0 binaries directly from ziglang.org'
 inputs:
   version:
     description: 'Zig version to install'
     required: false
-    default: '0.16.0'
+    default: '0.17.0'
 
 runs:
   using: 'composite'

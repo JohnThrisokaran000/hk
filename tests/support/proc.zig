@@ -18,8 +18,13 @@ pub const Result = struct {
     }
 };
 
-/// Path of the hk executable under test, installed by the build before the tests run.
-pub const exe_path = @import("test_options").hk_exe;
+/// Path of the hk executable under test. The build installs it before the tests run and passes the path in
+/// `HK_EXE` (Zig 0.17 no longer knows the install prefix while configuring, so it cannot be compiled in).
+/// POSIX only: `getPosix` is not available on Windows, where these tests have not been run.
+pub fn exePath() []const u8 {
+    return std.testing.environ.getPosix("HK_EXE") orelse
+        @panic("HK_EXE is not set; run these tests through `zig build test-e2e`");
+}
 
 pub fn run(
     gpa: std.mem.Allocator,
@@ -39,7 +44,7 @@ pub fn runEnv(
 ) !Result {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
-    try argv.append(gpa, exe_path);
+    try argv.append(gpa, exePath());
     try argv.appendSlice(gpa, args);
 
     var stdin_file: ?std.Io.File = null;

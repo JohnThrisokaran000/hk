@@ -1823,7 +1823,8 @@ test "streamed conversion output is sealed and leaves no partial file" {
     }};
     var w = try hk.convert.stream_writer.StreamWriter.begin(allocator, io, fx.path, &meta, &specs, hk.format.DEFAULT_ALIGNMENT_BYTES);
     defer w.deinit();
-    try w.write(0, 0, &([_]u8{7} ** 64));
+    const payload: [64]u8 = @splat(7);
+    try w.write(0, 0, &payload);
     try w.finish();
 
     try std.testing.expectEqual(hk.integrity.Verification.valid, try hk.integrity.verifyFile(fx.path, allocator));

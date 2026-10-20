@@ -63,8 +63,8 @@ comptime {
 /// walks one level of modules itself: each public module declaration is a namespace whose own declarations are
 /// referenced, which is what makes their `test` blocks reachable.
 fn refModule(comptime T: type) void {
-    inline for (comptime std.meta.declarations(T)) |d| {
-        const decl = @field(T, d.name);
+    inline for (comptime std.meta.declarations(T)) |decl_name| {
+        const decl = @field(T, decl_name);
         if (@TypeOf(decl) == type) {
             switch (@typeInfo(decl)) {
                 .@"struct" => refModule(decl),

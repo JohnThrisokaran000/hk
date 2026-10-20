@@ -184,7 +184,8 @@ test "server end to end" {
 
     // The prompt cache reuses a shared prefix.
     {
-        const long = "shared system text " ** 6;
+        const unit = "shared system text ";
+        const long = unit ++ unit ++ unit ++ unit ++ unit ++ unit;
         const b1 = "{\"messages\":[{\"role\":\"system\",\"content\":\"" ++ long ++ "\"},{\"role\":\"user\",\"content\":\"one\"}],\"temperature\":0,\"max_tokens\":4}";
         const b2 = "{\"messages\":[{\"role\":\"system\",\"content\":\"" ++ long ++ "\"},{\"role\":\"user\",\"content\":\"two\"}],\"temperature\":0,\"max_tokens\":4}";
         const r1 = try srv.post("/v1/chat/completions", b1, &.{});

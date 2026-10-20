@@ -1225,10 +1225,7 @@ pub export fn hk_writer_add_metadata_json(writer_ptr: ?*hk_writer_t, key_c: [*:0
 /// Converts a raw byte to an enum value only if it names a declared tag, so untrusted
 /// input can never produce an invalid enum (undefined behavior in safe builds).
 fn safeEnum(comptime E: type, val: u8) ?E {
-    inline for (@typeInfo(E).@"enum".fields) |f| {
-        if (val == f.value) return @enumFromInt(val);
-    }
-    return null;
+    return std.enums.fromInt(E, val);
 }
 
 fn safeStorageType(val: u8) ?format.StorageType {

@@ -374,9 +374,9 @@ pub const Context = struct {
         }
 
         var fns: Fns = undefined;
-        inline for (@typeInfo(Fns).@"struct".fields) |fld| {
-            const name = "vk" ++ [_]u8{std.ascii.toUpper(fld.name[0])} ++ fld.name[1..];
-            @field(fns, fld.name) = @ptrCast(get_dev_proc(device, name) orelse return error.NoVulkan);
+        inline for (comptime std.meta.fieldNames(Fns)) |fld_name| {
+            const name = "vk" ++ [_]u8{std.ascii.toUpper(fld_name[0])} ++ fld_name[1..];
+            @field(fns, fld_name) = @ptrCast(get_dev_proc(device, name) orelse return error.NoVulkan);
         }
 
         var queue: c.VkQueue = null;

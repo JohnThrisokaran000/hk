@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "kernels",
         "Kernel instruction set levels to build: all, fallback, or a comma separated list (default: all, fallback for Debug)",
-    ) orelse if (optimize == .Debug) "fallback" else "all";
+    ) orelse if (optimize == .debug) "fallback" else "all";
 
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "cuda", cuda_enabled);
@@ -133,8 +133,10 @@ pub fn build(b: *std.Build) void {
 
     // End to end tests of the command line and the server, run against the installed executable.
     {
-        const test_opts = b.addOptions();
-        test_opts.addOption([]const u8, "hk_exe", b.getInstallPath(.bin, cli_exe.out_filename));
+        // The tests run the installed binary. The install prefix is not known while configuring, so the
+        // path is passed through the environment, relative to the build root, assuming the default `zig-out`
+        // prefix (set HK_EXE yourself when using --prefix).
+        const hk_exe = b.fmt("zig-out/bin/{s}", .{cli_exe.out_filename});
         const e2e_step = b.step("test-e2e", "Run the command line and server end to end tests (builds and installs hk first)");
         const suites = [_]struct { file: []const u8, name: []const u8 }{
             .{ .file = "tests/cli_tests.zig", .name = "hk-cli-tests" },
@@ -146,10 +148,14 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(suite.file),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "test_options", .module = test_opts.createModule() }},
             });
             const t = b.addTest(.{ .name = suite.name, .root_module = mod });
             const run = b.addRunArtifact(t);
+            run.setCwd(b.path("."));
+            run.setEnvironmentVariable("HK_EXE", hk_exe);
+            // The cache key covers the test binary, not the hk executable it spawns, so a cached result would
+            // go stale (and pass) after hk changes. Always run.
+            run.has_side_effects = true;
             run.step.dependOn(b.getInstallStep());
             e2e_step.dependOn(&run.step);
         }
@@ -263,7 +269,7 @@ fn addKernelLevels(
 
         var q = target.query;
         q.cpu_arch = arch;
-        q.cpu_model = .{ .explicit = std.Target.Cpu.Arch.parseCpuModel(arch, v.model) catch
+        q.cpu_model = .{ .explicit = std.Target.Cpu.Arch.parseCpuModel(arch, v.model) orelse
             std.debug.panic("unknown cpu model {s}", .{v.model}) };
         q.cpu_features_add = std.Target.Cpu.Feature.Set.empty;
         for (v.add) |fname| {
