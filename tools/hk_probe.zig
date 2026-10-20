@@ -156,7 +156,7 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     defer allocator.free(prompt);
     for (prompt, 0..) |*t, i| t.* = @intCast(1 + (i * 7919) % (model.cfg.vocab - 1));
 
-    model.profile.enabled = true;
+    model.cpu.profile.enabled = true;
     printMem(io, "loaded");
     const t0 = nowNs(io);
     var pos: usize = 0;
@@ -166,8 +166,8 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
         pos += n;
     }
     const t1 = nowNs(io);
-    printProfile("prefill", &model.profile);
-    model.profile = .{ .enabled = true };
+    printProfile("prefill", &model.cpu.profile);
+    model.cpu.profile = .{ .enabled = true };
     if (vkEngine(model)) |g| {
         g.kind_ns = @splat(0);
         g.prof_record = 0;
@@ -187,7 +187,7 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
         tok = @intCast(best);
     }
     const t2 = nowNs(io);
-    printProfile("decode ", &model.profile);
+    printProfile("decode ", &model.cpu.profile);
     if (vkEngine(model)) |g| if (g.tq != null) {
         const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add" };
         std.debug.print("gpu kernels (ms per token):", .{});
@@ -199,7 +199,7 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     const pf = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
     const dc = @as(f64, @floatFromInt(t2 - t1)) / 1e9;
     std.debug.print("prefill {d} tok in {d:.3}s = {d:.1} tok/s | decode {d} tok in {d:.3}s = {d:.1} tok/s | threads {d}\n", .{
-        n_prompt, pf, @as(f64, @floatFromInt(n_prompt)) / pf, n_gen, dc, @as(f64, @floatFromInt(n_gen)) / dc, model.pool.size(),
+        n_prompt, pf, @as(f64, @floatFromInt(n_prompt)) / pf, n_gen, dc, @as(f64, @floatFromInt(n_gen)) / dc, model.cpu.pool.size(),
     });
 }
 
@@ -225,7 +225,7 @@ fn multi(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_se
 
     var t_fwd: i128 = 0;
     var t_log: i128 = 0;
-    model.profile = .{ .enabled = true };
+    model.cpu.profile = .{ .enabled = true };
     const t0 = nowNs(io);
     for (0..n_gen) |step| {
         for (items, 0..) |*it, i| it.* = .{ .kv = &caches[i], .token = toks[i], .pos = @intCast(step) };
@@ -248,7 +248,7 @@ fn multi(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_se
     }
     const t1 = nowNs(io);
     const secs = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
-    printProfile("multi  ", &model.profile);
+    printProfile("multi  ", &model.cpu.profile);
     const ms = struct {
         fn f(x: i128) f64 {
             return @as(f64, @floatFromInt(x)) / 1e6;

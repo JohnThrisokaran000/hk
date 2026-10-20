@@ -1,23 +1,16 @@
-//! Decoder only transformer inference on the CPU.
+//! Decoder only transformer inference.
 //!
-//! Memory behaviour is the point of this file:
-//!   * weights are views into the mapped container, never copied or converted;
-//!   * the KV cache is f16 and grows in segments of `seg_len` positions as the context fills,
-//!     so resident size follows the real context length rather than `n_ctx`, whatever the
-//!     kernel's transparent huge page setting is;
-//!   * attention is a single pass with an online softmax, so its scratch is a few hundred
-//!     bytes on the stack no matter how long the context is;
-//!   * every buffer a forward pass needs is allocated once in `init`.
+//! `Model` owns what every executor shares (configuration, the mapped weights, the default KV cache, rope
+//! frequencies) and hands each forward pass to an executor: the CPU one in `cpu_backend.zig`, or a device
+//! backend when the whole network fits on one. Memory behaviour of the CPU path is described there.
 
 const std = @import("std");
 const reader_mod = @import("../reader.zig");
-const pool_mod = @import("../pool.zig");
 const quant = @import("../quant.zig");
 const config_mod = @import("config.zig");
 const weights_mod = @import("weights.zig");
-const matmul = @import("matmul.zig");
+const cpu_mod = @import("cpu_backend.zig");
 const kv_mod = @import("kv.zig");
-const attention_mod = @import("attention.zig");
 const kernels = @import("../kernels.zig");
 const cores = @import("../cores.zig");
 const gpu_mod = @import("../vk/engine.zig");
@@ -26,8 +19,6 @@ const ops = @import("ops.zig");
 
 pub const Config = config_mod.Config;
 pub const Diag = config_mod.Diag;
-const vecdot = quant.vecdot;
-const Mat = weights_mod.Mat;
 
 pub const Options = struct {
     /// Total threads including the caller. 0 picks one per physical core.
@@ -66,27 +57,12 @@ pub const InitError = config_mod.ConfigError || weights_mod.LoadError || std.Thr
 pub const KvCache = kv_mod.KvCache;
 pub const Item = kv_mod.Item;
 
-/// Wall time per phase of the forward pass, filled in only when `Model.profile` is set.
-pub const Profile = struct {
-    enabled: bool = false,
-    embed: i128 = 0,
-    norm: i128 = 0,
-    prepare: i128 = 0,
-    qkv: i128 = 0,
-    rope: i128 = 0,
-    kv: i128 = 0,
-    attn: i128 = 0,
-    wo: i128 = 0,
-    ffn_in: i128 = 0,
-    act: i128 = 0,
-    ffn_down: i128 = 0,
-};
+pub const Profile = cpu_mod.Profile;
 
 pub const Model = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     weights: weights_mod.Weights,
-    pool: pool_mod.Pool,
     n_ctx: usize,
     n_batch: usize,
 
@@ -95,30 +71,10 @@ pub const Model = struct {
 
     inv_freq: []f32,
     rope_mscale: f32,
-    cos: []f32,
-    sin: []f32,
 
-    x: []f32,
-    xb: []f32,
-    tmp: []f32,
-    q: []f32,
-    k: []f32,
-    v: []f32,
-    att: []f32,
-    gate: []f32,
-    up: []f32,
-    logits: []f32,
-    /// Output rows for `logitsMany`, grown on demand. Sized by the number of rows asked for, not
-    /// by the batch size, since a row is vocabulary sized.
-    logits_many: []f32 = &.{},
-
-    acts: []vecdot.Act,
-    a8_pool: []vecdot.BlockA8,
-    q8k_pool: []vecdot.BlockQ8K,
-    a8_stride: usize,
-    q8k_stride: usize,
-    profile: Profile = .{},
-    attn_part: attention_mod.Partials = .{},
+    /// The CPU executor. It exists even when a device runs the network, as before this split; creating
+    /// it lazily would save its pool and scratch on GPU runs (a follow-up, not done here).
+    cpu: cpu_mod.Cpu,
     /// The device backend, when the network runs on one (the CPU path lives in this struct).
     gpu: ?backend_mod.Device = null,
     /// Why the GPU is not in use, when it was asked for and could not be.
@@ -138,8 +94,6 @@ pub const Model = struct {
 
         _ = kernels.get(); // pick the instruction set level before any worker runs
         const n_threads = if (opts.n_threads != 0) opts.n_threads else defaultThreads();
-        var pool = try pool_mod.Pool.init(allocator, n_threads);
-        errdefer pool.deinit();
 
         const n_ctx = if (opts.n_ctx != 0) opts.n_ctx else @min(cfg.ctx_train, 8192);
         const nb = @max(1, opts.n_batch);
@@ -151,74 +105,22 @@ pub const Model = struct {
         const inv_freq = try allocator.alloc(f32, half);
         errdefer allocator.free(inv_freq);
         ops.ropeInvFreq(inv_freq, cfg.rope_base, cfg.rope_dim, cfg.rope_scaling, w.rope_freqs);
-        // One angle table per token of a batch.
-        const cos = try allocator.alloc(f32, nb * half);
-        errdefer allocator.free(cos);
-        const sin = try allocator.alloc(f32, nb * half);
-        errdefer allocator.free(sin);
+        const rope_mscale = ops.ropeMscale(cfg.rope_scaling);
 
-        const max_in = @max(cfg.dim, @max(cfg.qDim(), cfg.ffn_dim));
-        const a8_stride = max_in / 32 + 1;
-        const q8k_stride = max_in / 256 + 1;
+        var cpu = try cpu_mod.Cpu.init(allocator, cfg, n_threads, nb, inv_freq, rope_mscale);
+        errdefer cpu.deinit();
 
         var m = Model{
             .allocator = allocator,
             .cfg = cfg,
             .weights = w,
-            .pool = pool,
             .n_ctx = n_ctx,
             .n_batch = nb,
             .kv = kv,
             .inv_freq = inv_freq,
-            .rope_mscale = ops.ropeMscale(cfg.rope_scaling),
-            .cos = cos,
-            .sin = sin,
-            .x = undefined,
-            .xb = undefined,
-            .tmp = undefined,
-            .q = undefined,
-            .k = undefined,
-            .v = undefined,
-            .att = undefined,
-            .gate = undefined,
-            .up = undefined,
-            .logits = undefined,
-            .acts = undefined,
-            .a8_pool = undefined,
-            .q8k_pool = undefined,
-            .a8_stride = a8_stride,
-            .q8k_stride = q8k_stride,
+            .rope_mscale = rope_mscale,
+            .cpu = cpu,
         };
-
-        // Scratch. Allocated one by one so a failure frees exactly what exists.
-        var made: usize = 0;
-        errdefer m.freeScratch(made);
-        m.x = try allocator.alloc(f32, nb * cfg.dim);
-        made += 1;
-        m.xb = try allocator.alloc(f32, nb * cfg.dim);
-        made += 1;
-        m.tmp = try allocator.alloc(f32, nb * cfg.dim);
-        made += 1;
-        m.q = try allocator.alloc(f32, nb * cfg.qDim());
-        made += 1;
-        m.k = try allocator.alloc(f32, nb * cfg.kvDim());
-        made += 1;
-        m.v = try allocator.alloc(f32, nb * cfg.kvDim());
-        made += 1;
-        m.att = try allocator.alloc(f32, nb * cfg.qDim());
-        made += 1;
-        m.gate = try allocator.alloc(f32, nb * cfg.ffn_dim);
-        made += 1;
-        m.up = try allocator.alloc(f32, nb * cfg.ffn_dim);
-        made += 1;
-        m.logits = try allocator.alloc(f32, cfg.vocab);
-        made += 1;
-        m.acts = try allocator.alloc(vecdot.Act, nb);
-        made += 1;
-        m.a8_pool = try allocator.alloc(vecdot.BlockA8, nb * a8_stride);
-        made += 1;
-        m.q8k_pool = try allocator.alloc(vecdot.BlockQ8K, nb * q8k_stride);
-        made += 1;
 
         if (opts.gpu != .off) m.tryGpu(opts, diag) catch |e| {
             if (opts.gpu == .on) {
@@ -281,75 +183,17 @@ pub const Model = struct {
         if (self.gpu) |g| g.release(kv);
     }
 
-    fn freeScratch(self: *Model, made: usize) void {
-        const a = self.allocator;
-        if (made > 0) a.free(self.x);
-        if (made > 1) a.free(self.xb);
-        if (made > 2) a.free(self.tmp);
-        if (made > 3) a.free(self.q);
-        if (made > 4) a.free(self.k);
-        if (made > 5) a.free(self.v);
-        if (made > 6) a.free(self.att);
-        if (made > 7) a.free(self.gate);
-        if (made > 8) a.free(self.up);
-        if (made > 9) a.free(self.logits);
-        if (made > 10) a.free(self.acts);
-        if (made > 11) a.free(self.a8_pool);
-        if (made > 12) a.free(self.q8k_pool);
-    }
-
     pub fn deinit(self: *Model) void {
         if (self.gpu) |g| g.destroy(self.allocator);
-        self.freeScratch(13);
-        self.allocator.free(self.cos);
-        self.allocator.free(self.sin);
+        self.cpu.deinit();
         self.allocator.free(self.inv_freq);
         self.kv.deinit();
-        if (self.logits_many.len != 0) self.allocator.free(self.logits_many);
-        self.attn_part.deinit(self.allocator);
-        self.pool.deinit();
         self.weights.deinit();
     }
 
     fn defaultThreads() usize {
         // Decoding is memory bound, so hyper threads add contention and little throughput.
         return cores.physicalCores(std.Options.debug_io);
-    }
-
-    /// Points `n` activation slots at consecutive rows of `src` (row length `len`).
-    fn initActs(self: *Model, src: []const f32, len: usize, n: usize) void {
-        for (0..n) |t| {
-            self.acts[t] = vecdot.Act.init(
-                src[t * len ..][0..len],
-                self.a8_pool[t * self.a8_stride ..],
-                self.q8k_pool[t * self.q8k_stride ..],
-            );
-        }
-    }
-
-    inline fn tick(self: *const Model) i128 {
-        if (!self.profile.enabled) return 0;
-        return std.Io.Timestamp.now(std.Options.debug_io, .awake).nanoseconds;
-    }
-
-    inline fn lap(self: *Model, comptime field: []const u8, since: *i128) void {
-        if (!self.profile.enabled) return;
-        const now = std.Io.Timestamp.now(std.Options.debug_io, .awake).nanoseconds;
-        @field(self.profile, field) += now - since.*;
-        since.* = now;
-    }
-
-    fn prepare(self: *Model, n: usize, mats: []const Mat) void {
-        var need_a8 = false;
-        var need_q8k = false;
-        for (mats) |m| switch (vecdot.actKind(m.t)) {
-            .a8 => need_a8 = true,
-            .q8k => need_q8k = true,
-            .f32 => {},
-        };
-        const k = kernels.get();
-        if (need_a8) k.prepare(self.acts[0..n], .a8);
-        if (need_q8k) k.prepare(self.acts[0..n], .q8k);
     }
 
     /// Runs `tokens` through the network at positions `pos .. pos + tokens.len` and leaves the
@@ -368,7 +212,7 @@ pub const Model = struct {
     }
 
     /// Runs one forward pass over `items`, which may come from different sequences. The hidden
-    /// state of item `i` ends up in `x[i]`; read predictions with `logitsFor(i)`.
+    /// state of item `i` ends up in the executor's activations; read predictions with `logitsFor(i)`.
     pub fn forwardItems(self: *Model, items: []const Item) Error!void {
         const n = items.len;
         const cfg = self.cfg;
@@ -377,7 +221,6 @@ pub const Model = struct {
         for (items) |it| {
             if (it.pos >= it.kv.n_ctx) return error.ContextFull;
             if (it.token >= cfg.vocab) return error.TokenOutOfRange;
-            if (self.gpu == null) try it.kv.ensure(it.pos + 1);
         }
         if (self.gpu) |g| {
             g.forward(items) catch |e| return switch (e) {
@@ -387,105 +230,20 @@ pub const Model = struct {
             };
             return;
         }
-
-        for (items, 0..) |it, t| {
-            const row = self.weights.tok_embd.data[it.token * self.weights.tok_embd.rowBytes() ..][0..self.weights.tok_embd.rowBytes()];
-            quant.dequantizeRow(self.weights.tok_embd.t, row, self.x[t * cfg.dim ..][0..cfg.dim]) catch unreachable;
-        }
-
-        const half = cfg.rope_dim / 2;
-        for (items, 0..) |it, t| ops.ropeAngles(self.cos[t * half ..][0..half], self.sin[t * half ..][0..half], self.inv_freq, it.pos, self.rope_mscale);
-
-        const qd = cfg.qDim();
-        const kd = cfg.kvDim();
-
-        for (self.weights.layers, 0..) |*l, li| {
-            // Attention block.
-            var t0 = self.tick();
-            kernels.get().rms_norm_rows(self.xb, self.x, l.attn_norm, cfg.rms_eps, n, cfg.dim);
-            self.lap("norm", &t0);
-            self.initActs(self.xb, cfg.dim, n);
-            self.prepare(n, &.{ l.wq, l.wk, l.wv });
-            self.lap("prepare", &t0);
-            matmul.runParts(&self.pool, &.{
-                .{ .mat = l.wq, .y = self.q, .bias = l.bq },
-                .{ .mat = l.wk, .y = self.k, .bias = l.bk },
-                .{ .mat = l.wv, .y = self.v, .bias = l.bv },
-            }, self.acts[0..n], &.{});
-            self.lap("qkv", &t0);
-
-            kernels.get().qk_rope(&.{
-                .q = self.q,
-                .k = self.k,
-                .n = n,
-                .q_dim = qd,
-                .kv_dim = kd,
-                .head_dim = cfg.head_dim,
-                .q_norm = l.q_norm,
-                .k_norm = l.k_norm,
-                .eps = cfg.rms_eps,
-                .cos = self.cos,
-                .sin = self.sin,
-                .half = half,
-                .style = cfg.rope_style,
-            });
-
-            self.lap("rope", &t0);
-            // All keys and values of the batch go in first so a token can see its predecessors.
-            for (items, 0..) |it, t| {
-                for (0..cfg.n_kv_heads) |g| {
-                    it.kv.write(li, g, it.pos, self.k[t * kd + g * cfg.head_dim ..][0..cfg.head_dim], self.v[t * kd + g * cfg.head_dim ..][0..cfg.head_dim]);
-                }
-            }
-            self.lap("kv", &t0);
-            self.pool.hintNext(l.wo.data);
-            try self.attention(li, items);
-            self.lap("attn", &t0);
-
-            self.initActs(self.att, qd, n);
-            self.prepare(n, &.{l.wo});
-            matmul.runParts(&self.pool, &.{.{ .mat = l.wo, .y = self.tmp }}, self.acts[0..n], l.w_gate.data);
-            kernels.get().add_in_place(self.x[0 .. n * cfg.dim], self.tmp[0 .. n * cfg.dim]);
-            self.lap("wo", &t0);
-
-            // Feed forward block.
-            kernels.get().rms_norm_rows(self.xb, self.x, l.ffn_norm, cfg.rms_eps, n, cfg.dim);
-            self.initActs(self.xb, cfg.dim, n);
-            self.prepare(n, &.{ l.w_gate, l.w_up });
-            matmul.runParts(&self.pool, &.{
-                .{ .mat = l.w_gate, .y = self.gate },
-                .{ .mat = l.w_up, .y = self.up },
-            }, self.acts[0..n], l.w_down.data);
-            self.lap("ffn_in", &t0);
-            kernels.get().swiglu(self.gate[0 .. n * cfg.ffn_dim], self.up[0 .. n * cfg.ffn_dim]);
-            self.lap("act", &t0);
-
-            self.initActs(self.gate, cfg.ffn_dim, n);
-            self.prepare(n, &.{l.w_down});
-            const after = if (li + 1 < self.weights.layers.len) self.weights.layers[li + 1].wq.data else self.weights.output.data;
-            matmul.runParts(&self.pool, &.{.{ .mat = l.w_down, .y = self.tmp }}, self.acts[0..n], after);
-            kernels.get().add_in_place(self.x[0 .. n * cfg.dim], self.tmp[0 .. n * cfg.dim]);
-            self.lap("ffn_down", &t0);
-        }
+        try self.cpu.forward(&self.weights, items);
     }
 
     /// Next token logits for the token at index `t` of the last `forward` batch. The slice is
     /// reused by the next call.
     pub fn logitsFor(self: *Model, t: usize) []const f32 {
         if (self.gpu) |g| return g.logits(&.{t}) catch @panic("the GPU failed while reading logits");
-        const cfg = self.cfg;
-        kernels.get().rms_norm_rows(self.xb, self.x[t * cfg.dim ..][0..cfg.dim], self.weights.out_norm, cfg.rms_eps, 1, cfg.dim);
-        self.initActs(self.xb, cfg.dim, 1);
-        self.prepare(1, &.{self.weights.output});
-        matmul.run(&self.pool, self.weights.output, self.acts[0..1], self.logits, null);
-        return self.logits;
+        return self.cpu.logitsFor(&self.weights, t);
     }
 
     /// Predictions for several items of the last pass at once. The output matrix is read a
     /// single time for all of them, so serving N sequences costs one sweep of it per step, not
     /// N. Row `k` of the result (vocabulary sized) belongs to `indices[k]`.
     pub fn logitsMany(self: *Model, indices: []const usize) Error![]const f32 {
-        const cfg = self.cfg;
         const n = indices.len;
         if (n == 0) return &.{};
         if (n > self.n_batch) return error.BatchTooLarge;
@@ -493,21 +251,6 @@ pub const Model = struct {
             if (n > g.maxRows()) return error.BatchTooLarge;
             return g.logits(indices) catch error.GpuFailed;
         }
-        if (self.logits_many.len < n * cfg.vocab) {
-            if (self.logits_many.len != 0) self.allocator.free(self.logits_many);
-            self.logits_many = &.{};
-            self.logits_many = try self.allocator.alloc(f32, n * cfg.vocab);
-        }
-        for (indices, 0..) |idx, k| {
-            kernels.get().rms_norm_rows(self.xb[k * cfg.dim ..][0..cfg.dim], self.x[idx * cfg.dim ..][0..cfg.dim], self.weights.out_norm, cfg.rms_eps, 1, cfg.dim);
-        }
-        self.initActs(self.xb, cfg.dim, n);
-        self.prepare(n, &.{self.weights.output});
-        matmul.run(&self.pool, self.weights.output, self.acts[0..n], self.logits_many, null);
-        return self.logits_many[0 .. n * cfg.vocab];
-    }
-
-    fn attention(self: *Model, layer: usize, items: []const Item) Error!void {
-        try attention_mod.run(&self.pool, self.allocator, &self.attn_part, self.cfg, layer, items, self.q, self.att);
+        return self.cpu.logitsMany(&self.weights, indices);
     }
 };

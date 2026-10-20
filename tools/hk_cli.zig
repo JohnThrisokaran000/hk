@@ -1718,7 +1718,7 @@ fn printStats(l: *Loaded, st: GenStats) void {
         m.rss_mib,
         m.anon_mib,
         m.file_mib,
-        l.model.pool.size(),
+        l.model.cpu.pool.size(),
     });
 }
 

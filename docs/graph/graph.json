@@ -5,8 +5,8 @@
  "stats": {
   "curated_nodes": 79,
   "curated_edges": 153,
-  "file_nodes": 168,
-  "import_edges": 375,
+  "file_nodes": 171,
+  "import_edges": 387,
   "unowned_files": 0,
   "status_counts": {
    "done": 8,
@@ -1526,6 +1526,22 @@
    "owner": "backend-abstraction"
   },
   {
+   "id": "file:src/backend/caps.zig",
+   "type": "file",
+   "label": "src/backend/caps.zig",
+   "lang": "zig",
+   "loc": 64,
+   "owner": "backend-abstraction"
+  },
+  {
+   "id": "file:src/backend/select.zig",
+   "type": "file",
+   "label": "src/backend/select.zig",
+   "lang": "zig",
+   "loc": 222,
+   "owner": "backend-abstraction"
+  },
+  {
    "id": "file:src/buf.zig",
    "type": "file",
    "label": "src/buf.zig",
@@ -1694,6 +1710,14 @@
    "owner": "engine"
   },
   {
+   "id": "file:src/engine/cpu_backend.zig",
+   "type": "file",
+   "label": "src/engine/cpu_backend.zig",
+   "lang": "zig",
+   "loc": 350,
+   "owner": "engine"
+  },
+  {
    "id": "file:src/engine/kv.zig",
    "type": "file",
    "label": "src/engine/kv.zig",
@@ -1714,7 +1738,7 @@
    "type": "file",
    "label": "src/engine/model.zig",
    "lang": "zig",
-   "loc": 513,
+   "loc": 256,
    "owner": "engine"
   },
   {
@@ -2386,7 +2410,7 @@
    "type": "file",
    "label": "tests/tiny_model_tool.zig",
    "lang": "zig",
-   "loc": 18,
+   "loc": 25,
    "owner": "tests-suite"
   },
   {
@@ -3399,6 +3423,11 @@
   },
   {
    "s": "engine",
+   "t": "file:src/engine/cpu_backend.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "engine",
    "t": "file:src/engine/matmul.zig",
    "type": "implemented_by"
   },
@@ -3940,6 +3969,16 @@
   {
    "s": "backend-abstraction",
    "t": "file:src/backend/backend.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "backend-abstraction",
+   "t": "file:src/backend/caps.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "backend-abstraction",
+   "t": "file:src/backend/select.zig",
    "type": "implemented_by"
   },
   {
@@ -4573,6 +4612,31 @@
    "type": "imports"
   },
   {
+   "s": "file:src/backend/caps.zig",
+   "t": "file:src/engine/weights.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/caps.zig",
+   "t": "file:src/format.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/caps.zig",
+   "t": "file:src/quant.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/caps.zig",
+   "t": "file:src/vk/engine.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/backend/select.zig",
+   "t": "file:src/backend/caps.zig",
+   "type": "imports"
+  },
+  {
    "s": "file:src/c_api.zig",
    "t": "file:src/adaptive.zig",
    "type": "imports"
@@ -4928,6 +4992,51 @@
    "type": "imports"
   },
   {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/engine/attention.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/engine/config.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/engine/kv.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/engine/matmul.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/engine/ops.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/engine/weights.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/kernels.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/pool.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/cpu_backend.zig",
+   "t": "file:src/quant.zig",
+   "type": "imports"
+  },
+  {
    "s": "file:src/engine/kv.zig",
    "t": "file:src/engine/config.zig",
    "type": "imports"
@@ -4964,22 +5073,17 @@
   },
   {
    "s": "file:src/engine/model.zig",
-   "t": "file:src/engine/attention.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/engine/model.zig",
    "t": "file:src/engine/config.zig",
    "type": "imports"
   },
   {
    "s": "file:src/engine/model.zig",
-   "t": "file:src/engine/kv.zig",
+   "t": "file:src/engine/cpu_backend.zig",
    "type": "imports"
   },
   {
    "s": "file:src/engine/model.zig",
-   "t": "file:src/engine/matmul.zig",
+   "t": "file:src/engine/kv.zig",
    "type": "imports"
   },
   {
@@ -4995,11 +5099,6 @@
   {
    "s": "file:src/engine/model.zig",
    "t": "file:src/kernels.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/engine/model.zig",
-   "t": "file:src/pool.zig",
    "type": "imports"
   },
   {
@@ -5992,11 +6091,26 @@
   {
    "s": "backend-abstraction",
    "t": "backend-vulkan",
+   "imports": 2
+  },
+  {
+   "s": "backend-abstraction",
+   "t": "engine",
+   "imports": 1
+  },
+  {
+   "s": "backend-abstraction",
+   "t": "format-core",
    "imports": 1
   },
   {
    "s": "backend-abstraction",
    "t": "kv-cache",
+   "imports": 1
+  },
+  {
+   "s": "backend-abstraction",
+   "t": "quant-formats",
    "imports": 1
   },
   {
@@ -6137,17 +6251,17 @@
   {
    "s": "engine",
    "t": "kernels-engine",
-   "imports": 3
-  },
-  {
-   "s": "engine",
-   "t": "kv-cache",
    "imports": 4
   },
   {
    "s": "engine",
+   "t": "kv-cache",
+   "imports": 5
+  },
+  {
+   "s": "engine",
    "t": "quant-formats",
-   "imports": 3
+   "imports": 4
   },
   {
    "s": "format-core",
