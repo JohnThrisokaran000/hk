@@ -34,10 +34,12 @@ If you already have a GGUF file, convert it once with `hk convert-gguf model.ggu
 ## Use the GPU
 
 ```bash
-hk run model.hk "Hello" -ngl 99          # Vulkan, whole model on the GPU if it fits
+hk run model.hk "Hello"                  # uses a CUDA or Vulkan device when there is one that takes the model
+hk run model.hk "Hello" -ngl 20          # exactly the first 20 layers on the device, the rest on the CPU
+hk run model.hk "Hello" -ngl 0           # CPU only (also --backend cpu, HK_GPU=0)
 ```
 
-Without `-ngl` (and without `HK_GPU=1` in the environment) everything runs on the CPU. When the GPU cannot be used, hk says why and carries on with the CPU. See [Hardware and Kernels](Hardware-and-Kernels.md).
+hk picks a device by itself: CUDA when the card has tensor cores (compute capability 8.0 and newer), otherwise Vulkan. A model that does not fit in device memory runs its leading layers on the device and the rest on the CPU. hk prints `[gpu] running on ...` when it uses a device, and says why when a device exists but could not take the model. See [Hardware and Kernels](Hardware-and-Kernels.md).
 
 ## Check that it works
 

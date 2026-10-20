@@ -60,7 +60,7 @@ Single NVIDIA GeForce RTX 3050 6GB Laptop GPU, Vulkan, same GGUF-derived models,
 | SmolLM2-135M f16 | 5927 | 18691 | 32% | 222 | 275 | 81% |
 | Qwen3-0.6B Q8_0 | 1528 | 6394 | 24% | 112 | 151 | 74% |
 
-**The GPU backend is substantially slower than llama.cpp's Vulkan backend.** It is correct (logits match the CPU path in the GPU tests) and it runs a whole model on the device, but it is untuned: no cooperative-matrix prefill, no kernel fusion beyond SwiGLU, one device only, no partial offload. Treat it as a working baseline, not a competitive implementation. Only this one GPU has been tested; AMD, Intel and Apple GPUs, and any other Vulkan driver, have not.
+The table above is the **October 5 Vulkan measurement, before the cooperative-matrix, integer-dot, CUDA tensor-core and graph work**; it is kept for the record. Current GPU numbers (CUDA and Vulkan against llama.cpp, four real models, prompt and decode, memory) are in [Compatibility](Compatibility.md) and `benchmarks/results/`. The short version: CUDA is level with llama.cpp on Q8_0 prompts and 5 to 30 percent behind elsewhere; Vulkan is 15 to 55 percent behind. Only this one GPU has been tested; AMD, Intel and Apple GPUs, and any other Vulkan driver or CUDA card, have not.
 
 ## What has not been measured
 

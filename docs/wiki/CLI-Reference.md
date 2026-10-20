@@ -25,8 +25,8 @@ Generates text. Text goes to standard output, statistics to standard error, so t
 | `--repeat-penalty X` | penalty for recent tokens, `1` disables | 1.0 |
 | `--seed N` | random seed, `0` uses the clock | 0 |
 | `--threads N` | compute threads | physical cores |
-| `-ngl, --gpu-layers N` | run on a GPU (Vulkan) when N > 0; also `HK_GPU=1` | CPU |
-| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda` (also `HK_BACKEND`). `auto` uses a device when the model fits and prints why when it does not. Naming `vulkan` or `cuda` means *use it or fail*: an unusable device is an error, never a silent CPU run. `cuda` is a first, unoptimized engine (see [Inference and Serving](Inference-and-Serving)); `auto` still prefers Vulkan until CUDA is benchmarked ahead of it | follows `-ngl` |
+| `-ngl, --gpu-layers N` | the first N layers go to a device and the rest stay on the CPU; N at or above the layer count means the whole model; `0` is the CPU (also `HK_GPU=0`) | the whole model if it fits, otherwise as many layers as do |
+| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda` (also `HK_BACKEND`). `auto` uses a device when one takes the model and prints why when one exists but cannot. Naming `vulkan` or `cuda` means *use it or fail*: an unusable device is an error, never a silent CPU run. `auto` tries CUDA first on a card with tensor cores (compute capability 8.0+), Vulkan first otherwise | `auto` |
 
 Every flag is checked before the model is opened, and an unknown or malformed one is an error, never a silent default. With `--temp 0` the output is deterministic.
 

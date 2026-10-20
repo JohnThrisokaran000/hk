@@ -41,8 +41,8 @@ hk serve model.hk --port 8080 --slots 4 --ctx 4096
 | `--ctx N` | context window per slot | the model's, up to 8192 |
 | `--batch N` | most tokens per forward pass | 256 |
 | `--threads N` | compute threads | physical cores |
-| `-ngl N` | use the GPU (a device region per slot) | CPU |
-| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda`; naming a device fails if it cannot be used (also `HK_BACKEND`) | follows `-ngl` |
+| `-ngl N` | the first N layers on a device (a region per slot); N at or above the layer count: all; `0`: CPU | automatic |
+| `--backend B` | `auto`, `cpu`, `vulkan` or `cuda`; naming a device fails if it cannot be used (also `HK_BACKEND`) | `auto` |
 | `--api-key KEY` | require `Authorization: Bearer KEY` (or set `HK_API_KEY`) | none |
 | `--alias NAME` | model name reported by the API | file name |
 | `--max-body-mb N` | largest request body | 32 |
