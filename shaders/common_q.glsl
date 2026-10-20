@@ -26,3 +26,4 @@ void sm4(uint s, uint j, out uint sc, out uint mn) {
 }
 
 int dot4(uint a, uint b) { return dotPacked4x8EXT(int(a), int(b)); }
+

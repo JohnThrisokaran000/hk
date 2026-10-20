@@ -56,7 +56,7 @@ void fetch(uint k0, uint r0, uint t0) {
         if (r0 + m < p.rows && col < p.cols) {
             uint o = (r0 + m) * p.row_bytes + (col / ELEMS) * BYTES;
             uint c = col % ELEMS;
-            v = vec4(dq(o, c), dq(o, c + 1u), dq(o, c + 2u), dq(o, c + 3u));
+            v = dq4(o, c);
         }
         ra[i] = f16vec4(v);
         vec4 a = vec4(0.0);
