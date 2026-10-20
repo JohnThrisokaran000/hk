@@ -118,6 +118,10 @@ const Fns = struct {
     getQueryPoolResults: std.meta.Child(c.PFN_vkGetQueryPoolResults),
 };
 
+fn envFlag(name: [*:0]const u8) bool {
+    return std.c.getenv(name) != null;
+}
+
 /// What the chosen device can do, for shaders and for deciding how much to offload.
 pub const Caps = struct {
     name: [256]u8 = undefined,
@@ -133,6 +137,9 @@ pub const Caps = struct {
     timestamp_period: f32 = 1.0,
     /// Memory that lives on the device (VRAM, or the shared pool on integrated parts), in bytes.
     device_local_bytes: u64 = 0,
+    /// `VK_KHR_cooperative_matrix` offers a subgroup scope 16x16x16 f16 x f16 -> f32 product on this device (and
+    /// the subgroup is 32 wide, which the cooperative matrix shaders assume); `HK_NO_COOPMAT` switches it off.
+    coopmat: bool = false,
 
     pub fn deviceName(self: *const Caps) []const u8 {
         return self.name[0..self.name_len];
@@ -329,6 +336,7 @@ pub const Context = struct {
 
         // Memory budget, when the driver reports it, tells how much VRAM is really free.
         var has_budget = false;
+        var has_coopmat_ext = false;
         var n_ext: u32 = 0;
         _ = enum_ext(phys, null, &n_ext, null);
         if (n_ext > 0) {
@@ -336,10 +344,49 @@ pub const Context = struct {
             defer allocator.free(exts);
             _ = enum_ext(phys, null, &n_ext, exts.ptr);
             for (exts[0..n_ext]) |e| {
-                if (std.mem.eql(u8, std.mem.sliceTo(&e.extensionName, 0), "VK_EXT_memory_budget")) has_budget = true;
+                const en = std.mem.sliceTo(&e.extensionName, 0);
+                if (std.mem.eql(u8, en, "VK_EXT_memory_budget")) has_budget = true;
+                if (std.mem.eql(u8, en, "VK_KHR_cooperative_matrix")) has_coopmat_ext = true;
             }
         }
-        const dev_exts = [_][*:0]const u8{"VK_EXT_memory_budget"};
+
+        // Cooperative matrices: the feature bit and a 16x16x16 f16 x f16 -> f32 subgroup shape must both be reported.
+        var coopmat = false;
+        if (has_coopmat_ext and sg.subgroupSize == 32 and !envFlag("HK_NO_COOPMAT")) probe: {
+            var cm_feat = c.VkPhysicalDeviceCooperativeMatrixFeaturesKHR{};
+            var feats_cm = std.mem.zeroes(c.VkPhysicalDeviceFeatures2);
+            feats_cm.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            feats_cm.pNext = &cm_feat;
+            get_feat2(phys, &feats_cm);
+            if (cm_feat.cooperativeMatrix == 0) break :probe;
+            const get_cm = get_inst(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR") orelse break :probe;
+            const get_cm_props: std.meta.Child(c.PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) = @ptrCast(get_cm);
+            var n_cm: u32 = 0;
+            if (get_cm_props(phys, &n_cm, null) != c.VK_SUCCESS or n_cm == 0) break :probe;
+            const cm = try allocator.alloc(c.VkCooperativeMatrixPropertiesKHR, n_cm);
+            defer allocator.free(cm);
+            for (cm) |*e| e.* = .{};
+            if (get_cm_props(phys, &n_cm, cm.ptr) != c.VK_SUCCESS) break :probe;
+            for (cm[0..n_cm]) |e| {
+                if (e.scope == c.VK_SCOPE_SUBGROUP_KHR and e.MSize == 16 and e.NSize == 16 and e.KSize == 16 and
+                    e.AType == c.VK_COMPONENT_TYPE_FLOAT16_KHR and e.BType == c.VK_COMPONENT_TYPE_FLOAT16_KHR and
+                    e.CType == c.VK_COMPONENT_TYPE_FLOAT32_KHR and e.ResultType == c.VK_COMPONENT_TYPE_FLOAT32_KHR)
+                {
+                    coopmat = true;
+                }
+            }
+        }
+        caps.coopmat = coopmat;
+        var dev_exts: [2][*:0]const u8 = undefined;
+        var n_dev_exts: u32 = 0;
+        if (has_budget) {
+            dev_exts[n_dev_exts] = "VK_EXT_memory_budget";
+            n_dev_exts += 1;
+        }
+        if (coopmat) {
+            dev_exts[n_dev_exts] = "VK_KHR_cooperative_matrix";
+            n_dev_exts += 1;
+        }
 
         // Enable exactly the features that were checked.
         var en12 = std.mem.zeroes(c.VkPhysicalDeviceVulkan12Features);
@@ -354,6 +401,8 @@ pub const Context = struct {
         var en2 = std.mem.zeroes(c.VkPhysicalDeviceFeatures2);
         en2.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         en2.pNext = &en11;
+        var en_cm = c.VkPhysicalDeviceCooperativeMatrixFeaturesKHR{ .cooperativeMatrix = 1 };
+        if (coopmat) en12.pNext = &en_cm;
         en2.features.shaderInt16 = feats.features.shaderInt16;
         en2.features.shaderInt64 = feats.features.shaderInt64;
 
@@ -362,8 +411,8 @@ pub const Context = struct {
         dci.pNext = &en2;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
-        if (has_budget) {
-            dci.enabledExtensionCount = 1;
+        if (n_dev_exts > 0) {
+            dci.enabledExtensionCount = n_dev_exts;
             dci.ppEnabledExtensionNames = &dev_exts;
         }
         var device: c.VkDevice = null;

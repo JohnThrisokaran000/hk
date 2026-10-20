@@ -505,6 +505,11 @@ pub const Engine = struct {
         return self.ctx.caps.deviceName();
     }
 
+    /// The prompt (batch) matrix kernel in use: cooperative matrices with f16 operands, or the f32 shared-memory tile.
+    pub fn matmulPath(self: *const Engine) []const u8 {
+        return if (self.ctx.caps.coopmat) "cooperative matrix (f16 operands, f32 accumulate)" else "tiled f32";
+    }
+
     fn mmvPipe(self: *Engine, t: StorageType) !vk.Pipeline {
         const i = @intFromEnum(t);
         if (self.pipes_mmv[i]) |p| return p;
@@ -516,9 +521,15 @@ pub const Engine = struct {
     fn mmPipe(self: *Engine, t: StorageType) !vk.Pipeline {
         const i = @intFromEnum(t);
         if (self.pipes_mm[i]) |p| return p;
-        const p = try self.ctx.createPipeline(spirv("mm", t) orelse return error.UnsupportedType, 4, @sizeOf(MmPush));
+        const code = if (self.ctx.caps.coopmat) spirv("mm_cm", t) else spirv("mm", t);
+        const p = try self.ctx.createPipeline(code orelse return error.UnsupportedType, 4, @sizeOf(MmPush));
         self.pipes_mm[i] = p;
         return p;
+    }
+
+    /// Rows and tokens of the output tile one workgroup of the batch matrix kernel produces.
+    fn mmTile(self: *const Engine) u32 {
+        return if (self.ctx.caps.coopmat) 128 else 64;
     }
 
     fn embedPipe(self: *Engine, t: StorageType) !vk.Pipeline {
@@ -628,7 +639,8 @@ pub const Engine = struct {
         } else {
             const p = self.pipes_mm[@intFromEnum(m.t)].?;
             const push = MmPush{ .rows = m.rows, .cols = m.cols, .row_bytes = m.row_bytes, .x_stride = m.cols, .y_stride = m.rows, .has_bias = @intFromBool(has_bias), .x_off = x_off, .y_off = y_off, .n_tokens = n, .mode = mode };
-            self.disp(.mm, p, m.set, std.mem.asBytes(&push), (m.rows + 63) / 64, (n + 63) / 64, 1);
+            const tile = self.mmTile();
+            self.disp(.mm, p, m.set, std.mem.asBytes(&push), (m.rows + tile - 1) / tile, (n + tile - 1) / tile, 1);
         }
     }
 
@@ -643,7 +655,8 @@ pub const Engine = struct {
         } else {
             const p = self.pipes_mm[@intFromEnum(m.t)].?;
             const push = MmPush{ .rows = 2 * m.rows, .cols = m.cols, .row_bytes = m.row_bytes, .x_stride = m.cols, .y_stride = 2 * m.rows, .has_bias = 0, .x_off = 0, .y_off = 0, .n_tokens = n, .mode = 0 };
-            self.disp(.mm, p, m.set_pair, std.mem.asBytes(&push), (2 * m.rows + 63) / 64, (n + 63) / 64, 1);
+            const tile = self.mmTile();
+            self.disp(.mm, p, m.set_pair, std.mem.asBytes(&push), (2 * m.rows + tile - 1) / tile, (n + tile - 1) / tile, 1);
             self.barrier();
             const count = CountPush{ .n = n * m.rows };
             self.disp(.swiglu, self.p_swiglu_pair, l.s_swiglu_pair, std.mem.asBytes(&count), (count.n + 255) / 256, 1, 1);
@@ -778,3 +791,104 @@ pub const Engine = struct {
         return out[0 .. indices.len * cfg.vocab];
     }
 };
+
+const test_formats = [_]StorageType{ .f32, .f16, .bf16, .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .iq4_nl, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq4_xs };
+
+/// Random weights of format `t`: blocks of random bytes that decode to finite, moderate values (random bytes alone put
+/// NaNs and 1e30 in the scales).
+fn randomWeights(allocator: std.mem.Allocator, random: std.Random, t: StorageType, rows: usize, cols: usize) ![]u8 {
+    const quant = @import("../quant.zig");
+    const info = quant.info(t).?;
+    const bytes = rows * (cols / info.elems) * info.bytes;
+    const data = try allocator.alloc(u8, bytes);
+    errdefer allocator.free(data);
+    var vals: [256]f32 = undefined;
+    var off: usize = 0;
+    while (off < bytes) : (off += info.bytes) {
+        const block = data[off..][0..info.bytes];
+        while (true) {
+            random.bytes(block);
+            quant.dequant.dequantizeRow(t, block, vals[0..info.elems]) catch unreachable;
+            var ok = true;
+            for (vals[0..info.elems]) |v| {
+                if (!std.math.isFinite(v) or @abs(v) > 8) ok = false;
+            }
+            if (ok) break;
+        }
+    }
+    return data;
+}
+
+/// Runs the batch kernel `kind` ("mm" or "mm_cm") on a random problem and returns the [n][rows] result.
+fn runBatchKernel(ctx: *vk.Context, comptime kind: []const u8, t: StorageType, dm: DevMat, xbuf: vk.Buffer, bias: vk.Buffer, n: u32, tile: u32, out: []f32) !void {
+    const pipe = try ctx.createPipeline(spirv(kind, t).?, 4, @sizeOf(MmPush));
+    defer ctx.destroyPipeline(pipe);
+    const ybytes = @as(u64, n) * dm.rows * 4;
+    const ybuf = try ctx.createBuffer(ybytes, .readback);
+    defer ctx.destroyBuffer(ybuf);
+    @memset(ybuf.mapped.?[0..ybytes], 0xff);
+    const set = try ctx.makeSet(pipe, &.{ .{ .buf = dm.buf }, .{ .buf = xbuf }, .{ .buf = ybuf }, .{ .buf = bias } });
+    const push = MmPush{ .rows = dm.rows, .cols = dm.cols, .row_bytes = dm.row_bytes, .x_stride = dm.cols, .y_stride = dm.rows, .has_bias = 1, .x_off = 0, .y_off = 0, .n_tokens = n, .mode = 0 };
+    const cb = ctx.xfer_cb;
+    try ctx.begin(cb, true);
+    ctx.dispatch(cb, pipe, set, std.mem.asBytes(&push), (dm.rows + tile - 1) / tile, (n + tile - 1) / tile, 1);
+    try ctx.end(cb);
+    try ctx.submitAndWait(cb);
+    @memcpy(std.mem.sliceAsBytes(out), ybuf.mapped.?[0..ybytes]);
+}
+
+test "the cooperative matrix kernel agrees with the tiled f32 kernel on every format" {
+    const gpa = std.testing.allocator;
+    var ctx = vk.Context.init(gpa, null) catch |e| switch (e) {
+        error.NoVulkan, error.NoDevice, error.MissingFeature, error.NoComputeQueue => return error.SkipZigTest,
+        else => return e,
+    };
+    defer ctx.deinit();
+    if (!ctx.caps.coopmat) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    // Sizes that are not multiples of either kernel's tile, so every edge is exercised.
+    const rows: usize = 197;
+    const cols: usize = 768;
+    const n: u32 = 131;
+
+    const xs = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xs);
+    for (xs) |*v| v.* = random.float(f32) * 4 - 2;
+    const xbuf = try ctx.createBuffer(xs.len * 4, .upload);
+    defer ctx.destroyBuffer(xbuf);
+    @memcpy(xbuf.mapped.?[0 .. xs.len * 4], std.mem.sliceAsBytes(xs));
+    const biases = try gpa.alloc(f32, rows);
+    defer gpa.free(biases);
+    for (biases) |*v| v.* = random.float(f32) - 0.5;
+    const bias = try ctx.createBuffer(rows * 4, .upload);
+    defer ctx.destroyBuffer(bias);
+    @memcpy(bias.mapped.?[0 .. rows * 4], std.mem.sliceAsBytes(biases));
+
+    const ref = try gpa.alloc(f32, n * rows);
+    defer gpa.free(ref);
+    const got = try gpa.alloc(f32, n * rows);
+    defer gpa.free(got);
+
+    inline for (test_formats) |t| {
+        const data = try randomWeights(gpa, random, t, rows, cols);
+        defer gpa.free(data);
+        const dm = try Engine.matBuffer(&ctx, .{ .data = data, .t = t, .rows = rows, .cols = cols }, gpa);
+        defer ctx.destroyBuffer(dm.buf);
+        try runBatchKernel(&ctx, "mm", t, dm, xbuf, bias, n, 64, ref);
+        try runBatchKernel(&ctx, "mm_cm", t, dm, xbuf, bias, n, 128, got);
+
+        // f16 operands against f32 ones: the products differ by about 2^-11 per term, so compare relative to the
+        // size of the result, over the whole matrix.
+        var sq: f64 = 0;
+        var worst: f64 = 0;
+        for (ref) |v| sq += @as(f64, v) * v;
+        const rms = @sqrt(sq / @as(f64, @floatFromInt(ref.len)));
+        for (ref, got) |a, b| worst = @max(worst, @abs(@as(f64, a) - b));
+        std.testing.expect(std.math.isFinite(rms) and rms > 0 and worst <= 0.02 * rms) catch |err| {
+            std.debug.print("{s}: worst difference {d:.5} against rms {d:.5}\n", .{ @tagName(t), worst, rms });
+            return err;
+        };
+    }
+}

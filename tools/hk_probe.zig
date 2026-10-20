@@ -75,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
     defer model.deinit();
 
     std.debug.print("kernels {s} (built: {s}){s}\n", .{ hk.kernels.get().name, hk.build_options_kernel_levels, if (model.gpu != null) "; running on the GPU" else "" });
+    if (vkEngine(&model)) |e| std.debug.print("vulkan prompt matmul: {s}\n", .{e.matmulPath()});
     if (std.mem.eql(u8, arg2, "--bench")) {
         const n_prompt: usize = if (it.next()) |x| try std.fmt.parseInt(usize, x, 10) else 512;
         const n_gen: usize = if (it.next()) |x| try std.fmt.parseInt(usize, x, 10) else 64;
