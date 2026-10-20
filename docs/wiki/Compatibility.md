@@ -93,7 +93,7 @@ HK_GPU_PROFILE=1  ... # host launch time and whole-pass GPU time;  HK_CUDA_EVENT
 zig-out/bin/hk-compare --llama-bin <dir> --pair m.hk:m.gguf --threads 6 --repeats 5   # against llama.cpp, with a real model
 ```
 
-Measured with `benchmarks/suite.py` (all engines interleaved, 3 repeats, median and min..max, prompt 512, generate 128, 6 threads) at hk `df38522` against llama.cpp `d806193` on real GGUF files that both engines load byte for byte; the full tables with memory are in `benchmarks/results/2026-10-21b-four-models.md`:
+Measured with `benchmarks/suite.py` (all engines interleaved, 3 repeats, median and min..max, prompt 512, generate 128, 6 threads) at hk `57948cf` against llama.cpp `d806193` on real GGUF files that both engines load byte for byte; the full tables with memory are in `benchmarks/results/2026-10-21b-four-models.md`:
 
 | Model (GGUF) | Engine | Prompt tok/s | Generation tok/s |
 |:---|:---|--:|--:|
