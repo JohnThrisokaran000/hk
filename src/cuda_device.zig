@@ -898,6 +898,85 @@ inline fn gemmImma(comptime t: format.StorageType, w: [*]const u8, xq: [*]const 
     };
 }
 
+inline fn dp4a(a: u32, b: u32, c: i32) i32 {
+    return asm volatile ("dp4a.s32.s32 %[d], %[a], %[b], %[c];"
+        : [d] "=r" (-> i32),
+        : [a] "r" (a),
+          [b] "r" (b),
+          [c] "r" (c),
+    );
+}
+
+/// Quantized activations of one chunk of a decode product: int8 quants as words, scale and sum per 32.
+var dq_x: [gemv_chunk / 4]u32 addrspace(.shared) = undefined;
+var dq_s: [gemv_chunk / 32]f32 addrspace(.shared) = undefined;
+var dq_m: [gemv_chunk / 32]f32 addrspace(.shared) = undefined;
+
+/// Single token matrix-vector product with integer arithmetic: the same block decoding as the integer GEMM, then four
+/// quants per `dp4a`. A warp owns one row; its lanes take the row's 32-blocks in turn. `xq`, `xs`, `xsum` are the
+/// activations quantized by `quantize_act`.
+inline fn gemvDp4a(comptime t: format.StorageType, w: [*]const u8, xq: [*]const i8, xs: [*]const f32, xsum: [*]const f32, y: [*]f32, k: u32, m: u32) void {
+    const info = comptime blocks.info(t).?;
+    const per_unit: u32 = comptime if (info.elems == 256) 8 else 1;
+    const has_min = comptime (t == .q4_1 or t == .q5_1 or t == .q4_k or t == .q5_k);
+    const halves = comptime (t == .q6_k);
+    const warp = tid() >> 5;
+    const lane = tid() & 31;
+    const row = bid() * gemv_rows + warp;
+    const valid = row < m;
+    const row_bytes: usize = @as(usize, k / info.elems) * info.bytes;
+    const nb: u32 = k / 32;
+    var acc: f32 = 0;
+
+    var k0: u32 = 0;
+    while (k0 < k) : (k0 += gemv_chunk) {
+        const len: u32 = @min(@as(u32, gemv_chunk), k - k0);
+        const xw: [*]const u32 = @ptrCast(@alignCast(xq + k0));
+        var i: u32 = tid();
+        while (i < len / 4) : (i += bdim()) dq_x[i] = xw[i];
+        i = tid();
+        while (i < len / 32) : (i += bdim()) {
+            dq_s[i] = xs[k0 / 32 + i];
+            if (has_min) dq_m[i] = xsum[k0 / 32 + i];
+        }
+        barSync();
+        if (valid) {
+            var b: u32 = lane;
+            while (b < len / 32) : (b += 32) {
+                const bl = k0 / 32 + b;
+                const a = @intFromPtr(w) + @as(usize, row) * row_bytes + @as(usize, bl / per_unit) * info.bytes;
+                const raw = immaFetch(t, a, bl % per_unit);
+                const blk = immaUnpack(t, &raw, bl % per_unit);
+                var lo: i32 = 0;
+                inline for (0..4) |u| lo = dp4a(blk.q[u], dq_x[b * 8 + u], lo);
+                var hi: i32 = 0;
+                inline for (4..8) |u| hi = dp4a(blk.q[u], dq_x[b * 8 + u], hi);
+                var v: f32 = undefined;
+                if (halves) {
+                    v = blk.sc[0] * @as(f32, @floatFromInt(lo)) + blk.sc[1] * @as(f32, @floatFromInt(hi));
+                } else {
+                    v = blk.sc[0] * @as(f32, @floatFromInt(lo + hi));
+                    if (has_min) v -= blk.mn * dq_m[b];
+                }
+                acc += dq_s[b] * v;
+            }
+        }
+        barSync();
+    }
+    _ = nb;
+    var off: u32 = 16;
+    while (off > 0) : (off >>= 1) acc += shflDown(acc, off);
+    if (lane == 0 and valid) y[row] = acc;
+}
+
+fn GemvDp4aKernel(comptime t: format.StorageType) type {
+    return struct {
+        fn run(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, xsum: [*]const f32, y: [*]f32, k: u32, m: u32) callconv(.kernel) void {
+            gemvDp4a(t, w, xq, xs, xsum, y, k, m);
+        }
+    };
+}
+
 fn GemmImmaKernel(comptime t: format.StorageType) type {
     return struct {
         fn run(w: [*]const u8, xq: [*]const i8, xs: [*]const f32, xsum: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
@@ -911,6 +990,7 @@ comptime {
     if (has_tensor_cores) {
         for (imma_formats) |t| @export(&GemmImmaKernel(t).run, .{ .name = "gemm_imma_" ++ @tagName(t) });
     }
+    for (imma_formats) |t| @export(&GemvDp4aKernel(t).run, .{ .name = "gemv_dp4a_" ++ @tagName(t) });
 }
 
 // -- tensor core prompt attention (sm_80 and newer) ---------------------------------------------------------------------
@@ -1436,6 +1516,165 @@ fn attentionPartKernel(
     }
 }
 
+var warp_m: [4]f32 addrspace(.shared) = undefined;
+var warp_l: [4]f32 addrspace(.shared) = undefined;
+var warp_acc: [4][256]f32 addrspace(.shared) = undefined;
+
+inline fn shflIdx(v: f32, src: u32) f32 {
+    return asm volatile ("shfl.sync.idx.b32 %[r], %[v], %[s], 31, 0xffffffff;"
+        : [r] "=f" (-> f32),
+        : [v] "f" (v),
+          [s] "r" (src),
+    );
+}
+
+inline fn halfPair(w: u32) [2]f32 {
+    return .{ @floatCast(@as(f16, @bitCast(@as(u16, @truncate(w))))), @floatCast(@as(f16, @bitCast(@as(u16, @truncate(w >> 16))))) };
+}
+
+/// Split-KV attention for decode, first half, with a warp per 32 positions: each lane scores one position by itself (a
+/// serial dot product over the head width, no reductions), the warp does one softmax step for the 32 scores, and the
+/// weighted sum of values has the lanes own slices of the head width. Compared with `attentionPartKernel` there is no
+/// block wide barrier inside the loop: the four warps of a block walk their own tiles and are merged once at the end.
+/// Writes the same [acc (head_dim), max, sum] state per (token, head, split). Head widths that are a multiple of 8, up to
+/// 256.
+fn attentionPartWarpKernel(
+    q: [*]const f32,
+    kptrs: [*]const u64,
+    vptrs: [*]const u64,
+    layer_off: u64,
+    slots: [*]const u32,
+    poss: [*]const u32,
+    part: [*]f32,
+    ctx: u32,
+    head_dim: u32,
+    n_heads: u32,
+    group: u32,
+    scale: f32,
+    splits: u32,
+) callconv(.kernel) void {
+    const split = bid() % splits;
+    const rh = bid() / splits;
+    const row = rh / n_heads;
+    const h = rh % n_heads;
+    const npos = poss[row] + 1;
+    const chunk = (npos + splits - 1) / splits;
+    const lo = @min(npos, split * chunk);
+    const hi = @min(npos, lo + chunk);
+    const kvh = h / group;
+    const ck: [*]const f16 = @ptrFromInt(kptrs[slots[row]] + layer_off);
+    const cv: [*]const f16 = @ptrFromInt(vptrs[slots[row]] + layer_off);
+    const kbase = ck + @as(usize, kvh) * ctx * head_dim;
+    const vbase = cv + @as(usize, kvh) * ctx * head_dim;
+    const qh = q + (@as(usize, row) * n_heads + h) * head_dim;
+
+    var d: u32 = tid();
+    while (d < head_dim) : (d += bdim()) attn_query[d] = qh[d] * scale;
+    barSync();
+
+    const warp = tid() >> 5;
+    const lane = tid() & 31;
+    const dpl = head_dim / 32; // dims of the value row each lane owns, contiguous: lane * dpl .. lane * dpl + dpl
+    const neg_inf = -std.math.inf(f32);
+    var m: f32 = neg_inf;
+    var l: f32 = 0;
+    var acc: [8]f32 = @splat(0);
+
+    var p0: u32 = lo + warp * 32;
+    while (p0 < hi) : (p0 += 128) {
+        const p = p0 + lane;
+        var sc: f32 = neg_inf;
+        if (p < hi) {
+            const kr: [*]const @Vector(4, u32) = @ptrCast(@alignCast(kbase + @as(usize, p) * head_dim));
+            // Eight halves per load and two independent partial sums, so the loads and the arithmetic overlap.
+            var s0: f32 = 0;
+            var s1: f32 = 0;
+            var i: u32 = 0;
+            while (i < head_dim / 8) : (i += 1) {
+                const kv = kr[i];
+                const q4 = i * 8;
+                inline for (0..4) |u| {
+                    const pair = halfPair(kv[u]);
+                    const t = attn_query[q4 + 2 * u] * pair[0] + attn_query[q4 + 2 * u + 1] * pair[1];
+                    if (u % 2 == 0) s0 += t else s1 += t;
+                }
+            }
+            sc = s0 + s1;
+        }
+        var mx = sc;
+        inline for (.{ 16, 8, 4, 2, 1 }) |o| mx = @max(mx, shflXor(mx, o));
+        const m_new = @max(m, mx);
+        const corr = expf(m - m_new);
+        const pj = if (p < hi) expf(sc - m_new) else 0;
+        var ps = pj;
+        inline for (.{ 16, 8, 4, 2, 1 }) |o| ps += shflXor(ps, o);
+        l = l * corr + ps;
+        inline for (0..8) |i| acc[i] *= corr;
+        m = m_new;
+        const live = @min(@as(u32, 32), hi - p0);
+        var j: u32 = 0;
+        if (dpl == 4) {
+            // Four positions per step: the value loads of all four are in flight before the first is used.
+            while (j + 4 <= live) : (j += 4) {
+                var vv: [4]@Vector(2, u32) = undefined;
+                var pw: [4]f32 = undefined;
+                inline for (0..4) |u| {
+                    pw[u] = shflIdx(pj, j + @as(u32, u));
+                    const vr: *const @Vector(2, u32) = @ptrCast(@alignCast(vbase + @as(usize, p0 + j + @as(u32, u)) * head_dim + lane * 4));
+                    vv[u] = vr.*;
+                }
+                inline for (0..4) |u| {
+                    const a0 = halfPair(vv[u][0]);
+                    const a1 = halfPair(vv[u][1]);
+                    acc[0] += pw[u] * a0[0];
+                    acc[1] += pw[u] * a0[1];
+                    acc[2] += pw[u] * a1[0];
+                    acc[3] += pw[u] * a1[1];
+                }
+            }
+        }
+        while (j < live) : (j += 1) {
+            const pw = shflIdx(pj, j);
+            const vr: [*]const u32 = @ptrCast(@alignCast(vbase + @as(usize, p0 + j) * head_dim + lane * dpl));
+            inline for (0..4) |u| {
+                if (u * 2 < dpl) {
+                    const vv = halfPair(vr[u]);
+                    acc[2 * u] += pw * vv[0];
+                    acc[2 * u + 1] += pw * vv[1];
+                }
+            }
+        }
+    }
+
+    if (lane == 0) {
+        warp_m[warp] = m;
+        warp_l[warp] = l;
+    }
+    inline for (0..8) |i| {
+        if (i < dpl) warp_acc[warp][lane * dpl + i] = acc[i];
+    }
+    barSync();
+    var big: f32 = neg_inf;
+    for (warp_m) |wm| big = @max(big, wm);
+    const o = part + @as(usize, bid()) * (head_dim + 2);
+    var total: f32 = 0;
+    if (big != neg_inf) {
+        for (warp_m, warp_l) |wm, wl| total += expf(wm - big) * wl;
+    }
+    d = tid();
+    while (d < head_dim) : (d += bdim()) {
+        var v: f32 = 0;
+        if (big != neg_inf) {
+            for (warp_m, 0..) |wm, w| v += expf(wm - big) * warp_acc[w][d];
+        }
+        o[d] = v;
+    }
+    if (tid() == 0) {
+        o[head_dim] = big;
+        o[head_dim + 1] = total;
+    }
+}
+
 /// Split-KV attention, second half: merges the `splits` partial states of each (token, head) exactly (rescaling each by
 /// its maximum) and writes the normalized output. One block per (token, head).
 fn attentionCombineKernel(part: [*]const f32, out: [*]f32, head_dim: u32, splits: u32) callconv(.kernel) void {
@@ -1491,6 +1730,7 @@ comptime {
     @export(&kvWriteKernel, .{ .name = "kv_write" });
     @export(&attentionKernel, .{ .name = "attention" });
     @export(&attentionPartKernel, .{ .name = "attention_part" });
+    @export(&attentionPartWarpKernel, .{ .name = "attention_part_warp" });
     @export(&attentionCombineKernel, .{ .name = "attention_combine" });
     @export(&swigluKernel, .{ .name = "swiglu" });
     @export(&toHalfKernel, .{ .name = "to_half" });

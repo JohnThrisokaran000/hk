@@ -1035,6 +1035,15 @@ pub const tensor_tile_rows: usize = 64;
 pub const tensor_tile_tokens: usize = 128;
 pub const tensor_block_threads: c_uint = 256;
 
+/// The single-token integer kernel for `fmt` (activations quantized by `quantize_act`, products with `dp4a`), or null
+/// when the format has none. `HK_NO_DP4A=1` turns these kernels off.
+pub fn dp4aKernel(fmt: format.StorageType) ?Kernel {
+    if (envvar.isSet("HK_NO_DP4A")) return null;
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "gemv_dp4a_{s}", .{@tagName(fmt)}) catch return null;
+    return deviceKernel(name) catch null;
+}
+
 /// The integer tensor core kernel for `fmt` (activations quantized to int8, see `quantize_act`), or null when the device
 /// has none or the format has no integer kernel yet.
 pub fn immaKernel(fmt: format.StorageType) ?Kernel {
@@ -1159,6 +1168,19 @@ pub fn launchKernel(k: Kernel, grid: u32, block: u32, args: anytype) !void {
     return launchKernel2D(k, grid, 1, block, args);
 }
 
+/// True when the environment variable is set to switch a feature off.
+pub fn envDisabled(name: [*:0]const u8) bool {
+    return envvar.isSet(name);
+}
+
+/// The stream kernels are launched on: null (the default stream) except while a graph is being captured.
+var launch_stream: CuStream = null;
+
+/// Directs `launchKernel` to `stream` (null: the default stream). Not thread safe; the engine calls it around a capture.
+pub fn setLaunchStream(stream: ?CudaStream) void {
+    launch_stream = if (stream) |st| st.handle else null;
+}
+
 /// Like `launchKernel` with a two dimensional grid.
 pub fn launchKernel2D(k: Kernel, grid_x: u32, grid_y: u32, block: u32, args: anytype) !void {
     const s = try ensureDriver();
@@ -1167,7 +1189,7 @@ pub fn launchKernel2D(k: Kernel, grid_x: u32, grid_y: u32, block: u32, args: any
     var ptrs: [n]?*anyopaque = undefined;
     inline for (0..n) |i| ptrs[i] = @ptrCast(&storage[i]);
     if (profiling.on) try profiling.begin(s);
-    if (s.api.?.cuLaunchKernel(k.f, grid_x, grid_y, 1, block, 1, 1, 0, null, &ptrs, null) != 0) return CudaError.CudaCallFailed;
+    if (s.api.?.cuLaunchKernel(k.f, grid_x, grid_y, 1, block, 1, 1, 0, launch_stream, &ptrs, null) != 0) return CudaError.CudaCallFailed;
     if (profiling.on) try profiling.end(s, k.name);
 }
 
@@ -1175,7 +1197,7 @@ pub fn launchKernel2D(k: Kernel, grid_x: u32, grid_y: u32, block: u32, args: any
 /// run down and exists to say where the time goes, not to measure speed.
 pub const profiling = struct {
     const max_kernels = 96;
-    var on = false;
+    pub var on = false;
     var start: CuEvent = null;
     var stop: CuEvent = null;
     var names: [max_kernels][]const u8 = undefined;

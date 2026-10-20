@@ -203,12 +203,12 @@ test "the CUDA engine keeps sequences apart and runs out of slots loudly" {
 
 /// A context long enough that decode slices attention across several blocks (more than 256 positions), checked token
 /// by token against the CPU. Prompt processing runs the whole-context kernel; every decode step runs the split one.
-fn checkLongContext(backend: Choice) !void {
+fn checkLongContext(backend: Choice, head_dim: usize) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer gpa.free(dir);
-    const h = try makeModel(dir, "longctx", .{ .arch = .qwen3, .ctx = 1024 });
+    const h = try makeModel(dir, "longctx", .{ .arch = .qwen3, .ctx = 1024, .dim = 4 * head_dim, .ffn = 128 });
     defer gpa.free(h);
     var reader = try hk.HKReader.open(h, gpa);
     defer reader.deinit();
@@ -220,6 +220,11 @@ fn checkLongContext(backend: Choice) !void {
     var cpu = try load(h, .off, .cpu, 1, 1024, &reader);
     defer cpu.deinit();
 
+    // Fewer, longer slices than usual so each warp of the CUDA decode attention walks several tiles and rescales between them.
+    switch (dev.gpu.?) {
+        .cuda => |e| e.slice_positions = 400,
+        .vulkan => {},
+    }
     const prompt_len = 700;
     var prompt: [prompt_len]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 7919) % 200);
@@ -252,11 +257,14 @@ fn checkLongContext(backend: Choice) !void {
 }
 
 test "the Vulkan engine matches the CPU on a long context" {
-    try checkLongContext(.vulkan);
+    try checkLongContext(.vulkan, 16);
+    try checkLongContext(.vulkan, 64);
 }
 
 test "the CUDA engine matches the CPU on a long context (split-KV attention)" {
-    try checkLongContext(.cuda);
+    try checkLongContext(.cuda, 16);
+    try checkLongContext(.cuda, 64);
+    try checkLongContext(.cuda, 128);
 }
 
 /// Prompt attention has a matrix-unit kernel (Vulkan cooperative matrices, CUDA tensor cores) for head sizes 64 and 128
@@ -301,6 +309,23 @@ fn checkPromptAttention(head_dim: usize, backend: Choice, q8: bool) !void {
         const row = try gpa.dupe(f32, dev.logitsFor(i));
         defer gpa.free(row);
         try std.testing.expect(cosine(row, cpu.logitsFor(i)) > bar);
+    }
+    // Then single steps: the decode kernels (split-KV attention, integer matrix-vector products, graph replay on CUDA).
+    var pos: usize = prompt.len;
+    var tok: u32 = 7;
+    for (0..8) |_| {
+        try dev.forward(&.{tok}, pos);
+        try cpu.forward(&.{tok}, pos);
+        const x = try gpa.dupe(f32, dev.logitsFor(0));
+        defer gpa.free(x);
+        const y = cpu.logitsFor(0);
+        try std.testing.expect(cosine(x, y) > bar);
+        var best: usize = 0;
+        for (y, 0..) |v, i| if (v > y[best]) {
+            best = i;
+        };
+        tok = @intCast(best);
+        pos += 1;
     }
 }
 

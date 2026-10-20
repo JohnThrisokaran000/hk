@@ -62,7 +62,31 @@ const block_threads: u32 = 128;
 
 /// The matrix kernels of one weight format: matrix-vector for a single token, the tiled kernel for small batches and,
 /// on GPUs of compute capability 8.0 and up, the tensor core kernel for prompts.
-const GemmKernels = struct { decode: cuda.Kernel, tiled: cuda.Kernel, tensor: ?cuda.Kernel, imma: ?cuda.Kernel };
+/// Passes of at most this many tokens are captured as graphs; larger ones (prompts) are launched directly.
+const graph_max_tokens = 8;
+const max_graphs = 16;
+const GraphSlot = struct { key: u32, exec: cuda.CudaGraphExec };
+
+const GemmKernels = struct {
+    decode: cuda.Kernel,
+    tiled: cuda.Kernel,
+    tensor: ?cuda.Kernel,
+    imma: ?cuda.Kernel,
+    dp4a: ?cuda.Kernel,
+
+    const Pick = enum { gemv, dp4a, tiled, tensor, imma };
+
+    /// Which kernel multiplies `n` tokens: integer ones where the format has them (a single token: `dp4a`; a prompt:
+    /// tensor cores), the f16 tensor core kernel for prompts of the other formats, and the portable ones otherwise.
+    fn pick(self: GemmKernels, n: usize) Pick {
+        if (n <= 1) return if (self.dp4a != null) .dp4a else .gemv;
+        if (n >= cuda.tensor_min_tokens) {
+            if (self.imma != null) return .imma;
+            if (self.tensor != null) return .tensor;
+        }
+        return .tiled;
+    }
+};
 /// Threads per block of the elementwise kernels.
 const elem_threads: u32 = 256;
 /// Threads per block of the attention kernel: one per position of a tile (`attn_tile` in the device code).
@@ -70,7 +94,7 @@ const attn_threads: u32 = 128;
 /// Largest head width the attention kernel supports.
 const max_head_dim = 256;
 /// Split-KV attention: slices of the context per (token, head) at most, and the smallest slice worth a block.
-const max_splits = 8;
+const max_splits = 16;
 const min_split_positions = 256;
 /// Attention uses one block per (token, head) when there are at least this many of them; fewer is decode-like work
 /// that cannot fill the device without slicing the context.
@@ -115,6 +139,8 @@ const Kernels = struct {
     kv_write: cuda.Kernel,
     attention: cuda.Kernel,
     attention_part: cuda.Kernel,
+    /// Decode attention with a warp per 32 positions (head widths that are a multiple of 32); else `attention_part`.
+    attention_part_warp: ?cuda.Kernel,
     attention_combine: cuda.Kernel,
     /// Tensor core prompt attention for this model's head size; null when the device has none or the size is not 64 / 128.
     attention_tc: ?cuda.Kernel,
@@ -227,6 +253,13 @@ pub const Engine = struct {
     prof_passes: u64 = 0,
     /// GPU milliseconds across whole passes (two events around a pass, no per kernel syncing), when enabled.
     prof_gpu_ms: f64 = 0,
+    /// Captured passes of a few tokens (decode), replayed instead of launching each kernel again: a decode pass is about
+    /// 400 small dependent kernels, and the launch gaps between them cost more than the arithmetic of the small ones.
+    graph_stream: ?cuda.CudaStream,
+    graphs: [max_graphs]GraphSlot,
+    n_graphs: usize,
+    /// Positions per attention slice when nonzero (a test knob: lets a short context run the multi-tile paths).
+    slice_positions: u32 = 0,
     pass_events: ?[2]cuda.CudaEvent = null,
     name_buf: [128]u8 = undefined,
     name_len: usize = 0,
@@ -278,6 +311,9 @@ pub const Engine = struct {
         self.prof_passes = 0;
         self.prof_gpu_ms = 0;
         self.pass_events = null;
+        self.graph_stream = null;
+        self.n_graphs = 0;
+        self.slice_positions = 0;
         if (cuda.getDeviceName(&self.name_buf)) |nm| self.name_len = nm.len else |_| {}
 
         self.k = .{
@@ -288,6 +324,7 @@ pub const Engine = struct {
             .kv_write = cuda.deviceKernel("kv_write") catch return error.DeviceFailed,
             .attention = cuda.deviceKernel("attention") catch return error.DeviceFailed,
             .attention_part = cuda.deviceKernel("attention_part") catch return error.DeviceFailed,
+            .attention_part_warp = if (cfg.head_dim % 32 == 0 and cfg.head_dim <= 256 and !cuda.envDisabled("HK_NO_WARP_ATTN")) (cuda.deviceKernel("attention_part_warp") catch null) else null,
             .attention_combine = cuda.deviceKernel("attention_combine") catch return error.DeviceFailed,
             .attention_tc = if (!cuda.hasTensorCores()) null else switch (cfg.head_dim) {
                 64 => cuda.deviceKernel("attention_tc_64") catch null,
@@ -457,7 +494,7 @@ pub const Engine = struct {
         if (self.gemm.get(m.t) == null) {
             const one = cuda.gemmKernel(m.t, 1) catch return error.UnsupportedType;
             const many = cuda.gemmKernel(m.t, 2) catch return error.UnsupportedType;
-            self.gemm.set(m.t, .{ .decode = one, .tiled = many, .tensor = cuda.tensorKernel(m.t), .imma = cuda.immaKernel(m.t) });
+            self.gemm.set(m.t, .{ .decode = one, .tiled = many, .tensor = cuda.tensorKernel(m.t), .imma = cuda.immaKernel(m.t), .dp4a = cuda.dp4aKernel(m.t) });
         }
         return .{ .mem = try made.bytes(m.data), .t = m.t, .rows = m.rows, .cols = m.cols };
     }
@@ -469,6 +506,8 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         const a = self.allocator;
+        for (self.graphs[0..self.n_graphs]) |*g| g.exec.destroy();
+        if (self.graph_stream) |*st| st.destroy();
         for (self.layers) |l| {
             for ([_]DevMat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| cuda.deviceFree(m.mem);
             for ([_]?cuda.DeviceMem{ l.attn_norm, l.ffn_norm, l.bq, l.bk, l.bv, l.q_norm, l.k_norm }) |v| {
@@ -536,20 +575,31 @@ pub const Engine = struct {
     /// y[token][0..rows] = m * x[token] for `n` tokens.
     fn mm(self: *Engine, m: DevMat, x: u64, y: u64, n: usize) Error!void {
         const kernels = self.gemm.get(m.t).?;
-        if (n >= cuda.tensor_min_tokens) if (kernels.imma) |im| {
-            const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
-            const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
-            return cuda.launchKernel2D(im, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.xq.addr, self.xs.addr, self.xsum.addr, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
-        };
-        if (n >= cuda.tensor_min_tokens) if (kernels.tensor) |tc| {
-            const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
-            const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
-            // The tensor core kernel reads halves: `halve` has put this product's input in `x16`.
-            return cuda.launchKernel2D(tc, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.x16.addr, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
-        };
-        const kern = if (n <= 1) kernels.decode else kernels.tiled;
-        const g = cuda.gemmGrid(m.rows, n);
-        cuda.launchKernel2D(kern, g[0], g[1], block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
+        const k32: u32 = @intCast(m.cols);
+        const rows32: u32 = @intCast(m.rows);
+        const n32: u32 = @intCast(n);
+        switch (kernels.pick(n)) {
+            .dp4a => {
+                const g: u32 = @intCast((m.rows + cuda.gemv_rows - 1) / cuda.gemv_rows);
+                cuda.launchKernel(kernels.dp4a.?, g, cuda.gemm_block_threads, .{ m.mem.addr, self.xq.addr, self.xs.addr, self.xsum.addr, y, k32, rows32 }) catch |e| return mapErr(e);
+            },
+            .imma => {
+                const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
+                const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
+                cuda.launchKernel2D(kernels.imma.?, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.xq.addr, self.xs.addr, self.xsum.addr, y, k32, rows32, n32 }) catch |e| return mapErr(e);
+            },
+            .tensor => {
+                const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
+                const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
+                // The tensor core kernel reads halves: `prepare` has put this product's input in `x16`.
+                cuda.launchKernel2D(kernels.tensor.?, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.x16.addr, y, k32, rows32, n32 }) catch |e| return mapErr(e);
+            },
+            .gemv, .tiled => |which| {
+                const kern = if (which == .gemv) kernels.decode else kernels.tiled;
+                const g = cuda.gemmGrid(m.rows, n);
+                cuda.launchKernel2D(kern, g[0], g[1], block_threads, .{ m.mem.addr, x, y, k32, rows32, n32 }) catch |e| return mapErr(e);
+            },
+        }
     }
 
     /// Prepares the input of the coming matrix products for the tensor core kernels of a pass of at least
@@ -557,12 +607,13 @@ pub const Engine = struct {
     /// integer ones. `count` is the number of activations in all (`n` rows); `mats` are the products that will read them.
     /// Call it after each producer of a matrix input and before the products.
     fn prepare(self: *Engine, x: u64, count: usize, n: usize, mats: []const DevMat) Error!void {
-        if (n < cuda.tensor_min_tokens or !cuda.hasTensorCores()) return;
         var need_half = false;
         var need_int = false;
-        for (mats) |m| {
-            if (self.gemm.get(m.t).?.imma != null) need_int = true else need_half = true;
-        }
+        for (mats) |m| switch (self.gemm.get(m.t).?.pick(n)) {
+            .dp4a, .imma => need_int = true,
+            .tensor => need_half = true,
+            .gemv, .tiled => {},
+        };
         if (need_half) {
             const pairs: u32 = @intCast(count / 2);
             cuda.launchKernel(self.k.to_half, grid(pairs, elem_threads), elem_threads, .{ self.x16.addr, x, pairs }) catch |e| return mapErr(e);
@@ -600,7 +651,7 @@ pub const Engine = struct {
         const ctx: u32 = @intCast(self.n_ctx);
         const x = self.hidden.addr;
         // Few (token, head) blocks cannot fill the device, so a long context is sliced across several blocks each.
-        const splits: u32 = if (n * cfg.n_heads >= split_below_blocks) 1 else @intCast(std.math.clamp((self.max_pos + min_split_positions) / min_split_positions, 1, max_splits));
+        const splits: u32 = self.splitCount(n);
 
         for (self.layers, 0..) |l, li| {
             try self.rmsNorm(self.xb.addr, x, l.attn_norm.addr, n);
@@ -627,7 +678,7 @@ pub const Engine = struct {
             } else if (splits == 1) {
                 cuda.launchKernel(self.k.attention, @intCast(n * cfg.n_heads), attn_threads, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.att.addr, ctx, hd, n_heads, group, scale }) catch |e| return mapErr(e);
             } else {
-                cuda.launchKernel(self.k.attention_part, @intCast(n * cfg.n_heads * splits), attn_threads, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.attn_part.addr, ctx, hd, n_heads, group, scale, splits }) catch |e| return mapErr(e);
+                cuda.launchKernel(self.k.attention_part_warp orelse self.k.attention_part, @intCast(n * cfg.n_heads * splits), attn_threads, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.attn_part.addr, ctx, hd, n_heads, group, scale, splits }) catch |e| return mapErr(e);
                 cuda.launchKernel(self.k.attention_combine, @intCast(n * cfg.n_heads), attn_threads, .{ self.attn_part.addr, self.att.addr, hd, splits }) catch |e| return mapErr(e);
             }
 
@@ -692,12 +743,50 @@ pub const Engine = struct {
         }
         const t0 = nowSecs();
         if (self.pass_events) |ev| ev[0].record(null) catch |e| return mapErr(e);
-        try self.runBatch(n);
+        try self.runPass(n);
         if (self.pass_events) |ev| ev[1].record(null) catch |e| return mapErr(e);
         if (hidden_io) |h| cuda.copyFromDevice(std.mem.sliceAsBytes(h), self.hidden.addr) catch |e| return mapErr(e);
         self.prof_launch_s += nowSecs() - t0;
         self.prof_passes += 1;
         self.n_last = n;
+    }
+
+    /// Slices the context of each (token, head) is cut into for attention in the current pass.
+    fn splitCount(self: *const Engine, n: usize) u32 {
+        const cfg = self.cfg;
+        if (n * cfg.n_heads >= split_below_blocks) return 1;
+        // The warp kernel gives each of a block's four warps one tile of 32 positions per step, so 128 positions per slice
+        // keep every warp busy; the block kernel wants longer slices.
+        const per_slice: u32 = if (self.slice_positions != 0) self.slice_positions else if (self.k.attention_part_warp != null) 128 else min_split_positions;
+        return @intCast(std.math.clamp((self.max_pos + per_slice) / per_slice, 1, max_splits));
+    }
+
+    /// Runs the kernels of a pass. A pass of a few tokens (decode) is the same sequence of launches every time apart from
+    /// the number of attention slices, so it is captured once per (tokens, slices) and replayed: the data that changes
+    /// (positions, slots, rotary angles, the hidden state) lives in device buffers the kernels read.
+    fn runPass(self: *Engine, n: usize) Error!void {
+        if (n > graph_max_tokens or cuda.profiling.on or cuda.envDisabled("HK_NO_CUDA_GRAPH")) return self.runBatch(n);
+        const key: u32 = @intCast(n | (@as(usize, self.splitCount(n)) << 8));
+        for (self.graphs[0..self.n_graphs]) |g| if (g.key == key) {
+            const st = self.graph_stream.?;
+            g.exec.launch(st) catch |e| return mapErr(e);
+            return;
+        };
+        if (self.n_graphs == max_graphs) return self.runBatch(n);
+        if (self.graph_stream == null) self.graph_stream = cuda.CudaStream.create() catch |e| return mapErr(e);
+        const st = self.graph_stream.?;
+        // Capture: the launches below are recorded, not run. If anything fails the pass is simply run directly.
+        cuda.CudaGraph.beginCapture(st) catch return self.runBatch(n);
+        cuda.setLaunchStream(st);
+        const result = self.runBatch(n);
+        cuda.setLaunchStream(null);
+        var graph = cuda.CudaGraph.endCapture(st) catch return self.runBatch(n);
+        defer graph.destroy();
+        result catch |e| return e;
+        const exec = graph.instantiate() catch return self.runBatch(n);
+        self.graphs[self.n_graphs] = .{ .key = key, .exec = exec };
+        self.n_graphs += 1;
+        exec.launch(st) catch |e| return mapErr(e);
     }
 
     /// Logits of the given items of the last pass, one vocabulary row each, in the order of `indices`. The slice stays
