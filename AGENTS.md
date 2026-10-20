@@ -4,7 +4,7 @@ This file is tool-agnostic (Claude Code, Codex, Cursor, Aider, a human). `CLAUDE
 
 ## Orient in 3 minutes
 
-1. Read [CONTEXT.md](CONTEXT.md) (stable map, commands, standing rules).
+1. Read [CONTEXT.md](docs/plan/CONTEXT.md) (stable map, commands, standing rules).
 2. Read the **Now** section and the last log entry of [docs/plan/HANDOFF.md](docs/plan/HANDOFF.md).
 3. `git status && git log --oneline -5`, then `zig build test` for a baseline. If the tree disagrees with HANDOFF,
    trust the tree and fix HANDOFF.
@@ -52,7 +52,7 @@ put proposed changes in HANDOFF "Open decisions".
 | Changed what works / what's verified | the touched rows in `docs/plan/STATUS.md` |
 | Added/moved/deleted source files, or changed a subsystem's status | `docs/graph/curated.json` if a concept/status changed; then `python3 docs/graph/gen_graph.py` |
 | Found a doc ≠ code mismatch | fix it, or add to STATUS "Known doc/code discrepancies" |
-| Learned a durable owner preference | the agent's memory system (if it has one) and, if it's a project rule, `CONTEXT.md` §5 |
+| Learned a durable owner preference | the agent's memory system (if it has one) and, if it's a project rule, `docs/plan/CONTEXT.md` §5 |
 
 `python3 docs/graph/gen_graph.py --check` fails if the generated graph is stale or a curated node points at a path
 that no longer exists. Run it before ending a session that touched structure.

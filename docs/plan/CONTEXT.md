@@ -2,10 +2,10 @@
 
 > Read this file first, in any session, with any agent. It is the stable map.
 > **Volatile state** (what is half-done right now, what to do next) lives in
-> [docs/plan/HANDOFF.md](docs/plan/HANDOFF.md). **Plan vs. reality** lives in
-> [docs/plan/STATUS.md](docs/plan/STATUS.md). The **target** is
-> [docs/plan/MASTER_PLAN.md](docs/plan/MASTER_PLAN.md). The **queryable graph** is
-> [docs/graph/](docs/graph/README.md).
+> [docs/plan/HANDOFF.md](HANDOFF.md). **Plan vs. reality** lives in
+> [docs/plan/STATUS.md](STATUS.md). The **target** is
+> [docs/plan/MASTER_PLAN.md](MASTER_PLAN.md). The **queryable graph** is
+> [docs/graph/](../graph/README.md).
 
 ## 1. What HK is
 
@@ -163,7 +163,7 @@ found a doc/code discrepancy, fix it or list it in STATUS "Known discrepancies".
 
 | File | Purpose | Changes |
 |:--|:--|:--|
-| `CONTEXT.md` | stable orientation (this file) | rarely |
+| `docs/plan/CONTEXT.md` | stable orientation (this file) | rarely |
 | `AGENTS.md` / `CLAUDE.md` | agent working agreement (CLAUDE.md imports AGENTS.md) | rarely |
 | `docs/plan/MASTER_PLAN.md` | the owner's 160-section target, verbatim | owner only |
 | `docs/plan/STATUS.md` | plan § → code reality matrix with evidence | when status changes |

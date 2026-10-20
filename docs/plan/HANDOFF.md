@@ -1,7 +1,7 @@
 # HK — Handoff
 
 Volatile, session-to-session state. **Newest information goes at the top of "Now"; the log at the bottom is
-append-only.** Stable orientation: [CONTEXT.md](../../CONTEXT.md). Plan vs. reality: [STATUS.md](STATUS.md).
+append-only.** Stable orientation: [CONTEXT.md](CONTEXT.md). Plan vs. reality: [STATUS.md](STATUS.md).
 
 Rules for editing this file: state what was *run* vs. *only read*; never write "done" for something not
 verified; when a "Now" item is finished, move one line of it to the log and delete it from "Now".
@@ -9,6 +9,24 @@ verified; when a "Now" item is finished, move one line of it to the log and dele
 ---
 
 ## Now
+
+### 0. HK 2.0.0 is released (2026-10-21)
+
+PR #5 (`feat/hk-2.0-backends`) was merged into `main` by the owner (ruleset bypass; merge commit `030ba32`, tree identical to the tested `16f765e`). Tag `v2.0.0`
+points at `030ba32`. The release workflow (run `39485175463`) finished green: native binaries for x86_64/aarch64 Linux, aarch64 macOS and x86_64 Windows, the GitHub
+Release, PyPI `hknt` 2.0.0 (confirmed with `pip index versions hknt`), npm `hkntf`, crates.io `hknt`, NuGet and GitHub Packages. Not checked by installing each package.
+CI on the PR head `16f765e` was green on all jobs; CI on `main` after the merge: see the Actions tab.
+
+`main` requires signed commits and PRs, so every later change needs a PR the owner merges. Branch `docs/readme-landing` (this change) cleans the repository root
+(removed `PERFORMANCE_REPORT_KERNELS.md`, the four `run_*_demo.py` scripts, `install.sh`/`install.ps1` (pinned to v1.0.0 and to asset names the release does not
+publish), `models/.gitkeep`; `CONTEXT.md` moved to `docs/plan/`), commits `graphify-out/` (graph, report, html, manifest; the cache stays ignored), and
+rewrites README/CONTRIBUTING. Docs-only: no new tag. **Open decision for the owner:** the GitHub "About" blurb and topics still describe the old project ("137+ architecture support");
+changing them is a repository setting (`gh repo edit`), not done.
+
+**Next: 2.1 hardware acceleration** (branch `feat/hk-2.1-hardware`, off `16f765e`, no commits yet). Candidates: ROCm/HIP (Zig can emit amdgcn code objects: `zig build-lib -dynamic
+-target amdgcn-amdhsa -mcpu gfx1100` gives a valid object; `cuda_device.zig` primitives need an arch abstraction and wave-size handling), Metal, Intel XPU/DirectML (probably documented as
+covered by Vulkan), Android Vulkan; none can be run on this machine (RTX 3050 only), so they ship as "implemented, not run" per the owner. Known performance gaps: Vulkan K-quant prefill and decode,
+CUDA K-quant prefill (~75 %), CPU K-quant prefill. Add a Zig cache to CI (the cross-compile step takes 25 to 40 minutes cold). 2:4 sparse tensor cores are later work.
 
 ### Owner direction (2026-10-20)
 
@@ -71,13 +89,13 @@ Plan: `~/.claude/plans/snug-foraging-quasar.md` (approved 2026-10-20). Checklist
 | 6 CUDA fusion + graphs | **evaluated, not done** | host launch cost measured ~0.4 ms/pass of ~7 ms; GEMV was 72 % of decode, so fixing memory traffic came first (§152). Revisit after Tensor Cores/integer dot products |
 | 7 Vulkan under common API | partly (1a); parity harness not shared yet | |
 | 8 CPU finalized + kernel-stack unification (owner decision 2) | **done** | `quantization.zig` and `tensor_ops.zig` deleted; encoders → `quant/encode.zig`, research formats → `quant/research.zig`, C ABI products → `engine/abi_ops.zig`. Found and fixed: private Q4_K layout, broken Q3_K encoder, silent block skipping in `dequantizeToF32`. The "legacy optimizations worth porting" turned out to be nothing: the legacy code was single-threaded (its thread pool ran inline) and slower |
-| 9 Release gate: §148 compatibility contract | **contract written, release NOT cut** | `docs/wiki/Compatibility.md` "Release contract"; `hk_abi_version()` = 2. No version bump, tag, push or publish was done (owner approves those) |
+| 9 Release gate: §148 compatibility contract | **done; 2.0.0 released 2026-10-21** | `docs/wiki/Compatibility.md` "Release contract"; `hk_abi_version()` = 2; tag `v2.0.0` |
 
 **2.0 readiness (honest assessment, 2026-10-20 evening; branch `feat/hk-2.0-backends`, pushed, draft PR #5):** every §150 item exists and is verified on this machine only (Ryzen 7 7445HS, RTX 3050 6 GB laptop, Arch, driver 615.78). Since the first assessment: Vulkan prompt matmul and attention run on cooperative matrices, CUDA has tensor-core GEMM and flash attention (Zig inline PTX, sm_80 build of the device code), Vulkan has split-KV decode attention, partial offload of leading layers exists on both devices with a planner that picks the largest prefix that fits, and perplexity agrees with llama.cpp and Transformers (`benchmarks/results/2026-10-20-ppl-*.json`: Qwen3-0.6B Q8_0 wikitext-2, 20 windows of 512: llama.cpp 23.67-23.68, hk 23.64-23.68, Transformers f32 23.73). Real-model prefill/decode (tok/s, Qwen3-0.6B Q8_0, 512/128): hk-vulkan ~4,700/~117, hk-cuda ~4,000/~108 (llama.cpp Vulkan measured earlier: 7,032/145.6; llama.cpp CUDA baseline needs a CUDA-capable host compiler, see below). Remaining gaps before calling it 2.0: decode is 20-25 % behind llama.cpp on both devices (CUDA GEMV reaches ~58 % of memory bandwidth; no `dp4a`); prefill still ~1.5x behind llama.cpp Vulkan; automatic selection is a fixed order (Vulkan, then CUDA), not measured; no fusion/graphs; nothing run on a second machine, ARM, macOS or a non-NVIDIA GPU; CI on PR #5 is the first run against Zig 0.17 (Windows/cross-compile failed on an unguarded `std.c.getenv`, fixed in `2fa7da8`; macOS fails `server_tests: an oversized body is refused`, which also fails on `main`, and the test now prints the client error so the next run says why). The CPU executor is a peer struct rather than a union variant of `Device`.
 
 **Benchmark environment (user-level, nothing installed system-wide):** `~/hk-bench/` holds llama.cpp builds (`build` Vulkan, `build-cpu`, `build-cuda` pending), models (`models/`), wikitext-2 (`data/`), CUDA 13.0.2 toolkit assembled from the runfile (`cuda/`; the installer needs libxml2.so.2 which Arch lacks, so it was unpacked with `--noexec` and the nvcc/cudart/cublas components copied), and a GCC 15.2 build in progress (`build_gcc.sh`; nvcc 13.0 rejects the system GCC 16). Harness: `benchmarks/suite.py` (speed, RSS, VRAM; interleaved repeats) and `benchmarks/perplexity.py` (accuracy).
 
-**Release-cut steps (done for 2.0.0, repeat for each milestone):** (1) version in `build.zig.zon`, `pyproject.toml`, `python/hk/__init__.py`, `bindings/{js/package.json + package-lock.json, rust/Cargo.toml + Cargo.lock, java/pom.xml, csharp/Hk.csproj}`, `CITATION.cff`, the banner in `tools/hk_cli.zig`; (2) `## [Unreleased]` → `## [x.y.z] - date` in `CHANGELOG.md` with an upgrade note, a fresh empty `[Unreleased]` above; (3) `SECURITY.md`, `README.md`, `CONTEXT.md`, `STATUS.md`; (4) the whole matrix (Debug, ReleaseFast, `-Dcpu=x86_64_v3`, `-Dcpu=x86_64`, e2e, `tests/bindings/run.sh`, pytest, `gen_graph.py --check`) plus CI on all three OSes; (5) merge the PR into `main`; (6) tag `vX.Y.Z` — the release workflow then builds the native libraries, wheels and packages and publishes PyPI `hknt`, npm `hkntf`, crates.io `hknt`, NuGet and GitHub Packages (not undoable: a published version cannot be replaced); (7) wiki sync (automatic on `docs/wiki` changes).
+**Release-cut steps (done for 2.0.0, repeat for each milestone):** (1) version in `build.zig.zon`, `pyproject.toml`, `python/hk/__init__.py`, `bindings/{js/package.json + package-lock.json, rust/Cargo.toml + Cargo.lock, java/pom.xml, csharp/Hk.csproj}`, `CITATION.cff`, the banner in `tools/hk_cli.zig`; (2) `## [Unreleased]` → `## [x.y.z] - date` in `CHANGELOG.md` with an upgrade note, a fresh empty `[Unreleased]` above; (3) `SECURITY.md`, `README.md`, `docs/plan/CONTEXT.md`, `STATUS.md`; (4) the whole matrix (Debug, ReleaseFast, `-Dcpu=x86_64_v3`, `-Dcpu=x86_64`, e2e, `tests/bindings/run.sh`, pytest, `gen_graph.py --check`) plus CI on all three OSes; (5) merge the PR into `main`; (6) tag `vX.Y.Z` — the release workflow then builds the native libraries, wheels and packages and publishes PyPI `hknt`, npm `hkntf`, crates.io `hknt`, NuGet and GitHub Packages (not undoable: a published version cannot be replaced); (7) wiki sync (automatic on `docs/wiki` changes).
 
 **Bugs of mine found by the process (for the record):** an edit script that died halfway and left `engine.zig` half-edited while I reported it done (assert every anchor); a benchmark that stopped the prefill clock before the async GPU finished, which inflated prefill and deflated decode (end prefill with the first logits); `Engine.init` leaving defaulted fields `undefined`, visible only in Debug (keep Debug in the matrix); equivalent mutants ("every split covers the whole context", "never split") that look like test gaps but are not.
 
@@ -127,3 +145,7 @@ Plan: `~/.claude/plans/snug-foraging-quasar.md` (approved 2026-10-20). Checklist
 - Owner redirected: no 3.0.0 now; follow the §150 milestone order and the §151 chain; keep as much as possible in Zig. Removed the Python seal/journal mirror I had started writing and routed Python through the C ABI instead.
 - Installed **graphify** (`pipx install graphifyy` 0.9.92; command `graphify`). Built the code graph with `graphify extract . --code-only` (local AST, no API key): 4,848 nodes, 9,617 edges, Zig/Python/C#/Rust/TS/Java included. `graphify claude install` appended a "graphify" section to `CLAUDE.md` and wrote PreToolUse hooks to `.claude/settings.json` (machine-specific absolute path — excluded via `.git/info/exclude`; re-run `graphify claude install` on another machine). `graphify-out/` is git-ignored. Not installed: git hooks (`graphify hook install`) — they would run on every commit. Community names are placeholders (naming needs an LLM backend). Refresh with `graphify update .`. `docs/graph/` (curated plan/status graph) stays the source for *meaning*; graphify is the source for *code structure*; both pass their checks.
 - Not run: Windows/macOS/ARM, GPU benchmarks, anything in section B.
+
+### 2026-10-21 — 2.0.0 released; root cleanup
+- Owner merged PR #5 (override), I tagged `v2.0.0` on `030ba32`; release workflow green (see Now §0). Verified before tagging: `origin/main` tree equals the tested tree; Debug/ReleaseFast/v3/baseline 196/196, e2e 26/26, bindings 8 suites, pytest 97 passed / 3 skipped.
+- Branch `docs/readme-landing`: repo root cleaned, `graphify-out/` committed, README/CONTRIBUTING/HANDOFF rewritten; `gen_graph.py --check` is run before the commit. Not run: a fresh `pip install hknt==2.0.0` / `npm install hkntf` smoke test.

@@ -39,9 +39,6 @@ scratch/test_*
 benchmarks/test_*
 benchmarks/*.bin
 benchmarks/model_bench*
-models/*.hk
-models/*.safetensors
-models/*.pt
 *.tmp
 
 # Operating System & IDE
@@ -60,4 +57,6 @@ Thumbs.db
 
 # Fixtures written by the binding tests
 test_*.hk
-graphify-out/
+graphify-out/cache/
+graphify-out/.graphify_*
+graphify-out/*.sig
