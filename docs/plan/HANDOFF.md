@@ -16,10 +16,10 @@ Do **not** ship a "3.0.0". Implement the whole of `MASTER_PLAN.md` and release *
 (§150), built along the dependency chain in §151. 3.0 is the *last* milestone. Also: **keep as much as possible in Zig**
 (Python stays a thin layer over the C ABI; no second implementation of anything Zig already owns).
 
-### A. DONE, UNCOMMITTED: container integrity + crash-safe edits (plan §4, §5; milestone 2.4 items, landed early)
+### A. DONE, COMMITTED (`a1ee4eb`, branch `feat/container-integrity`): container integrity + crash-safe edits (plan §4, §5; milestone 2.4 items, landed early)
 
 Details and numbers: CHANGELOG `[Unreleased]`, STATUS rows 4–5, wiki `Format-Specification` "Integrity and crash safety".
-Working tree on top of `054964b`; nothing committed (owner has not asked).
+Committed on top of `054964b`; not pushed, not tagged.
 
 **Run (2026-10-20):** `zig build test` 148/148 at Debug, ReleaseFast, `-Dcpu=x86_64_v3`, `-Dcpu=x86_64`; `zig build test-e2e -Doptimize=ReleaseFast`
 24/24; `bash tests/bindings/run.sh` 8 suites 0 failed; `pytest tests` 97 passed / 3 skipped (missing `openai`, `jax`, `tkinter`) in a scratch
@@ -48,7 +48,7 @@ Milestone items: backend abstraction · CUDA engine · CUDA decode · CUDA prefi
 CPU backend finalized · unified memory planner · automatic device selection. Chain: graph/model abstraction → backend abstraction → CUDA
 (prefill → decode → attention → fusion/graphs) → memory planner → partial offload → Vulkan optimization.
 
-Nothing of B is started. Backend-interface work is **plan-mode** work (CLAUDE.md) and is blocked on owner decisions 2 and 3 below.
+Nothing of B is started. Backend-interface work is **plan-mode** work (CLAUDE.md); owner decisions 2 and 3 are now made (below), so it is unblocked.
 First concrete step once unblocked: define `Backend` (capabilities, buffer alloc, matmul-by-format, attention, norm, rope, kv ops, sync) in
 `src/backend/`, put the CPU stack and the Vulkan engine behind it with **no behavior change**, prove parity with the existing engine tests,
 then add the operator capability table (§136).
@@ -60,16 +60,15 @@ those can be written and cross-compiled but must be recorded as "not run on hard
 ### Open decisions (owner)
 
 1. ~~Seal cost model~~ — resolved above (revisitable).
-2. **Which kernel stack is canonical?** Plan §9/§15/§17/§20 say "retain the earlier optimizations", but those live in the legacy stack
+2. ~~**Which kernel stack is canonical?**~~ **DECIDED 2026-10-20: the engine stack.** Port the legacy optimizations worth keeping into `src/engine` + `src/quant` + `src/kernels`, then route the C API/Python through the engine kernels and retire `tensor_ops.zig`/`quantization.zig`. (Original question follows.) Plan §9/§15/§17/§20 say "retain the earlier optimizations", but those live in the legacy stack
    (`tensor_ops.zig`), not the engine. Options: port them into the engine stack; or retire the legacy stack and route C API/Python through the engine kernels.
    *Blocks the backend interface design.*
-3. **CUDA path:** adopt `src/cuda.zig` as the base for an engine backend, or restart from the Vulkan engine's structure? (Old commit messages
+3. ~~**CUDA path**~~ **DECIDED 2026-10-20: adopt `src/cuda.zig` as the base** (validate it first — it is unmeasured and wired into nothing). (Original question follows.) Adopt `src/cuda.zig` as the base for an engine backend, or restart from the Vulkan engine's structure? (Old commit messages
    disagree on how well the old CUDA code worked; nothing re-measured.) *Blocks CUDA engine.*
 4. **Sandbox policy (§33):** `CodeSandbox` silently falls back from Docker to an unsandboxed subprocess. Make it fail closed? Likely yes; changes behavior.
 5. ~~Version number~~ — superseded: no version is assigned until a milestone is complete; the CLI banner still says 1.2.0 while packages say 1.1.1 (fix when 2.0 is cut).
 6. **`build.zig` `-Dcuda` default-on** for non-macOS builds although CUDA is off the engine path.
-7. **Commit the integrity work?** Large uncommitted tree on branch `docs/context-system`. Suggested: commit on a new branch `feat/container-integrity`
-   (not main), no tag, no push.
+7. ~~Commit the integrity work?~~ **DONE 2026-10-20:** commit `a1ee4eb` on branch `feat/container-integrity` (off `docs/context-system`). No tag, no push, no release.
 
 ### Verified facts worth not re-deriving
 
