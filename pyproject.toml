@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hknt"
 version = "2.0.0"
-description = "Memory-first LLM runtime and universal model container in Zig: zero-copy mmap, CPU/CUDA/Vulkan engines, 2:4 sparse storage, Net2Net growth, in-file version history, self-learning loops."
+description = "From-scratch LLM runtime and model format in Zig: zero-copy mmap, CPU/CUDA/Vulkan engines, 2:4 sparsity, Net2Net growth, in-file version history, self-learning loops."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }

@@ -1,6 +1,6 @@
 # hk
 
-hk is a memory-first local LLM runtime and a universal model container, written in Zig. One binary downloads a model from Hugging Face, converts it to the `.hk` format while it downloads (zero-copy memory mapped, sealed, crash safe), and runs it on CPU, CUDA or Vulkan in a terminal or behind an OpenAI compatible server. Around that sit research features: 2:4 structured sparsity (storage only so far), Net2Net model growth, an in-file version history and self-learning loops for LLMs, each marked with what is tested.
+hk is a memory-first local LLM runtime and a universal model container, written in Zig. One binary downloads a model from Hugging Face, converts it to the `.hk` format while it downloads (zero-copy memory mapped, sealed, crash safe), and runs it on CPU, CUDA or Vulkan in a terminal or behind an OpenAI compatible server. Around that sit the bigger bets: 2:4 structured sparsity (storage only so far), Net2Net model growth, an in-file version history and self-learning loops for LLMs, each marked with what is tested.
 
 This wiki says what each part does, how to use it, and how well it works, including where it does not work yet. If a page makes a claim, the claim has a number or a test behind it, or it says that it does not.
 
