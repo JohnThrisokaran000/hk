@@ -525,7 +525,9 @@ inline fn ue4m3Half(x: u8) f32_ {
     const raw: f32_ = if (exp == 0)
         man * 0x1p-9
     else
-        (1.0 + man / 8.0) * std.math.pow(f32_, 2.0, @as(f32_, @floatFromInt(exp - 7)));
+        // 2^(exp - 7) is exactly representable; building it from its bits avoids a libm call (and so also
+        // compiles for the GPU) and gives the same value `pow` did.
+        (1.0 + man / 8.0) * @as(f32_, @bitCast(@as(u32, @intCast(exp - 7 + 127)) << 23));
     return raw * 0.5;
 }
 

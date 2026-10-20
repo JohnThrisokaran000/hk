@@ -132,6 +132,9 @@ const DriverApi = struct {
 // ---------------------------------------------------------------------
 const PTX_SOURCE: [:0]const u8 = @embedFile("cuda/hk_cuda.ptx");
 
+/// PTX compiled by `build.zig` from `src/cuda_device.zig` (device code written in Zig, nvptx64).
+const DEVICE_PTX: [:0]const u8 = if (enabled) @embedFile("cuda_device_ptx") else "";
+
 const DriverState = struct {
     lib_handle: ?*anyopaque = null,
     api: ?DriverApi = null,
@@ -140,6 +143,10 @@ const DriverState = struct {
     device: CuDevice = 0,
     context: CuContext = null,
     module: CuModule = null,
+    /// The Zig-built device module (`DEVICE_PTX`). Null when the driver rejected it; `deviceFunction` then reports it.
+    dev_module: CuModule = null,
+    /// Kernel handles of the device module, looked up on first use.
+    dev_fns: std.StringHashMapUnmanaged(CuFunction) = .empty,
 
     // Kernel Function Pointers
     fn_gemv_f32: CuFunction = null,
@@ -252,6 +259,9 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
     global_state.device = dev;
     global_state.context = ctx;
     global_state.module = mod;
+
+    var dmod: CuModule = null;
+    if (api.cuModuleLoadData(&dmod, DEVICE_PTX.ptr) == 0) global_state.dev_module = dmod;
 
     _ = api.cuModuleGetFunction(&global_state.fn_gemv_f32, mod, "gemvF32KernelOpt");
     _ = api.cuModuleGetFunction(&global_state.fn_gemv_q8_0, mod, "gemvQ8_0KernelOpt");
@@ -949,4 +959,49 @@ pub fn fusedSwiGluResidual(gate: anytype, up: anytype, res: anytype, hidden_dim:
     if (toDevicePtr(res) != 0 and dim > 0) {
         try addResidual(gate, res, dim);
     }
+}
+
+// ---------------------------------------------------------------------
+// Device module built from Zig (src/cuda_device.zig)
+// ---------------------------------------------------------------------
+
+/// Looks up a kernel of the Zig device module by name; the handle is cached.
+fn deviceFunction(name: []const u8) !CuFunction {
+    const s = try ensureDriver();
+    if (s.dev_module == null) return CudaError.KernelNotFound;
+    global_mutex.lock();
+    defer global_mutex.unlock();
+    if (s.dev_fns.get(name)) |f| return f;
+    var buf: [64]u8 = undefined;
+    if (name.len >= buf.len) return CudaError.KernelNotFound;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    var f: CuFunction = null;
+    if (s.api.?.cuModuleGetFunction(&f, s.dev_module, @ptrCast(&buf)) != 0 or f == null) return CudaError.KernelNotFound;
+    const key = std.heap.page_allocator.dupe(u8, name) catch return error.OutOfMemory;
+    s.dev_fns.put(std.heap.page_allocator, key, f) catch return error.OutOfMemory;
+    return f;
+}
+
+/// Threads per block of the matrix-vector kernels (one block per output row).
+pub const gemv_block_threads: c_uint = 128;
+
+/// y[0..m] = W[m x k] * x, with W stored as `t` blocks row after row (the container's layout), run by the Zig device
+/// kernel for that format. `k` must be a whole number of blocks. The same block decoders the CPU engine uses run on
+/// the device, so every format the CPU decodes is available here.
+pub fn deviceGemv(t: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize) !void {
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "gemv_{s}", .{@tagName(t)}) catch return CudaError.UnsupportedStorageType;
+    const f = deviceFunction(name) catch |e| switch (e) {
+        error.KernelNotFound => return CudaError.UnsupportedStorageType,
+        else => return e,
+    };
+    const s = try ensureDriver();
+    var d_w = toDevicePtr(w);
+    var d_x = toDevicePtr(x);
+    var d_y = toDevicePtr(y);
+    var k_val: u32 = @intCast(k);
+    var params = [_]?*anyopaque{ @ptrCast(&d_w), @ptrCast(&d_x), @ptrCast(&d_y), @ptrCast(&k_val) };
+    const res = s.api.?.cuLaunchKernel(f, @intCast(m), 1, 1, gemv_block_threads, 1, 1, 0, null, &params, null);
+    if (res != 0) return CudaError.CudaCallFailed;
 }

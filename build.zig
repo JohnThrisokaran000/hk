@@ -41,6 +41,23 @@ pub fn build(b: *std.Build) void {
         if (target.result.os.tag != .windows) {
             hk_mod.linkSystemLibrary("dl", .{});
         }
+        // Device code is Zig too (src/cuda_device.zig). Zig compiles it to PTX, which the host embeds and the driver
+        // JIT-compiles for the installed GPU, so no CUDA toolkit is needed to build HK. sm_70 is the oldest
+        // architecture with the warp shuffles the kernels use; newer GPUs JIT it forward.
+        const device_target = b.resolveTargetQuery(.{
+            .cpu_arch = .nvptx64,
+            .os_tag = .cuda,
+            .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_70 },
+        });
+        const device_obj = b.addObject(.{
+            .name = "hk_cuda_device",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cuda_device.zig"),
+                .target = device_target,
+                .optimize = .fast,
+            }),
+        });
+        hk_mod.addAnonymousImport("cuda_device_ptx", .{ .root_source_file = device_obj.getEmittedAsm() });
     }
 
     // Shared Library (DLL / .so / .dylib) for C ABI bindings (Python ctypes, C#, etc.)

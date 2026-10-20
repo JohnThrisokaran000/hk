@@ -5,18 +5,18 @@
  "stats": {
   "curated_nodes": 79,
   "curated_edges": 153,
-  "file_nodes": 171,
-  "import_edges": 391,
+  "file_nodes": 172,
+  "import_edges": 394,
   "unowned_files": 0,
   "status_counts": {
    "done": 8,
-   "partial": 15,
+   "partial": 16,
    "in-progress": 2,
    "prototype": 8,
    "storage-only": 1,
    "legacy": 2,
    "untested-hw": 0,
-   "not-started": 23
+   "not-started": 22
   }
  },
  "nodes": [
@@ -682,15 +682,17 @@
   },
   {
    "id": "backend-cuda-engine",
-   "type": "planned",
+   "type": "subsystem",
    "label": "CUDA engine backend (Tensor Cores, graphs)",
-   "status": "not-started",
+   "status": "partial",
    "plan": [
     57,
     150
    ],
-   "paths": [],
-   "note": ""
+   "paths": [
+    "src/cuda_device.zig"
+   ],
+   "note": "Stage 3a: device code in Zig (nvptx64 PTX built by build.zig, no CUDA toolkit). One generic GEMV kernel for all 26 CPU formats reuses quant/dequant.zig; verified vs CPU on RTX 3050. No engine/forward pass, prefill, attention, Tensor Cores or graphs yet."
   },
   {
    "id": "backend-metal",
@@ -1658,7 +1660,7 @@
    "type": "file",
    "label": "src/cuda.zig",
    "lang": "zig",
-   "loc": 952,
+   "loc": 1007,
    "owner": "backend-cuda-standalone"
   },
   {
@@ -1676,6 +1678,14 @@
    "lang": "cuda",
    "loc": 404,
    "owner": "backend-cuda-standalone"
+  },
+  {
+   "id": "file:src/cuda_device.zig",
+   "type": "file",
+   "label": "src/cuda_device.zig",
+   "lang": "zig",
+   "loc": 140,
+   "owner": "backend-cuda-engine"
   },
   {
    "id": "file:src/engine.zig",
@@ -1946,7 +1956,7 @@
    "type": "file",
    "label": "src/quant/dequant.zig",
    "lang": "zig",
-   "loc": 602,
+   "loc": 604,
    "owner": "quant-formats"
   },
   {
@@ -2266,7 +2276,7 @@
    "type": "file",
    "label": "tests/test_cuda.zig",
    "lang": "zig",
-   "loc": 265,
+   "loc": 351,
    "owner": "backend-cuda-standalone"
   },
   {
@@ -3982,6 +3992,11 @@
    "type": "implemented_by"
   },
   {
+   "s": "backend-cuda-engine",
+   "t": "file:src/cuda_device.zig",
+   "type": "implemented_by"
+  },
+  {
    "s": "tests-suite",
    "t": "file:tests/conftest.py",
    "type": "implemented_by"
@@ -4929,6 +4944,21 @@
   {
    "s": "file:src/cuda.zig",
    "t": "file:src/format.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda_device.zig",
+   "t": "file:src/format.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda_device.zig",
+   "t": "file:src/quant/blocks.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/cuda_device.zig",
+   "t": "file:src/quant/dequant.zig",
    "type": "imports"
   },
   {
@@ -6132,6 +6162,16 @@
    "s": "backend-abstraction",
    "t": "quant-formats",
    "imports": 1
+  },
+  {
+   "s": "backend-cuda-engine",
+   "t": "format-core",
+   "imports": 1
+  },
+  {
+   "s": "backend-cuda-engine",
+   "t": "quant-formats",
+   "imports": 2
   },
   {
    "s": "backend-cuda-standalone",

@@ -263,3 +263,89 @@ test "cuda stream and event profiling" {
     const elapsed = try cuda.CudaEvent.elapsedMs(&start, &end);
     try std.testing.expect(elapsed >= 0.0);
 }
+
+/// Fills `dst` (whole blocks of `t`) with random bytes, re-rolling any block that does not decode to small finite
+/// values (a random f16 scale is often inf/NaN), so the test data is a valid, well-conditioned tensor.
+fn randomBlocks(comptime t: hk.format.StorageType, rand: std.Random, dst: []u8) !void {
+    const info = comptime hk.quant.blocks.info(t).?;
+    var decoded: [info.elems]f32 = undefined;
+    var off: usize = 0;
+    while (off < dst.len) : (off += info.bytes) {
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            if (attempts > 2000) return error.CouldNotBuildValidBlock;
+            rand.bytes(dst[off..][0..info.bytes]);
+            try hk.quant.dequantizeRow(t, dst[off..][0..info.bytes], &decoded);
+            var ok = true;
+            for (decoded) |v| {
+                if (!std.math.isFinite(v) or @abs(v) > 1000) ok = false;
+            }
+            if (ok) break;
+        }
+    }
+}
+
+test "device gemv matches the CPU decoders for every format the CPU runs" {
+    if (!cuda.isAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(2024);
+    const rand = prng.random();
+    const M: usize = 9;
+    const K: usize = 512; // a whole number of blocks for 1, 32, 64 and 256 element formats
+
+    const x = try allocator.alloc(f32, K);
+    defer allocator.free(x);
+    for (x) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
+    const d_x = try cuda.DeviceBuffer.upload(std.mem.sliceAsBytes(x));
+    defer d_x.free();
+    const d_y = try cuda.DeviceBuffer.allocUninit(M * @sizeOf(f32));
+    defer d_y.free();
+
+    var tested: usize = 0;
+    inline for (comptime std.enums.values(hk.format.StorageType)) |t| {
+        if (comptime hk.quant.vecdot.supported(t)) {
+            const info = comptime hk.quant.blocks.info(t).?;
+            const row_bytes = K / info.elems * info.bytes;
+            const w = try allocator.alloc(u8, M * row_bytes);
+            defer allocator.free(w);
+            try randomBlocks(t, rand, w);
+
+            const dec = try allocator.alloc(f32, K);
+            defer allocator.free(dec);
+            const want = try allocator.alloc(f64, M);
+            defer allocator.free(want);
+            const scale = try allocator.alloc(f64, M);
+            defer allocator.free(scale);
+            for (0..M) |r| {
+                try hk.quant.dequantizeRow(t, w[r * row_bytes ..][0..row_bytes], dec);
+                var s: f64 = 0;
+                var mag: f64 = 0;
+                for (dec, x) |a, b| {
+                    s += @as(f64, a) * b;
+                    mag += @abs(@as(f64, a) * b);
+                }
+                want[r] = s;
+                scale[r] = mag;
+            }
+
+            const d_w = try cuda.DeviceBuffer.upload(w);
+            defer d_w.free();
+            try cuda.deviceGemv(t, d_w, d_x, d_y, M, K);
+            try cuda.synchronize();
+            const got = try allocator.alloc(f32, M);
+            defer allocator.free(got);
+            try d_y.download(std.mem.sliceAsBytes(got));
+
+            for (0..M) |r| {
+                // f32 accumulation in a different order: error scales with the sum of magnitudes, not the result.
+                const tol = 1e-4 * scale[r] + 1e-6;
+                if (@abs(@as(f64, got[r]) - want[r]) > tol) {
+                    std.debug.print("format {s} row {d}: device {d} cpu {d} (tol {d})\n", .{ @tagName(t), r, got[r], want[r], tol });
+                    return error.DeviceMismatch;
+                }
+            }
+            tested += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 26), tested);
+}
