@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const format = @import("format.zig");
+const envvar = @import("envvar.zig");
 
 pub const enabled = build_options.cuda;
 
@@ -273,7 +274,7 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
     // keeps the portable build. If the driver rejects the sm_80 module the portable one is used instead.
     var cc_major: c_int = 0;
     _ = api.cuDeviceGetAttribute(&cc_major, 75, dev);
-    if (cc_major >= 8 and std.c.getenv("HK_NO_TENSOR_CORES") == null and api.cuModuleLoadData(&dmod, DEVICE_PTX_SM80.ptr) == 0) {
+    if (cc_major >= 8 and !envvar.isSet("HK_NO_TENSOR_CORES") and api.cuModuleLoadData(&dmod, DEVICE_PTX_SM80.ptr) == 0) {
         global_state.dev_module = dmod;
         global_state.tensor_cores = true;
     } else {

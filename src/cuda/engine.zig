@@ -36,6 +36,7 @@ pub const Error = error{
     OutOfMemory,
     OutOfDeviceMemory,
     DeviceFailed,
+    PartialEngine,
 };
 
 pub const Options = struct {
@@ -45,6 +46,15 @@ pub const Options = struct {
     n_ctx: usize = 2048,
     /// Sequences that can use the device at once.
     slots: usize = 1,
+    /// Leading layers to run on the device; 0, or all layers or more, means the whole network. With fewer, the
+    /// embedding and everything after the last device layer stay on the CPU (partial offload): the device takes hidden
+    /// states in and gives them back through `forwardPartial`.
+    layers: usize = 0,
+
+    /// Layers the device runs for a model of `n_layers`.
+    pub fn layerCount(self: Options, n_layers: usize) usize {
+        return if (self.layers == 0 or self.layers >= n_layers) n_layers else self.layers;
+    }
 };
 
 /// Threads per block of the reduction kernels (one block per row/head).
@@ -113,18 +123,31 @@ const Kernels = struct {
 };
 
 /// Bytes the engine needs on the device for `w` with options `o`, with a margin for the driver.
+/// Device bytes of the weights of layer `i`.
+pub fn layerBytes(w: *const weights_mod.Weights, i: usize) u64 {
+    const l = w.layers[i];
+    var total: u64 = 0;
+    for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| total += m.data.len;
+    total += 4 * (l.attn_norm.len + l.ffn_norm.len);
+    for ([_]?[]const f32{ l.bq, l.bk, l.bv, l.q_norm, l.k_norm }) |v| {
+        if (v) |sl| total += 4 * sl.len;
+    }
+    return total;
+}
+
 pub fn bytesNeeded(w: *const weights_mod.Weights, cfg: Config, o: Options) u64 {
     var total: u64 = 0;
-    for (w.layers) |l| {
+    const nl = o.layerCount(w.layers.len);
+    for (w.layers[0..nl]) |l| {
         for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| total += m.data.len;
         total += 4 * (l.attn_norm.len + l.ffn_norm.len);
         for ([_]?[]const f32{ l.bq, l.bk, l.bv, l.q_norm, l.k_norm }) |v| {
             if (v) |s| total += 4 * s.len;
         }
     }
-    total += w.output.data.len + 4 * w.out_norm.len;
+    if (nl == w.layers.len) total += w.output.data.len + 4 * w.out_norm.len;
     const kv_per_layer: u64 = 2 * @as(u64, o.slots) * o.n_ctx * cfg.n_kv_heads * cfg.head_dim * 2;
-    total += kv_per_layer * cfg.n_layers;
+    total += kv_per_layer * nl;
     // Activations are [batch][...]: xb, hidden, tmp (dim); q, att (qDim); k, v (kvDim); gate, up (ffn); cos, sin.
     const per_token: u64 = (3 * @as(u64, cfg.dim) + 2 * cfg.qDim() + 2 * cfg.kvDim() + 2 * cfg.ffn_dim + cfg.rope_dim) * 4 + 8;
     total += per_token * o.n_batch;
@@ -142,6 +165,8 @@ pub const Engine = struct {
     n_slots: usize,
     max_rows: usize,
     layers: []DevLayer,
+    /// Only the leading layers are on the device (no final norm or output matrix).
+    partial: bool,
     out_norm: cuda.DeviceMem,
     output: DevMat,
     tok_embd: Mat,
@@ -216,13 +241,16 @@ pub const Engine = struct {
     ) Error!Engine {
         if (cfg.head_dim > max_head_dim or cfg.head_dim % 2 != 0) return error.UnsupportedShape;
         if (cfg.n_heads % cfg.n_kv_heads != 0 or cfg.rope_dim > cfg.head_dim) return error.UnsupportedShape;
-        for (w.layers) |l| {
+        const nl = o.layerCount(w.layers.len);
+        const partial = nl < w.layers.len;
+        for (w.layers[0..nl]) |l| {
             for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| if (!supports(m.t)) return error.UnsupportedType;
         }
-        if (!supports(w.output.t)) return error.UnsupportedType;
-        if (!supports(w.tok_embd.t)) return error.UnsupportedType;
+        if (!partial and !supports(w.output.t)) return error.UnsupportedType;
+        if (!partial and !supports(w.tok_embd.t)) return error.UnsupportedType;
 
         var self: Engine = undefined;
+        self.partial = partial;
         self.allocator = allocator;
         self.cfg = cfg;
         self.n_batch = o.n_batch;
@@ -267,9 +295,9 @@ pub const Engine = struct {
         var made = Made{ .allocator = allocator };
         errdefer made.release();
 
-        self.layers = try allocator.alloc(DevLayer, w.layers.len);
+        self.layers = try allocator.alloc(DevLayer, nl);
         made.layers = self.layers;
-        for (w.layers, self.layers) |l, *d| {
+        for (w.layers[0..nl], self.layers) |l, *d| {
             d.attn_norm = try made.vec(l.attn_norm);
             d.wq = try self.upload(&made, l.wq);
             d.wk = try self.upload(&made, l.wk);
@@ -285,8 +313,13 @@ pub const Engine = struct {
             d.w_up = try self.upload(&made, l.w_up);
             d.w_down = try self.upload(&made, l.w_down);
         }
-        self.out_norm = try made.vec(w.out_norm);
-        self.output = try self.upload(&made, w.output);
+        if (partial) {
+            self.out_norm = .{ .addr = 0, .len = 0 };
+            self.output = .{ .mem = .{ .addr = 0, .len = 0 }, .t = .f32, .rows = 0, .cols = 0 };
+        } else {
+            self.out_norm = try made.vec(w.out_norm);
+            self.output = try self.upload(&made, w.output);
+        }
 
         const f = 4; // bytes of an f32
         const rows = o.n_batch;
@@ -305,7 +338,7 @@ pub const Engine = struct {
         self.sin_dev = try made.empty(o.n_batch * half * f);
         self.logits_dev = try made.empty(self.max_rows * cfg.vocab * f);
 
-        const kv_bytes = cfg.n_layers * cfg.n_kv_heads * o.n_ctx * cfg.head_dim * 2;
+        const kv_bytes = nl * cfg.n_kv_heads * o.n_ctx * cfg.head_dim * 2;
         self.kcache = try allocator.alloc(cuda.DeviceMem, o.slots);
         made.kcache = self.kcache;
         self.vcache = try allocator.alloc(cuda.DeviceMem, o.slots);
@@ -426,8 +459,10 @@ pub const Engine = struct {
             }
         }
         a.free(self.layers);
-        cuda.deviceFree(self.out_norm);
-        cuda.deviceFree(self.output.mem);
+        if (!self.partial) {
+            cuda.deviceFree(self.out_norm);
+            cuda.deviceFree(self.output.mem);
+        }
         for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
         for (self.kcache, self.vcache) |kc, vc| {
             cuda.deviceFree(kc);
@@ -565,6 +600,18 @@ pub const Engine = struct {
 
     /// Runs one forward pass over `items`. Items that share a cache must appear in increasing position order.
     pub fn forward(self: *Engine, items: []const kv_mod.Item) Error!void {
+        if (self.partial) return error.PartialEngine;
+        return self.forwardImpl(items, null);
+    }
+
+    /// A partial engine's pass: `hidden` holds the embedded tokens ([n][dim], from the CPU) on the way in and the state
+    /// after the last device layer on the way out.
+    pub fn forwardPartial(self: *Engine, items: []const kv_mod.Item, hidden: []f32) Error!void {
+        std.debug.assert(self.partial and hidden.len >= items.len * self.cfg.dim);
+        return self.forwardImpl(items, hidden[0 .. items.len * self.cfg.dim]);
+    }
+
+    fn forwardImpl(self: *Engine, items: []const kv_mod.Item, hidden_io: ?[]f32) Error!void {
         const n = items.len;
         const cfg = self.cfg;
         std.debug.assert(n >= 1 and n <= self.n_batch);
@@ -572,15 +619,18 @@ pub const Engine = struct {
         const rb = self.tok_embd.rowBytes();
         for (items, 0..) |it, t| {
             if (it.pos >= self.n_ctx) return error.ContextFull;
-            const row = self.tok_embd.data[@as(usize, it.token) * rb ..][0..rb];
-            quant.dequantizeRow(self.tok_embd.t, row, self.embed_h[t * cfg.dim ..][0..cfg.dim]) catch return error.UnsupportedType;
+            if (hidden_io == null) {
+                const row = self.tok_embd.data[@as(usize, it.token) * rb ..][0..rb];
+                quant.dequantizeRow(self.tok_embd.t, row, self.embed_h[t * cfg.dim ..][0..cfg.dim]) catch return error.UnsupportedType;
+            }
             ops.ropeAngles(self.cos_h[t * half ..][0..half], self.sin_h[t * half ..][0..half], self.inv_freq, it.pos, self.mscale);
         }
         for (items, 0..) |it, t| {
             self.slot_h[t] = @intCast(try self.slotFor(it.kv));
             self.pos_h[t] = it.pos;
         }
-        cuda.copyToDevice(self.hidden.addr, std.mem.sliceAsBytes(self.embed_h[0 .. n * cfg.dim])) catch |e| return mapErr(e);
+        const hidden_in = if (hidden_io) |h| h else self.embed_h[0 .. n * cfg.dim];
+        cuda.copyToDevice(self.hidden.addr, std.mem.sliceAsBytes(hidden_in)) catch |e| return mapErr(e);
         cuda.copyToDevice(self.cos_dev.addr, std.mem.sliceAsBytes(self.cos_h[0 .. n * half])) catch |e| return mapErr(e);
         cuda.copyToDevice(self.sin_dev.addr, std.mem.sliceAsBytes(self.sin_h[0 .. n * half])) catch |e| return mapErr(e);
         cuda.copyToDevice(self.item_slot.addr, std.mem.sliceAsBytes(self.slot_h[0..n])) catch |e| return mapErr(e);
@@ -596,6 +646,7 @@ pub const Engine = struct {
         if (self.pass_events) |ev| ev[0].record(null) catch |e| return mapErr(e);
         try self.runBatch(n);
         if (self.pass_events) |ev| ev[1].record(null) catch |e| return mapErr(e);
+        if (hidden_io) |h| cuda.copyFromDevice(std.mem.sliceAsBytes(h), self.hidden.addr) catch |e| return mapErr(e);
         self.prof_launch_s += nowSecs() - t0;
         self.prof_passes += 1;
         self.n_last = n;

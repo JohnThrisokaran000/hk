@@ -9,6 +9,9 @@
 //!     cannot hold the model plus a context of at least `min_ctx` positions;
 //!   * the context is halved until the model fits in 90 % of free device memory (headroom for the driver and
 //!     fragmentation), and the caller learns the context it actually got;
+//!   * a model that does not fit whole can still use a device that supports partial offload: the leading layers go to
+//!     the device and the rest stay on the CPU, as many as fit at the requested context (or exactly the number the
+//!     user asked for);
 //!   * nothing is chosen silently: when no device is chosen the plan says why, per device.
 
 const std = @import("std");
@@ -50,11 +53,34 @@ pub fn wants(choice: Choice) Wants {
     };
 }
 
+/// Most layers a partial offload plan can describe.
+pub const max_layers = 256;
+
+/// What running only the leading layers on a device costs. Weights differ from layer to layer (mixed quantizations),
+/// so they are listed; the KV cache of one layer is the same for every layer.
+pub const Partial = struct {
+    layers: usize,
+    /// Activations and runtime, independent of the layer count and the context.
+    fixed: u64,
+    /// KV cache bytes of one layer per context position.
+    per_layer_ctx: u64,
+    layer_bytes: [max_layers]u64 = @splat(0),
+
+    /// Bytes for the first `k` layers at context `n_ctx`.
+    pub fn at(self: *const Partial, k: usize, n_ctx: usize) u64 {
+        var total = self.fixed;
+        for (self.layer_bytes[0..k]) |b| total +|= b;
+        return total +| self.per_layer_ctx *| n_ctx *| k;
+    }
+};
+
 /// Memory a target needs: a fixed part (weights, activations, runtime) plus a part that grows with the context
 /// (the KV cache of every slot).
 pub const Need = struct {
     base: u64,
     per_ctx: u64,
+    /// Present when the target can run a prefix of the layers.
+    partial: ?Partial = null,
 
     pub fn at(self: Need, n_ctx: usize) u64 {
         return self.base +| self.per_ctx *| n_ctx;
@@ -77,6 +103,8 @@ pub const Why = union(enum) {
     unavailable: []const u8,
     unsupported_format: StorageType,
     does_not_fit: struct { needed: u64, free: u64 },
+    /// `--gpu-layers` asked for a number of layers whose weights and cache do not fit.
+    layers_do_not_fit: struct { layers: usize, needed: u64, free: u64 },
 };
 
 pub const Rejection = struct { target: Target, why: Why };
@@ -88,6 +116,8 @@ pub const Plan = struct {
     target: Target = .cpu,
     /// The context the chosen target will reserve (equals the request unless it had to shrink).
     n_ctx: usize,
+    /// Leading layers the target runs; 0 means the whole network.
+    layers: usize = 0,
     device_name: []const u8 = "",
     rejections: [max_rejections]Rejection = undefined,
     n_rejections: usize = 0,
@@ -109,9 +139,15 @@ pub const Inputs = struct {
     n_ctx: usize,
     /// Smallest context worth running a device with; below it the device is rejected.
     min_ctx: usize = 512,
+    /// Exactly this many leading layers on the device (`--gpu-layers`); null lets the planner decide. A count of all
+    /// layers or more means the whole network.
+    force_layers: ?usize = null,
     /// Device candidates, best first. The CPU is the implicit last resort and is not listed.
     candidates: []const Candidate,
 };
+
+/// Smallest context a whole-model plan shrinks to when partial offload is the alternative.
+const whole_floor: usize = 2048;
 
 /// Fraction of free device memory the plan may use, as numerator over 10.
 const headroom_tenths: u64 = 9;
@@ -131,9 +167,42 @@ pub fn plan(in: Inputs) Plan {
             continue;
         }
         const budget = c.free_bytes / 10 * headroom_tenths;
+        // An explicit layer count below the model's depth is a partial plan, whatever would fit.
+        if (in.force_layers) |want| if (c.need.partial) |part| if (want < part.layers) {
+            if (want == 0) continue;
+            if (part.at(want, in.n_ctx) > budget) {
+                p.reject(c.target, .{ .layers_do_not_fit = .{ .layers = want, .needed = part.at(want, in.n_ctx), .free = c.free_bytes } });
+                continue;
+            }
+            p.target = c.target;
+            p.n_ctx = in.n_ctx;
+            p.layers = want;
+            p.device_name = c.device_name;
+            return p;
+        };
+        // A target that can offload part of the model keeps a usable context rather than shrinking it to the minimum:
+        // below `whole_floor` the model goes partial instead.
+        const floor = if (c.need.partial != null) @max(in.min_ctx, @min(in.n_ctx, whole_floor)) else in.min_ctx;
         var ctx = in.n_ctx;
-        while (c.need.at(ctx) > budget and ctx > in.min_ctx) ctx = @max(in.min_ctx, ctx / 2);
+        while (c.need.at(ctx) > budget and ctx > floor) ctx = @max(floor, ctx / 2);
         if (c.need.at(ctx) > budget) {
+            // Not whole. Run as many leading layers as fit at the requested context, if the target can.
+            if (c.need.partial) |part| {
+                var pctx = in.n_ctx;
+                while (true) {
+                    var k = part.layers - 1;
+                    while (k > 0 and part.at(k, pctx) > budget) k -= 1;
+                    if (k > 0) {
+                        p.target = c.target;
+                        p.n_ctx = pctx;
+                        p.layers = k;
+                        p.device_name = c.device_name;
+                        return p;
+                    }
+                    if (pctx <= in.min_ctx) break;
+                    pctx = @max(in.min_ctx, pctx / 2);
+                }
+            }
             p.reject(c.target, .{ .does_not_fit = .{ .needed = c.need.at(ctx), .free = c.free_bytes } });
             continue;
         }
@@ -158,6 +227,7 @@ pub fn writeReason(r: Rejection, w: *std.Io.Writer) std.Io.Writer.Error!void {
         .unavailable => |msg| try w.writeAll(msg),
         .unsupported_format => |t| try w.print("a weight format ({s}) has no {s} kernel yet", .{ @tagName(t), api }),
         .does_not_fit => |f| try w.print("the model needs {d} MiB and only {d} MiB are free", .{ f.needed >> 20, f.free >> 20 }),
+        .layers_do_not_fit => |f| try w.print("{d} layers need {d} MiB and only {d} MiB are free", .{ f.layers, f.needed >> 20, f.free >> 20 }),
     }
 }
 
@@ -265,4 +335,64 @@ test "describe prints one line per rejection" {
         "CUDA: no CUDA driver found\nVulkan: a weight format (iq2_xs) has no Vulkan kernel yet\n",
         w.buffered(),
     );
+}
+
+fn partialCand(target: Target, free_mib: u64, layers: usize, layer_mib: u64, fixed_mib: u64, per_layer_ctx_kib: u64) Candidate {
+    var part = Partial{ .layers = layers, .fixed = fixed_mib * mib, .per_layer_ctx = per_layer_ctx_kib * 1024 };
+    var total: u64 = 0;
+    for (0..layers) |i| {
+        part.layer_bytes[i] = layer_mib * mib;
+        total += layer_mib * mib;
+    }
+    return .{
+        .target = target,
+        .device_name = "fake",
+        .free_bytes = free_mib * mib,
+        .need = .{ .base = fixed_mib * mib + total, .per_ctx = per_layer_ctx_kib * 1024 * layers, .partial = part },
+    };
+}
+
+test "a model that does not fit runs as many leading layers as fit, at the requested context" {
+    // 32 layers of 200 MiB, 100 MiB fixed, 16 KiB per layer per position: at 4096 positions a layer costs 264 MiB.
+    // Budget 90 % of 4000 = 3600 MiB -> (3600 - 100) / 264 = 13 layers.
+    const cs = [_]Candidate{partialCand(.vulkan, 4000, 32, 200, 100, 16)};
+    const p = plan(.{ .n_ctx = 4096, .candidates = &cs });
+    try std.testing.expectEqual(Target.vulkan, p.target);
+    try std.testing.expectEqual(@as(usize, 13), p.layers);
+    try std.testing.expectEqual(@as(usize, 4096), p.n_ctx);
+}
+
+test "a model that fits whole is never split, and a target without partial support is rejected as before" {
+    const fits = [_]Candidate{partialCand(.vulkan, 20000, 32, 200, 100, 16)};
+    const p = plan(.{ .n_ctx = 4096, .candidates = &fits });
+    try std.testing.expectEqual(@as(usize, 0), p.layers);
+    const whole_only = [_]Candidate{cand(.vulkan, 4000, 6000, 1)};
+    const q = plan(.{ .n_ctx = 4096, .candidates = &whole_only });
+    try std.testing.expectEqual(Target.cpu, q.target);
+}
+
+test "partial offload keeps the context instead of shrinking the whole model to the minimum" {
+    // Whole needs 32 * 200 + 100 = 6500 MiB + KV; free is 5000 -> not whole at the floor either, so partial at 8192.
+    const cs = [_]Candidate{partialCand(.cuda, 5000, 32, 200, 100, 16)};
+    const p = plan(.{ .n_ctx = 8192, .candidates = &cs });
+    try std.testing.expect(p.layers > 0 and p.layers < 32);
+    try std.testing.expectEqual(@as(usize, 8192), p.n_ctx);
+}
+
+test "an explicit layer count is used if it fits and refused with numbers if it does not" {
+    const cs = [_]Candidate{partialCand(.vulkan, 4000, 32, 200, 100, 16)};
+    const ok = plan(.{ .n_ctx = 4096, .candidates = &cs, .force_layers = 8 });
+    try std.testing.expectEqual(@as(usize, 8), ok.layers);
+    const too_many = plan(.{ .n_ctx = 4096, .candidates = &cs, .force_layers = 20 });
+    try std.testing.expectEqual(Target.cpu, too_many.target);
+    try std.testing.expectEqual(@as(usize, 20), too_many.rejected()[0].why.layers_do_not_fit.layers);
+    const all = plan(.{ .n_ctx = 512, .candidates = &[_]Candidate{partialCand(.vulkan, 20000, 32, 200, 100, 16)}, .force_layers = 32 });
+    try std.testing.expectEqual(@as(usize, 0), all.layers);
+}
+
+test "no layer fits: the device is rejected with the whole-model numbers" {
+    const cs = [_]Candidate{partialCand(.vulkan, 100, 32, 200, 100, 16)};
+    const p = plan(.{ .n_ctx = 4096, .candidates = &cs });
+    try std.testing.expectEqual(Target.cpu, p.target);
+    try std.testing.expect(p.rejected()[0].why == .does_not_fit);
 }

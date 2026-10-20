@@ -68,13 +68,15 @@ pub fn main(init: std.process.Init) !void {
         };
         gpu_mode = if (backend == .cpu) .off else .on;
     }
-    var model = hk.engine.Model.init(allocator, &reader, .{ .n_ctx = 4096, .n_threads = n_threads, .gpu = gpu_mode, .backend = backend }, &diag) catch |err| {
+    // HK_GPU_LAYERS=N runs the first N layers on the device and the rest on the CPU (partial offload).
+    const gpu_layers: ?usize = if (init.environ_map.get("HK_GPU_LAYERS")) |v| std.fmt.parseInt(usize, v, 10) catch null else null;
+    var model = hk.engine.Model.init(allocator, &reader, .{ .n_ctx = 4096, .n_threads = n_threads, .gpu = gpu_mode, .backend = backend, .gpu_layers = gpu_layers }, &diag) catch |err| {
         std.debug.print("load failed: {s}: {s}\n", .{ @errorName(err), diag.message() });
         return err;
     };
     defer model.deinit();
 
-    std.debug.print("kernels {s} (built: {s}){s}\n", .{ hk.kernels.get().name, hk.build_options_kernel_levels, if (model.gpu != null) "; running on the GPU" else "" });
+    std.debug.print("kernels {s} (built: {s}){s}\n", .{ hk.kernels.get().name, hk.build_options_kernel_levels, if (model.gpu_layers != 0) "; first layers on the GPU (partial offload)" else if (model.gpu != null) "; running on the GPU" else "" });
     if (vkEngine(&model)) |e| std.debug.print("vulkan prompt matmul: {s}\n", .{e.matmulPath()});
     if (std.mem.eql(u8, arg2, "--bench")) {
         const n_prompt: usize = if (it.next()) |x| try std.fmt.parseInt(usize, x, 10) else 512;

@@ -30,6 +30,27 @@ pub const Error = vk_engine.Error || cuda_engine.Error;
 
 pub const Item = kv_mod.Item;
 
+/// What running only leading layers costs on a device, from the engine's own accounting: the fixed part is what one
+/// layer leaves of `bytesNeeded` after its weights, and the cache cost per position comes from asking for one more.
+fn partialNeed(
+    w: *const weights_mod.Weights,
+    cfg: config_mod.Config,
+    opts: anytype,
+    comptime bytesNeeded: anytype,
+    comptime layerBytes: anytype,
+) ?select.Partial {
+    if (w.layers.len < 2 or w.layers.len > select.max_layers) return null;
+    var o = opts;
+    o.layers = 1;
+    o.n_ctx = 0;
+    const one = bytesNeeded(w, cfg, o);
+    o.n_ctx = 1;
+    const one_ctx = bytesNeeded(w, cfg, o) - one;
+    var part = select.Partial{ .layers = w.layers.len, .fixed = one -| layerBytes(w, 0), .per_layer_ctx = one_ctx };
+    for (0..w.layers.len) |i| part.layer_bytes[i] = layerBytes(w, i);
+    return part;
+}
+
 /// Probes the Vulkan device for the planner: usability, free memory, whether the model's formats have kernels, and
 /// what the model needs (linear in the context, so two engine queries give the exact slope).
 pub fn probeVulkan(
@@ -63,6 +84,7 @@ pub fn probeVulkan(
     const base = vk_engine.Engine.bytesNeeded(w, cfg, o);
     o.n_ctx = 1;
     cand.need = .{ .base = base, .per_ctx = vk_engine.Engine.bytesNeeded(w, cfg, o) - base };
+    cand.need.partial = partialNeed(w, cfg, o, vk_engine.Engine.bytesNeeded, vk_engine.Engine.layerBytes);
     return cand;
 }
 
@@ -99,6 +121,7 @@ pub fn probeCuda(
     const base = cuda_engine.bytesNeeded(w, cfg, o);
     o.n_ctx = 1;
     cand.need = .{ .base = base, .per_ctx = cuda_engine.bytesNeeded(w, cfg, o) - base };
+    cand.need.partial = partialNeed(w, cfg, o, cuda_engine.bytesNeeded, cuda_engine.layerBytes);
     return cand;
 }
 
@@ -135,6 +158,28 @@ pub const Device = union(Kind) {
     pub fn forward(self: Device, items: []const Item) Error!void {
         return switch (self) {
             inline else => |e| e.forward(items),
+        };
+    }
+
+    /// Partial offload: runs the device's leading layers over the hidden states in `hidden` ([n][dim], embedded by the
+    /// CPU) and leaves the result in `hidden`.
+    pub fn forwardPartial(self: Device, items: []const Item, hidden: []f32) Error!void {
+        return switch (self) {
+            inline else => |e| e.forwardPartial(items, hidden),
+        };
+    }
+
+    /// Whether this device runs only the leading layers (partial offload).
+    pub fn isPartial(self: Device) bool {
+        return switch (self) {
+            inline else => |e| e.partial,
+        };
+    }
+
+    /// Layers the device runs.
+    pub fn layerCount(self: Device) usize {
+        return switch (self) {
+            inline else => |e| e.layers.len,
         };
     }
 

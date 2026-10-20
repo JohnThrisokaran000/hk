@@ -22,8 +22,12 @@ fn cosine(a: []const f32, b: []const f32) f64 {
 }
 
 fn load(path: []const u8, gpu: hk.engine.model.GpuMode, backend: Choice, slots: usize, n_ctx: usize, reader: *hk.HKReader) !hk.engine.Model {
+    return loadLayers(path, gpu, backend, slots, n_ctx, reader, null);
+}
+
+fn loadLayers(path: []const u8, gpu: hk.engine.model.GpuMode, backend: Choice, slots: usize, n_ctx: usize, reader: *hk.HKReader, layers: ?usize) !hk.engine.Model {
     var diag = hk.engine.Diag{};
-    return hk.engine.Model.init(gpa, reader, .{ .n_ctx = n_ctx, .n_threads = 2, .gpu = gpu, .backend = backend, .gpu_slots = slots }, &diag) catch |e| {
+    return hk.engine.Model.init(gpa, reader, .{ .n_ctx = n_ctx, .n_threads = 2, .gpu = gpu, .backend = backend, .gpu_slots = slots, .gpu_layers = layers }, &diag) catch |e| {
         if (gpu == .off) std.debug.print("load {s}: {s}: {s}\n", .{ path, @errorName(e), diag.message() });
         return e;
     };
@@ -312,4 +316,66 @@ test "the CUDA prompt attention matches the CPU at head size 64" {
 
 test "the CUDA prompt attention matches the CPU at head size 128" {
     try checkPromptAttention(128, .cuda);
+}
+
+/// Partial offload: the first layers run on the device, the rest (and the embedding and output) on the CPU. The result
+/// must be what the CPU alone computes, for a prompt and for single steps, and the device layers must not also hold a
+/// host cache.
+fn checkPartial(backend: Choice, device_layers: usize) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+    const h = try makeModel(dir, "partial", .{ .arch = .qwen3, .n_layers = 4 });
+    defer gpa.free(h);
+    var reader = try hk.HKReader.open(h, gpa);
+    defer reader.deinit();
+    var dev = loadLayers(h, .on, backend, 1, 256, &reader, device_layers) catch |e| switch (e) {
+        error.GpuFailed => return error.SkipZigTest,
+        else => return e,
+    };
+    defer dev.deinit();
+    var cpu = try load(h, .off, .cpu, 1, 256, &reader);
+    defer cpu.deinit();
+    try std.testing.expect(dev.gpu != null);
+    try std.testing.expectEqual(device_layers, dev.gpu_layers);
+    try std.testing.expectEqual(device_layers, dev.gpu.?.layerCount());
+    try std.testing.expect(dev.gpu.?.isPartial());
+
+    const prompt = [_]u32{ 3, 17, 5, 5, 29, 0, 11, 8, 40, 41, 9, 12, 77, 3, 4, 90, 21, 33 };
+    try dev.forward(&prompt, 0);
+    try cpu.forward(&prompt, 0);
+    const a = try gpa.dupe(f32, dev.logitsFor(prompt.len - 1));
+    defer gpa.free(a);
+    try std.testing.expect(cosine(a, cpu.logitsFor(prompt.len - 1)) > 0.9999);
+
+    var pos: usize = prompt.len;
+    var tok: u32 = 7;
+    for (0..6) |_| {
+        try dev.forward(&.{tok}, pos);
+        try cpu.forward(&.{tok}, pos);
+        const x = try gpa.dupe(f32, dev.logitsFor(0));
+        defer gpa.free(x);
+        const y = cpu.logitsFor(0);
+        try std.testing.expect(cosine(x, y) > 0.9999);
+        var best: usize = 0;
+        for (y, 0..) |v, i| if (v > y[best]) {
+            best = i;
+        };
+        tok = @intCast(best);
+        pos += 1;
+    }
+    // The host cache covers only the layers the CPU runs.
+    try std.testing.expect(dev.kv.bytes() > 0);
+    try std.testing.expectEqual(cpu.kv.bytes() / 4 * (4 - device_layers), dev.kv.bytes());
+}
+
+test "the Vulkan engine runs the leading layers and the CPU the rest" {
+    try checkPartial(.vulkan, 1);
+    try checkPartial(.vulkan, 3);
+}
+
+test "the CUDA engine runs the leading layers and the CPU the rest" {
+    try checkPartial(.cuda, 1);
+    try checkPartial(.cuda, 3);
 }

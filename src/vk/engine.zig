@@ -20,7 +20,7 @@ const StorageType = format.StorageType;
 const Config = config_mod.Config;
 const Mat = weights_mod.Mat;
 
-pub const Error = error{ UnsupportedType, UnsupportedShape, NoGpuSlot, OutOfMemory } || vk.Error;
+pub const Error = error{ UnsupportedType, UnsupportedShape, NoGpuSlot, OutOfMemory, PartialEngine } || vk.Error;
 
 pub const Options = struct {
     /// Most tokens in one forward pass.
@@ -31,6 +31,15 @@ pub const Options = struct {
     slots: usize = 1,
     /// Index of the Vulkan device, or null to pick the best one.
     device: ?usize = null,
+    /// Leading layers to run on the device; 0, or a count of all layers or more, means the whole network. With fewer,
+    /// the embedding and everything after the last device layer stay on the CPU (partial offload): the device takes
+    /// hidden states in and gives them back through `forwardPartial`.
+    layers: usize = 0,
+
+    /// Layers the device runs for a model of `n_layers`.
+    pub fn layerCount(self: Options, n_layers: usize) usize {
+        return if (self.layers == 0 or self.layers >= n_layers) n_layers else self.layers;
+    }
 };
 
 /// The format name used in shader file names, or null when the GPU cannot decode the format.
@@ -131,6 +140,10 @@ pub const Engine = struct {
     n_ctx: u32,
     n_slots: u32,
     layers: []Layer,
+    /// Only the leading layers are on the device; no embedding, final norm or output matrix either.
+    partial: bool,
+    /// Hidden states of a partial pass, read back here.
+    hid_host: vk.Buffer,
     tok_embd: DevMat,
     output: DevMat,
     tied_output: bool,
@@ -337,15 +350,26 @@ pub const Engine = struct {
     }
 
     /// Bytes of device memory a model needs, so a caller can decide before uploading anything.
+    /// Device bytes of the weights of layer `i`.
+    pub fn layerBytes(w: *const weights_mod.Weights, i: usize) u64 {
+        const l = w.layers[i];
+        var total: u64 = 0;
+        for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| total += m.data.len;
+        return total;
+    }
+
     pub fn bytesNeeded(w: *const weights_mod.Weights, cfg: Config, o: Options) u64 {
         var total: u64 = 0;
-        for (w.layers) |l| {
+        const nl = o.layerCount(w.layers.len);
+        for (w.layers[0..nl]) |l| {
             for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| total += m.data.len;
         }
-        total += w.tok_embd.data.len;
-        if (!w.tied_output) total += w.output.data.len;
+        if (nl == w.layers.len) {
+            total += w.tok_embd.data.len;
+            if (!w.tied_output) total += w.output.data.len;
+        }
         const kv_per_layer: u64 = 2 * @as(u64, o.slots) * o.n_ctx * cfg.n_kv_heads * cfg.head_dim * 2;
-        total += kv_per_layer * cfg.n_layers;
+        total += kv_per_layer * nl;
         const act: u64 = @as(u64, o.n_batch) * (3 * cfg.dim + 2 * cfg.qDim() + 2 * cfg.kvDim() + 2 * cfg.ffn_dim) * 4;
         total += act + (64 << 20);
         return total;
@@ -360,12 +384,15 @@ pub const Engine = struct {
         o: Options,
     ) Error!Engine {
         if (cfg.head_dim > 256 or cfg.head_dim % 2 != 0) return error.UnsupportedShape;
-        for (w.layers) |l| {
+        const nl = o.layerCount(w.layers.len);
+        const partial = nl < w.layers.len;
+        for (w.layers[0..nl]) |l| {
             for ([_]Mat{ l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down }) |m| if (!supports(m.t)) return error.UnsupportedType;
         }
-        if (!supports(w.tok_embd.t) or !supports(w.output.t)) return error.UnsupportedType;
+        if (!partial and (!supports(w.tok_embd.t) or !supports(w.output.t))) return error.UnsupportedType;
 
         var self: Engine = undefined;
+        self.partial = partial;
         self.allocator = allocator;
         self.ctx = try vk.Context.init(allocator, o.device);
         self.owners = &.{};
@@ -425,16 +452,24 @@ pub const Engine = struct {
         self.toks = try cx.createBuffer(nb * 4, .upload);
         self.logits_dev = try cx.createBuffer(@as(u64, self.max_rows) * cfg.vocab * 4, .device);
         self.logits_host = try cx.createBuffer(@as(u64, self.max_rows) * cfg.vocab * 4, .readback);
+        self.hid_host = try cx.createBuffer(nb * cfg.dim * 4, .readback);
         self.dummy = try cx.createBuffer(64, .device);
         self.out_norm = try f32Buffer(cx, w.out_norm);
         self.inv_freq = try f32Buffer(cx, inv_freq);
         self.cb = cx.xfer_cb;
 
-        self.tok_embd = try matBuffer(cx, w.tok_embd, allocator);
-        self.tied_output = w.tied_output;
-        self.output = if (w.tied_output) self.tok_embd else try matBuffer(cx, w.output, allocator);
+        if (partial) {
+            // The CPU embeds and produces the logits; nothing of the head goes to the device.
+            self.tok_embd = .{ .buf = self.dummy, .t = .f32, .rows = 0, .cols = 0, .row_bytes = 0 };
+            self.output = self.tok_embd;
+            self.tied_output = true;
+        } else {
+            self.tok_embd = try matBuffer(cx, w.tok_embd, allocator);
+            self.tied_output = w.tied_output;
+            self.output = if (w.tied_output) self.tok_embd else try matBuffer(cx, w.output, allocator);
+        }
 
-        self.layers = try allocator.alloc(Layer, w.layers.len);
+        self.layers = try allocator.alloc(Layer, nl);
         var made: usize = 0;
         errdefer {
             for (self.layers[0..made]) |l| self.freeLayer(l);
@@ -442,7 +477,7 @@ pub const Engine = struct {
             self.layers = &.{};
         }
         const kv_bytes: u64 = @as(u64, o.slots) * o.n_ctx * cfg.n_kv_heads * cfg.head_dim * 2;
-        for (w.layers, 0..) |l, i| {
+        for (w.layers[0..nl], 0..) |l, i| {
             self.layers[i] = .{
                 .attn_norm = try f32Buffer(cx, l.attn_norm),
                 .ffn_norm = try f32Buffer(cx, l.ffn_norm),
@@ -501,9 +536,11 @@ pub const Engine = struct {
         for (self.layers) |l| self.freeLayer(l);
         self.allocator.free(self.layers);
         const cx = &self.ctx;
-        for ([_]vk.Buffer{ self.x, self.xb, self.xn, self.tmp, self.q, self.att, self.k, self.v, self.gate, self.up, self.gu, self.par, self.toks, self.logits_dev, self.logits_host, self.dummy, self.out_norm, self.inv_freq }) |b| cx.destroyBuffer(b);
-        cx.destroyBuffer(self.tok_embd.buf);
-        if (!self.tied_output) cx.destroyBuffer(self.output.buf);
+        for ([_]vk.Buffer{ self.x, self.xb, self.xn, self.tmp, self.q, self.att, self.k, self.v, self.gate, self.up, self.gu, self.par, self.toks, self.logits_dev, self.logits_host, self.hid_host, self.dummy, self.out_norm, self.inv_freq }) |b| cx.destroyBuffer(b);
+        if (!self.partial) {
+            cx.destroyBuffer(self.tok_embd.buf);
+            if (!self.tied_output) cx.destroyBuffer(self.output.buf);
+        }
         for (self.pipes_mmv) |p| if (p) |pp| cx.destroyPipeline(pp);
         for (self.pipes_mm) |p| if (p) |pp| cx.destroyPipeline(pp);
         for (self.pipes_embed) |p| if (p) |pp| cx.destroyPipeline(pp);
@@ -565,10 +602,12 @@ pub const Engine = struct {
 
     fn buildSets(self: *Engine) !void {
         const cx = &self.ctx;
-        const ep = try self.embedPipe(self.tok_embd.t);
-        self.s_embed = try cx.makeSet(ep, &.{ .{ .buf = self.tok_embd.buf }, .{ .buf = self.toks }, .{ .buf = self.x } });
-        self.s_final_norm = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = self.out_norm }, .{ .buf = self.xn } });
-        try self.matSet(&self.output, self.xn, self.logits_dev, null);
+        if (!self.partial) {
+            const ep = try self.embedPipe(self.tok_embd.t);
+            self.s_embed = try cx.makeSet(ep, &.{ .{ .buf = self.tok_embd.buf }, .{ .buf = self.toks }, .{ .buf = self.x } });
+            self.s_final_norm = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = self.out_norm }, .{ .buf = self.xn } });
+            try self.matSet(&self.output, self.xn, self.logits_dev, null);
+        }
         for (self.layers) |*l| {
             l.s_norm1 = try cx.makeSet(self.p_norm, &.{ .{ .buf = self.x }, .{ .buf = l.attn_norm }, .{ .buf = self.xb } });
             try self.matSet(&l.wq, self.xb, self.q, l.bq);
@@ -683,6 +722,18 @@ pub const Engine = struct {
     /// Runs the whole network on `n` tokens. The items name the sequence (cache), token and
     /// position of each; items of one cache must be consecutive positions in increasing order.
     pub fn forward(self: *Engine, items: []const kv_mod.Item) Error!void {
+        if (self.partial) return error.PartialEngine;
+        return self.forwardImpl(items, null);
+    }
+
+    /// A partial engine's pass: `hidden` holds the embedded tokens ([n][dim], from the CPU) on the way in and the state
+    /// after the last device layer on the way out.
+    pub fn forwardPartial(self: *Engine, items: []const kv_mod.Item, hidden: []f32) Error!void {
+        std.debug.assert(self.partial and hidden.len >= items.len * self.cfg.dim);
+        return self.forwardImpl(items, hidden[0 .. items.len * self.cfg.dim]);
+    }
+
+    fn forwardImpl(self: *Engine, items: []const kv_mod.Item, hidden: ?[]f32) Error!void {
         const n: u32 = @intCast(items.len);
         std.debug.assert(n >= 1 and n <= self.n_batch);
         const cfg = self.cfg;
@@ -697,6 +748,7 @@ pub const Engine = struct {
 
         const cx = &self.ctx;
         const cb = self.cb;
+        if (hidden) |h| try cx.upload(self.x, 0, std.mem.sliceAsBytes(h));
         const t_start = nowSecs();
         try cx.begin(cb, true);
         if (self.tq != null) {
@@ -705,10 +757,12 @@ pub const Engine = struct {
             self.tq_n = 0;
         }
 
-        const ep = self.pipes_embed[@intFromEnum(self.tok_embd.t)].?;
-        const eb = EmbedPush{ .dim = @intCast(cfg.dim), .row_bytes = self.tok_embd.row_bytes };
-        self.disp(.embed, ep, self.s_embed, std.mem.asBytes(&eb), (@as(u32, @intCast(cfg.dim)) + 127) / 128, n, 1);
-        self.barrier();
+        if (hidden == null) {
+            const ep = self.pipes_embed[@intFromEnum(self.tok_embd.t)].?;
+            const eb = EmbedPush{ .dim = @intCast(cfg.dim), .row_bytes = self.tok_embd.row_bytes };
+            self.disp(.embed, ep, self.s_embed, std.mem.asBytes(&eb), (@as(u32, @intCast(cfg.dim)) + 127) / 128, n, 1);
+            self.barrier();
+        }
 
         const norm = NormPush{ .dim = @intCast(cfg.dim), .eps = cfg.rms_eps };
         const rope = RopePush{
@@ -773,8 +827,14 @@ pub const Engine = struct {
         }
         _ = count_dim;
 
-        // The final norm, for every row, so any of them can be asked for afterwards.
-        self.disp(.norm, self.p_norm, self.s_final_norm, std.mem.asBytes(&norm), n, 1, 1);
+        if (hidden != null) {
+            // Leading layers only: the hidden states go back to the CPU, which runs the rest.
+            cx.transferBarrier(cb);
+            cx.copy(cb, self.x, self.hid_host, 0, 0, @as(u64, n) * cfg.dim * 4);
+        } else {
+            // The final norm, for every row, so any of them can be asked for afterwards.
+            self.disp(.norm, self.p_norm, self.s_final_norm, std.mem.asBytes(&norm), n, 1, 1);
+        }
         try cx.end(cb);
         const t_rec = nowSecs();
         try cx.submitAndWait(cb);
@@ -782,6 +842,7 @@ pub const Engine = struct {
         self.prof_wait += nowSecs() - t_rec;
         self.prof_calls += 1;
         self.n_last = n;
+        if (hidden) |h| @memcpy(std.mem.sliceAsBytes(h), self.hid_host.mapped.?[0 .. h.len * 4]);
         if (self.tq != null) self.collectTimestamps();
     }
 
@@ -814,6 +875,7 @@ pub const Engine = struct {
             self.mat(&self.output, 1, @intCast(idx * cfg.dim), @intCast(k * cfg.vocab), false, 0);
             self.barrier();
         }
+        cx.transferBarrier(cb);
         cx.copy(cb, self.logits_dev, self.logits_host, 0, 0, @as(u64, indices.len) * cfg.vocab * 4);
         try cx.end(cb);
         const t0 = nowSecs();

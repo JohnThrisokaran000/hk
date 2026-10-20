@@ -228,14 +228,26 @@ pub const Cpu = struct {
     /// state of item `i` ends up in `x[i]`; read predictions with `logitsFor(i)`. The caller has
     /// already checked batch size, context room and token range.
     pub fn forward(self: *Cpu, w: *const weights_mod.Weights, items: []const Item) Error!void {
-        const n = items.len;
+        try self.embed(w, items);
+        try self.forwardFrom(w, items, 0);
+    }
+
+    /// Embeds the tokens of `items` into `x` and makes room in their caches. The first half of `forward`; partial
+    /// offload hands `x` to a device for the leading layers and then calls `forwardFrom`.
+    pub fn embed(self: *Cpu, w: *const weights_mod.Weights, items: []const Item) Error!void {
         const cfg = self.cfg;
         for (items) |it| try it.kv.ensure(it.pos + 1);
-
         for (items, 0..) |it, t| {
             const row = w.tok_embd.data[it.token * w.tok_embd.rowBytes() ..][0..w.tok_embd.rowBytes()];
             quant.dequantizeRow(w.tok_embd.t, row, self.x[t * cfg.dim ..][0..cfg.dim]) catch unreachable;
         }
+    }
+
+    /// Runs layers `first_layer ..` over the hidden states already in `x`. The caches of `items` must already be
+    /// sized (`embed` does that) and must hold layers from `first_layer` on.
+    pub fn forwardFrom(self: *Cpu, w: *const weights_mod.Weights, items: []const Item, first_layer: usize) Error!void {
+        const n = items.len;
+        const cfg = self.cfg;
 
         const half = cfg.rope_dim / 2;
         for (items, 0..) |it, t| ops.ropeAngles(self.cos[t * half ..][0..half], self.sin[t * half ..][0..half], self.inv_freq, it.pos, self.rope_mscale);
@@ -243,7 +255,7 @@ pub const Cpu = struct {
         const qd = cfg.qDim();
         const kd = cfg.kvDim();
 
-        for (w.layers, 0..) |*l, li| {
+        for (w.layers[first_layer..], first_layer..) |*l, li| {
             // Attention block.
             var t0 = self.tick();
             kernels.get().rms_norm_rows(self.xb, self.x, l.attn_norm, cfg.rms_eps, n, cfg.dim);

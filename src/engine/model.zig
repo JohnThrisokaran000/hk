@@ -36,6 +36,9 @@ pub const Options = struct {
     gpu_device: ?usize = null,
     /// Which target may run the network. Only consulted when `gpu` is not `.off`.
     backend: backend_mod.select.Choice = .auto,
+    /// Run exactly this many leading layers on the device and the rest on the CPU (`--gpu-layers`). Null lets the
+    /// planner decide: the whole network when it fits, otherwise as many leading layers as do.
+    gpu_layers: ?usize = null,
 };
 
 pub const GpuMode = enum {
@@ -82,6 +85,9 @@ pub const Model = struct {
     gpu: ?backend_mod.Device = null,
     /// Why the GPU is not in use, when it was asked for and could not be. Owned by the model.
     gpu_note: ?[]const u8 = null,
+    /// When a device runs only the leading layers (partial offload), how many; 0 when it runs the whole network or
+    /// there is no device. The CPU runs the layers after these, the embedding and the output.
+    gpu_layers: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -145,13 +151,18 @@ pub const Model = struct {
         _ = diag;
         const vopts = gpu_mod.Options{ .n_batch = self.n_batch, .n_ctx = self.n_ctx, .slots = opts.gpu_slots, .device = opts.gpu_device };
         const copts = cuda_engine.Options{ .n_batch = self.n_batch, .n_ctx = self.n_ctx, .slots = opts.gpu_slots };
+        // `--gpu-layers 0` is the CPU.
+        if (opts.gpu_layers) |n| if (n == 0) {
+            self.setNote("0 layers were requested on the device");
+            return error.NoDevice;
+        };
         // Vulkan first: its engine has batched kernels and is the measured one. CUDA is chosen by `--backend cuda`
         // until it is benchmarked ahead of Vulkan.
         const candidates = [_]backend_mod.select.Candidate{
             backend_mod.probeVulkan(self.allocator, &self.weights, self.cfg, vopts),
             backend_mod.probeCuda(&self.weights, self.cfg, copts),
         };
-        const plan = backend_mod.select.plan(.{ .choice = opts.backend, .n_ctx = self.n_ctx, .candidates = &candidates });
+        const plan = backend_mod.select.plan(.{ .choice = opts.backend, .n_ctx = self.n_ctx, .candidates = &candidates, .force_layers = opts.gpu_layers });
 
         if (plan.target == .cpu) {
             var buf: [320]u8 = undefined;
@@ -169,6 +180,7 @@ pub const Model = struct {
             .vulkan => {
                 var go = vopts;
                 go.n_ctx = plan.n_ctx;
+                go.layers = plan.layers;
                 const eng = try self.allocator.create(gpu_mod.Engine);
                 errdefer self.allocator.destroy(eng);
                 eng.* = gpu_mod.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
@@ -182,10 +194,12 @@ pub const Model = struct {
                 };
                 self.gpu = .{ .vulkan = eng };
                 self.n_ctx = go.n_ctx;
+                self.setPartial(plan.layers);
             },
             .cuda => {
                 var go = copts;
                 go.n_ctx = plan.n_ctx;
+                go.layers = plan.layers;
                 const eng = try self.allocator.create(cuda_engine.Engine);
                 errdefer self.allocator.destroy(eng);
                 eng.* = cuda_engine.Engine.init(self.allocator, &self.weights, self.cfg, self.inv_freq, self.rope_mscale, go) catch |e| {
@@ -199,9 +213,27 @@ pub const Model = struct {
                 };
                 self.gpu = .{ .cuda = eng };
                 self.n_ctx = go.n_ctx;
+                self.setPartial(plan.layers);
             },
             .cpu => unreachable,
         }
+    }
+
+    /// Records that a device runs `layers` leading layers (0: the whole network). The default cache then holds only the
+    /// layers the CPU runs.
+    fn setPartial(self: *Model, layers: usize) void {
+        self.gpu_layers = layers;
+        self.kv.first_layer = layers;
+    }
+
+    /// The first layer whose keys and values live in a host `KvCache`: caches made for this model must start there.
+    pub fn kvFirstLayer(self: *const Model) usize {
+        return self.gpu_layers;
+    }
+
+    /// A cache for one more sequence, sized for this model and its device split.
+    pub fn newKv(self: *const Model, allocator: std.mem.Allocator, n_ctx: usize) !KvCache {
+        return KvCache.initFrom(allocator, self.cfg, @min(n_ctx, self.n_ctx), self.gpu_layers);
     }
 
     /// Forgets a cache that is going away, so a GPU slot it held can be reused.
@@ -250,6 +282,7 @@ pub const Model = struct {
             if (it.token >= cfg.vocab) return error.TokenOutOfRange;
         }
         if (self.gpu) |g| {
+            if (self.gpu_layers != 0) return self.forwardHybrid(g, items);
             g.forward(items) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.NoGpuSlot => error.GpuFailed,
@@ -260,10 +293,21 @@ pub const Model = struct {
         try self.cpu.forward(&self.weights, items);
     }
 
+    /// Partial offload: the CPU embeds, the device runs the leading layers, the CPU runs the rest and (later) the output.
+    fn forwardHybrid(self: *Model, g: backend_mod.Device, items: []const Item) Error!void {
+        const n = items.len;
+        try self.cpu.embed(&self.weights, items);
+        g.forwardPartial(items, self.cpu.x[0 .. n * self.cfg.dim]) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.GpuFailed,
+        };
+        try self.cpu.forwardFrom(&self.weights, items, self.gpu_layers);
+    }
+
     /// Next token logits for the token at index `t` of the last `forward` batch. The slice is
     /// reused by the next call.
     pub fn logitsFor(self: *Model, t: usize) []const f32 {
-        if (self.gpu) |g| return g.logits(&.{t}) catch @panic("the GPU failed while reading logits");
+        if (self.gpu) |g| if (self.gpu_layers == 0) return g.logits(&.{t}) catch @panic("the GPU failed while reading logits");
         return self.cpu.logitsFor(&self.weights, t);
     }
 
@@ -274,10 +318,10 @@ pub const Model = struct {
         const n = indices.len;
         if (n == 0) return &.{};
         if (n > self.n_batch) return error.BatchTooLarge;
-        if (self.gpu) |g| {
+        if (self.gpu) |g| if (self.gpu_layers == 0) {
             if (n > g.maxRows()) return error.BatchTooLarge;
             return g.logits(indices) catch error.GpuFailed;
-        }
+        };
         return self.cpu.logitsMany(&self.weights, indices);
     }
 };

@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 pub const c = @import("c.zig");
+const envvar = @import("../envvar.zig");
 
 pub const Error = error{
     NoVulkan,
@@ -117,10 +118,6 @@ const Fns = struct {
     cmdResetQueryPool: std.meta.Child(c.PFN_vkCmdResetQueryPool),
     getQueryPoolResults: std.meta.Child(c.PFN_vkGetQueryPoolResults),
 };
-
-fn envFlag(name: [*:0]const u8) bool {
-    return std.c.getenv(name) != null;
-}
 
 /// What the chosen device can do, for shaders and for deciding how much to offload.
 pub const Caps = struct {
@@ -366,7 +363,7 @@ pub const Context = struct {
 
         // Cooperative matrices: the feature bit and a 16x16x16 f16 x f16 -> f32 subgroup shape must both be reported.
         var coopmat = false;
-        if (has_coopmat_ext and sg.subgroupSize == 32 and !envFlag("HK_NO_COOPMAT")) probe: {
+        if (has_coopmat_ext and sg.subgroupSize == 32 and !envvar.isSet("HK_NO_COOPMAT")) probe: {
             var cm_feat = c.VkPhysicalDeviceCooperativeMatrixFeaturesKHR{};
             var feats_cm = std.mem.zeroes(c.VkPhysicalDeviceFeatures2);
             feats_cm.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -708,6 +705,15 @@ pub const Context = struct {
         mb.srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT;
         mb.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT;
         self.f.cmdPipelineBarrier(cb, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, null, 0, null);
+    }
+
+    /// Makes shader writes of earlier dispatches visible to the copy that follows (`barrier` only orders compute work).
+    pub fn transferBarrier(self: *Context, cb: c.VkCommandBuffer) void {
+        var mb = std.mem.zeroes(c.VkMemoryBarrier);
+        mb.sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = c.VK_ACCESS_TRANSFER_READ_BIT;
+        self.f.cmdPipelineBarrier(cb, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, null, 0, null);
     }
 
     pub fn copy(self: *Context, cb: c.VkCommandBuffer, src: Buffer, dst: Buffer, src_off: u64, dst_off: u64, size: u64) void {

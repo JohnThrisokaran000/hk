@@ -1551,7 +1551,11 @@ const Loaded = struct {
         errdefer l.model.deinit();
         if (opts.gpu != .off) {
             if (l.model.gpu) |g| {
-                std.debug.print("[gpu] running on {s} ({s})\n", .{ g.deviceName(), g.apiName() });
+                if (l.model.gpu_layers != 0) {
+                    std.debug.print("[gpu] running the first {d} of {d} layers on {s} ({s}); the rest, the embedding and the output on the CPU\n", .{ l.model.gpu_layers, l.model.cfg.n_layers, g.deviceName(), g.apiName() });
+                } else {
+                    std.debug.print("[gpu] running on {s} ({s})\n", .{ g.deviceName(), g.apiName() });
+                }
             } else {
                 std.debug.print("[gpu] not used: {s}; running on the CPU\n", .{l.model.gpu_note orelse "unknown reason"});
             }
@@ -1736,8 +1740,10 @@ const usage_gen =
     \\      --repeat-penalty X  penalty for recent tokens, 1 to disable (default 1.0)
     \\      --seed N          random seed, 0 uses the clock (default 0)
     \\      --threads N       compute threads (default: the number of physical cores)
-    \\  -ngl, --gpu-layers N  run on a GPU (Vulkan) when N > 0 and the model fits; the whole model
-    \\                        goes to the device, so any N above 0 means all layers. Also HK_GPU=1.
+    \\  -ngl, --gpu-layers N  run on a GPU when N > 0: the first N layers go to the device and the rest
+    \\                        stay on the CPU; N at or above the layer count means the whole model. Without
+    \\                        N the whole model goes if it fits, otherwise as many layers as do (with --backend
+    \\                        or HK_GPU=1). 0 is the CPU.
     \\      --backend B       auto | cpu | vulkan | cuda (also HK_BACKEND). auto uses a device when the model
     \\                        fits and says why when it does not; naming a device fails if it cannot be used.
     \\
@@ -1757,14 +1763,17 @@ fn parseBackend(text: []const u8, what: []const u8) !BackendChoice {
 
 /// GPU settings from `-ngl`, `--backend` and the environment. An explicit device (`--backend vulkan`/`cuda`) means
 /// the load must fail if that device cannot be used; `auto` tries a device and quietly stays on the CPU otherwise.
-fn gpuSettings(gpu_layers: ?usize, backend: ?BackendChoice) !struct { gpu: hk.engine.model.GpuMode, backend: BackendChoice } {
+fn gpuSettings(gpu_layers: ?usize, backend: ?BackendChoice) !struct { gpu: hk.engine.model.GpuMode, backend: BackendChoice, layers: ?usize } {
     var choice = backend;
     if (choice == null) if (g_env) |e| if (e.get("HK_BACKEND")) |t| {
         choice = try parseBackend(t, "HK_BACKEND");
     };
-    const c = choice orelse return .{ .gpu = gpuMode(gpu_layers), .backend = .auto };
+    // `-ngl N` also fixes how many layers go to the device; `-ngl 0` is the CPU even when a device is named.
+    const layers: ?usize = if (gpu_layers) |n| (if (n > 0) n else null) else null;
+    const c = choice orelse return .{ .gpu = gpuMode(gpu_layers), .backend = .auto, .layers = layers };
     const w = hk.backend.select.wants(c);
-    return .{ .gpu = if (!w.device) .off else if (w.required) .on else .auto, .backend = c };
+    const off = if (gpu_layers) |n| n == 0 else false;
+    return .{ .gpu = if (!w.device or off) .off else if (w.required) .on else .auto, .backend = c, .layers = layers };
 }
 
 /// Whether to use a GPU: `-ngl N` with N above 0, or HK_GPU=1 in the environment.
@@ -1877,7 +1886,7 @@ fn cmdRun(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !voi
     };
 
     const gs = try gpuSettings(g.gpu_layers, g.backend);
-    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend });
+    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend, .gpu_layers = gs.layers });
     defer l.close(allocator);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1916,7 +1925,7 @@ fn cmdRun(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !voi
 
 fn cmdChat(model_path: []const u8, g: GenArgs, allocator: std.mem.Allocator) !void {
     const gs = try gpuSettings(g.gpu_layers, g.backend);
-    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend });
+    const l = try Loaded.open(allocator, model_path, .{ .n_threads = g.threads, .gpu = gs.gpu, .backend = gs.backend, .gpu_layers = gs.layers });
     defer l.close(allocator);
 
     const io = std.Options.debug_io;
@@ -1983,7 +1992,8 @@ fn usageServe() error{BadUsage} {
         \\  --ctx N          context window per slot (default: the model's, up to 8192)
         \\  --batch N        most tokens per forward pass (default 256)
         \\  --threads N      compute threads (default: the number of physical cores)
-        \\  -ngl N           use a GPU (Vulkan) when N > 0 and the model fits; one device region per slot
+        \\  -ngl N           use a GPU when N > 0: the first N layers go to the device (N at or above the layer
+        \\                   count: all of them); one device region per slot
         \\  --api-key KEY    require "Authorization: Bearer KEY" (or set HK_API_KEY)
         \\  --alias NAME     model name reported by the API
         \\
@@ -2018,6 +2028,7 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: cli_hub.Env, args: *s
         } else if (std.mem.eql(u8, a, "-ngl") or std.mem.eql(u8, a, "--gpu-layers")) {
             const n = std.fmt.parseInt(usize, args.next() orelse return usageServe(), 10) catch return usageServe();
             opts.gpu = if (n > 0) .auto else .off;
+            opts.gpu_layers = if (n > 0) n else null;
         } else if (std.mem.eql(u8, a, "--backend")) {
             backend_flag = try parseBackend(args.next() orelse return usageServe(), "--backend");
         } else if (std.mem.eql(u8, a, "--api-key")) {
