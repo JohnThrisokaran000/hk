@@ -950,3 +950,12 @@ pub const struct_VkCooperativeMatrixPropertiesKHR = extern struct {
 };
 pub const VkCooperativeMatrixPropertiesKHR = struct_VkCooperativeMatrixPropertiesKHR;
 pub const PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR = ?*const fn (physicalDevice: VkPhysicalDevice, pPropertyCount: [*c]u32, pProperties: [*c]VkCooperativeMatrixPropertiesKHR) callconv(.c) VkResult;
+
+// -- VK_KHR_shader_integer_dot_product -------------------------------------------------------------------------------
+pub const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: c_int = 1000280000;
+pub const struct_VkPhysicalDeviceShaderIntegerDotProductFeatures = extern struct {
+    sType: VkStructureType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+    pNext: ?*anyopaque = null,
+    shaderIntegerDotProduct: VkBool32 = 0,
+};
+pub const VkPhysicalDeviceShaderIntegerDotProductFeatures = struct_VkPhysicalDeviceShaderIntegerDotProductFeatures;

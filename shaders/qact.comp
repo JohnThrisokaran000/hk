@@ -1,0 +1,37 @@
+#version 450
+// Quantizes activations for the integer matrix-vector kernels: per block of 32 floats an f32 scale (max|x| / 127), the
+// 32 quants packed four to a word, and the sum of the quants (for formats with a minimum). One invocation per block;
+// the workgroup's y is the token. Output block index is token * blocks + block.
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer XQ { uint xq[]; };
+layout(std430, binding = 2) writeonly buffer XS { vec2 xs[]; };
+layout(push_constant) uniform P {
+    uint blocks;    // blocks per token
+    uint x_off;     // floats
+    uint x_stride;  // floats between tokens
+    uint o_tok;     // first output token slot
+} p;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= p.blocks) return;
+    uint t = gl_WorkGroupID.y;
+    uint base = p.x_off + t * p.x_stride + b * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) amax = max(amax, abs(x[base + i]));
+    float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    int sum = 0;
+    uint o = ((p.o_tok + t) * p.blocks + b) * 8u;
+    for (uint w = 0u; w < 8u; w++) {
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            int q = clamp(int(roundEven(x[base + 4u * w + j] * inv)), -127, 127);
+            sum += q;
+            packed |= uint(q & 255) << (8u * j);
+        }
+        xq[o + w] = packed;
+    }
+    xs[(p.o_tok + t) * p.blocks + b] = vec2(amax / 127.0, float(sum));
+}

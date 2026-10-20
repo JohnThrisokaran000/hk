@@ -68,9 +68,11 @@ pub fn main(init: std.process.Init) !void {
         };
         gpu_mode = if (backend == .cpu) .off else .on;
     }
+    // HK_BATCH=N sets the most tokens per pass (1 makes `--ppl` run every token through the decode kernels).
+    const n_batch: usize = if (init.environ_map.get("HK_BATCH")) |v| std.fmt.parseInt(usize, v, 10) catch 256 else 256;
     // HK_GPU_LAYERS=N runs the first N layers on the device and the rest on the CPU (partial offload).
     const gpu_layers: ?usize = if (init.environ_map.get("HK_GPU_LAYERS")) |v| std.fmt.parseInt(usize, v, 10) catch null else null;
-    var model = hk.engine.Model.init(allocator, &reader, .{ .n_ctx = 4096, .n_threads = n_threads, .gpu = gpu_mode, .backend = backend, .gpu_layers = gpu_layers }, &diag) catch |err| {
+    var model = hk.engine.Model.init(allocator, &reader, .{ .n_ctx = 4096, .n_threads = n_threads, .n_batch = n_batch, .gpu = gpu_mode, .backend = backend, .gpu_layers = gpu_layers }, &diag) catch |err| {
         std.debug.print("load failed: {s}: {s}\n", .{ @errorName(err), diag.message() });
         return err;
     };
@@ -203,7 +205,7 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     const t1 = nowNs(io);
     printProfile("prefill", &model.cpu.profile);
     if (vkEngine(model)) |g| if (g.tq != null) {
-        const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add" };
+        const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add", "qact" };
         std.debug.print("gpu kernels, prefill (ms per pass of the whole prompt):", .{});
         for (names, 0..) |nm, i| std.debug.print(" {s} {d:.2}", .{ nm, g.kind_ns[i] / 1e6 });
         std.debug.print("\n", .{});
@@ -242,7 +244,7 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
         .vulkan => {},
     };
     if (vkEngine(model)) |g| if (g.tq != null) {
-        const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add" };
+        const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add", "qact" };
         std.debug.print("gpu kernels (ms per token):", .{});
         for (names, 0..) |nm, i| std.debug.print(" {s} {d:.2}", .{ nm, g.kind_ns[i] / 1e6 / @as(f64, @floatFromInt(@max(1, n_gen))) });
         std.debug.print("\n", .{});

@@ -1,0 +1,192 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product : require
+// y[t][r] = dot(row r of W, x[t]) (+ bias[r]) for a few tokens with integer arithmetic: the weights are unpacked to
+// bytes and multiplied against the activations quantized by qact.comp, four products per OpSDot. Lanes of a row take its
+// 32-blocks in turn; a block contributes d_x * (sc * sum(q * xq) - mn * sum(xq)). Select the format with -DTYPE_<NAME>.
+
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer W { uint w32[]; };
+layout(std430, binding = 1) readonly buffer XQ { uint xq[]; };
+layout(std430, binding = 2) buffer Y { float y[]; };
+layout(std430, binding = 3) readonly buffer B { float bias[]; };
+layout(std430, binding = 4) readonly buffer XS { vec2 xs[]; };
+layout(push_constant) uniform P {
+    uint rows;
+    uint cols;
+    uint row_bytes;
+    uint x_stride;
+    uint y_stride;
+    uint has_bias;
+    uint x_off;         // token slot of the first quantized input row
+    uint y_off;
+    uint lpr;           // lanes per row, a power of two from 4 to 32
+    uint mode;          // 0: y = result, 1: y += result, 2: gate and up rows interleaved, y = silu(gate) * up
+} p;
+
+#include "common_q.glsl"
+
+#if defined(TYPE_Q4_K)
+#define BYTES 144u
+#define PER_UNIT 8u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    float d = h16(o);
+    float dmin = h16(o + 2u);
+    uint sc, mn;
+    sm4(o + 4u, sub, sc, mn);
+    uint shift = (sub & 1u) * 4u;
+    uint q = wb + 4u + 8u * (sub >> 1);
+    int acc = 0;
+    [[unroll]] for (uint k = 0u; k < 8u; k++) acc += dot4((w32[q + k] >> shift) & M0F, xq[xw + k]);
+    return xsv.x * (d * float(sc) * float(acc) - dmin * float(mn) * xsv.y);
+}
+#elif defined(TYPE_Q5_K)
+#define BYTES 176u
+#define PER_UNIT 8u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    float d = h16(o);
+    float dmin = h16(o + 2u);
+    uint sc, mn;
+    sm4(o + 4u, sub, sc, mn);
+    uint shift = (sub & 1u) * 4u;
+    uint q = wb + 12u + 8u * (sub >> 1);
+    int acc = 0;
+    [[unroll]] for (uint k = 0u; k < 8u; k++) {
+        uint v = ((w32[q + k] >> shift) & M0F) | (((w32[wb + 4u + k] >> sub) & 0x01010101u) << 4);
+        acc += dot4(v, xq[xw + k]);
+    }
+    return xsv.x * (d * float(sc) * float(acc) - dmin * float(mn) * xsv.y);
+}
+#elif defined(TYPE_Q6_K)
+#define BYTES 212u
+#define PER_UNIT 8u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    uint h = sub >> 2;
+    uint i = sub & 3u;
+    uint shift = 4u * (i >> 1);
+    int lo = 0;
+    int hi = 0;
+    [[unroll]] for (uint k = 0u; k < 8u; k++) {
+        uint ql = w32[wb + 16u * h + 8u * (i & 1u) + k];
+        uint qh = w32[wb + 32u + 8u * h + k];
+        uint v = signedBytes(((ql >> shift) & M0F) | (((qh >> (2u * i)) & 0x03030303u) << 4), 32u);
+        if (k < 4u) lo += dot4(v, xq[xw + k]); else hi += dot4(v, xq[xw + k]);
+    }
+    uint sbase = o + 192u + 8u * h + 2u * i;
+    float d = h16(o + 208u);
+    return xsv.x * d * (float(s8(sbase)) * float(lo) + float(s8(sbase + 1u)) * float(hi));
+}
+#elif defined(TYPE_Q8_0)
+#define BYTES 36u
+#define PER_UNIT 1u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    int acc = 0;
+    [[unroll]] for (uint k = 0u; k < 8u; k++) acc += dot4(w32[wb + 1u + k], xq[xw + k]);
+    return xsv.x * f32at(o) * float(acc);
+}
+#elif defined(TYPE_Q4_0)
+#define BYTES 20u
+#define PER_UNIT 1u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    int acc = 0;
+    [[unroll]] for (uint k = 0u; k < 4u; k++) {
+        uint w = w32[wb + 1u + k];
+        acc += dot4(w & M0F, xq[xw + k]) + dot4((w >> 4) & M0F, xq[xw + 4u + k]);
+    }
+    return xsv.x * f32at(o) * (float(acc) - 8.0 * xsv.y);
+}
+#elif defined(TYPE_Q4_1)
+#define BYTES 24u
+#define PER_UNIT 1u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    int acc = 0;
+    [[unroll]] for (uint k = 0u; k < 4u; k++) {
+        uint w = w32[wb + 2u + k];
+        acc += dot4(w & M0F, xq[xw + k]) + dot4((w >> 4) & M0F, xq[xw + 4u + k]);
+    }
+    return xsv.x * (f32at(o) * float(acc) + f32at(o + 4u) * xsv.y);
+}
+#elif defined(TYPE_Q5_0)
+#define BYTES 24u
+#define PER_UNIT 1u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    uint qh = w32[wb + 1u];
+    int acc = 0;
+    [[unroll]] for (uint k = 0u; k < 4u; k++) {
+        uint w = w32[wb + 2u + k];
+        uint lo = (w & M0F) | (spreadBits(qh >> (4u * k)) << 4);
+        uint hi = ((w >> 4) & M0F) | (spreadBits(qh >> (4u * k + 16u)) << 4);
+        acc += dot4(lo, xq[xw + k]) + dot4(hi, xq[xw + 4u + k]);
+    }
+    return xsv.x * f32at(o) * (float(acc) - 16.0 * xsv.y);
+}
+#elif defined(TYPE_Q5_1)
+#define BYTES 28u
+#define PER_UNIT 1u
+float blockdot(uint o, uint sub, uint xw, vec2 xsv) {
+    uint wb = o >> 2;
+    uint qh = w32[wb + 2u];
+    int acc = 0;
+    [[unroll]] for (uint k = 0u; k < 4u; k++) {
+        uint w = w32[wb + 3u + k];
+        uint lo = (w & M0F) | (spreadBits(qh >> (4u * k)) << 4);
+        uint hi = ((w >> 4) & M0F) | (spreadBits(qh >> (4u * k + 16u)) << 4);
+        acc += dot4(lo, xq[xw + k]) + dot4(hi, xq[xw + 4u + k]);
+    }
+    return xsv.x * (f32at(o) * float(acc) + f32at(o + 4u) * xsv.y);
+}
+#else
+#error "no integer kernel for this format"
+#endif
+
+shared float red[128];
+shared float red2[128];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lpr = p.lpr;
+    uint lane = tid & (lpr - 1u);
+    uint row = gl_WorkGroupID.x * (128u / lpr) + tid / lpr;
+    uint t = gl_WorkGroupID.y;
+    float acc = 0.0;
+    float acc2 = 0.0;
+    if (row < p.rows) {
+        uint nb = p.cols / 32u;
+        uint wrow = p.mode == 2u ? 2u * row : row;
+        uint base = wrow * p.row_bytes;
+        for (uint u = lane; u < nb; u += lpr) {
+            uint o = base + (u / PER_UNIT) * BYTES;
+            uint xi = (p.x_off + t) * nb + u;
+            vec2 xsv = xs[xi];
+            acc += blockdot(o, u % PER_UNIT, xi * 8u, xsv);
+            if (p.mode == 2u) acc2 += blockdot(o + p.row_bytes, u % PER_UNIT, xi * 8u, xsv);
+        }
+    }
+    red[tid] = acc;
+    red2[tid] = acc2;
+    barrier();
+    for (uint s = lpr >> 1; s > 0u; s >>= 1) {
+        if (lane < s) {
+            red[tid] += red[tid + s];
+            red2[tid] += red2[tid + s];
+        }
+        barrier();
+    }
+    if (lane == 0u && row < p.rows) {
+        uint yi = p.y_off + t * p.y_stride + row;
+        float r = red[tid];
+        if (p.mode == 2u) {
+            y[yi] = r / (1.0 + exp(-r)) * red2[tid];
+        } else {
+            r += p.has_bias != 0u ? bias[row] : 0.0;
+            y[yi] = p.mode == 1u ? y[yi] + r : r;
+        }
+    }
+}

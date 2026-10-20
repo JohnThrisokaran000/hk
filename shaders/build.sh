@@ -18,3 +18,9 @@ done
 for hd in 64 128; do
     glslc --target-env=vulkan1.2 -O -I. -DHD="$hd" attention_cm.comp -o "$out/attention_cm_$hd.spv"
 done
+# Integer dot product decode kernels (VK_KHR_shader_integer_dot_product) and the activation quantizer they read.
+for t in q8_0 q4_0 q4_1 q5_0 q5_1 q4_k q5_k q6_k; do
+    T=$(echo "$t" | tr a-z A-Z)
+    glslc --target-env=vulkan1.2 -O -I. -DTYPE_"$T" mmvq.comp -o "$out/mmvq_$t.spv"
+done
+glslc --target-env=vulkan1.2 -O -I. qact.comp -o "$out/qact.spv"

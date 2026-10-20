@@ -137,6 +137,9 @@ pub const Caps = struct {
     /// `VK_KHR_cooperative_matrix` offers a subgroup scope 16x16x16 f16 x f16 -> f32 product on this device (and
     /// the subgroup is 32 wide, which the cooperative matrix shaders assume); `HK_NO_COOPMAT` switches it off.
     coopmat: bool = false,
+    /// `VK_KHR_shader_integer_dot_product` with the feature on: the packed 4 x int8 dot (`OpSDot`) the integer decode
+    /// kernels use. `HK_NO_INTDOT` switches it off.
+    int_dot: bool = false,
 
     pub fn deviceName(self: *const Caps) []const u8 {
         return self.name[0..self.name_len];
@@ -348,6 +351,7 @@ pub const Context = struct {
         // Memory budget, when the driver reports it, tells how much VRAM is really free.
         var has_budget = false;
         var has_coopmat_ext = false;
+        var has_intdot_ext = false;
         var n_ext: u32 = 0;
         _ = enum_ext(phys, null, &n_ext, null);
         if (n_ext > 0) {
@@ -358,6 +362,7 @@ pub const Context = struct {
                 const en = std.mem.sliceTo(&e.extensionName, 0);
                 if (std.mem.eql(u8, en, "VK_EXT_memory_budget")) has_budget = true;
                 if (std.mem.eql(u8, en, "VK_KHR_cooperative_matrix")) has_coopmat_ext = true;
+                if (std.mem.eql(u8, en, "VK_KHR_shader_integer_dot_product")) has_intdot_ext = true;
             }
         }
 
@@ -388,7 +393,18 @@ pub const Context = struct {
             }
         }
         caps.coopmat = coopmat;
-        var dev_exts: [2][*:0]const u8 = undefined;
+
+        var int_dot = false;
+        if (has_intdot_ext and !envvar.isSet("HK_NO_INTDOT")) {
+            var dp_feat = c.VkPhysicalDeviceShaderIntegerDotProductFeatures{};
+            var feats_dp = std.mem.zeroes(c.VkPhysicalDeviceFeatures2);
+            feats_dp.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            feats_dp.pNext = &dp_feat;
+            get_feat2(phys, &feats_dp);
+            int_dot = dp_feat.shaderIntegerDotProduct != 0;
+        }
+        caps.int_dot = int_dot;
+        var dev_exts: [3][*:0]const u8 = undefined;
         var n_dev_exts: u32 = 0;
         if (has_budget) {
             dev_exts[n_dev_exts] = "VK_EXT_memory_budget";
@@ -396,6 +412,10 @@ pub const Context = struct {
         }
         if (coopmat) {
             dev_exts[n_dev_exts] = "VK_KHR_cooperative_matrix";
+            n_dev_exts += 1;
+        }
+        if (int_dot) {
+            dev_exts[n_dev_exts] = "VK_KHR_shader_integer_dot_product";
             n_dev_exts += 1;
         }
 
@@ -413,7 +433,11 @@ pub const Context = struct {
         en2.sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         en2.pNext = &en11;
         var en_cm = c.VkPhysicalDeviceCooperativeMatrixFeaturesKHR{ .cooperativeMatrix = 1 };
+        var en_dp = c.VkPhysicalDeviceShaderIntegerDotProductFeatures{ .shaderIntegerDotProduct = 1 };
         if (coopmat) en12.pNext = &en_cm;
+        if (int_dot) {
+            if (coopmat) en_cm.pNext = &en_dp else en12.pNext = &en_dp;
+        }
         en2.features.shaderInt16 = feats.features.shaderInt16;
         en2.features.shaderInt64 = feats.features.shaderInt64;
 
