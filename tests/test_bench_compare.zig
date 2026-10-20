@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !void {
 
         // Warmup
         gemmF32_baseline(A, B, C_base, M, K, N);
-        hk.tensor_ops.gemmF32(A, B, C_opt, M, K, N);
+        try hk.engine.abi_ops.gemmF32(A, B, C_opt, M, K, N);
 
         const iters = 10;
         const t0 = std.Io.Clock.Timestamp.now(io, .awake);
@@ -165,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
         const dur_base = @as(f64, @floatFromInt(t0.untilNow(io).raw.nanoseconds)) / (@as(f64, @floatFromInt(iters)) * 1e6);
 
         const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-        for (0..iters) |_| hk.tensor_ops.gemmF32(A, B, C_opt, M, K, N);
+        for (0..iters) |_| try hk.engine.abi_ops.gemmF32(A, B, C_opt, M, K, N);
         const dur_opt = @as(f64, @floatFromInt(t1.untilNow(io).raw.nanoseconds)) / (@as(f64, @floatFromInt(iters)) * 1e6);
 
         const speedup = dur_base / dur_opt;
@@ -243,7 +243,7 @@ pub fn main(init: std.process.Init) !void {
         const dur_base = @as(f64, @floatFromInt(t0.untilNow(io).raw.nanoseconds)) / (@as(f64, @floatFromInt(iters)) * 1e3);
 
         const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-        for (0..iters) |_| hk.tensor_ops.softmaxF32(logits, probs_opt);
+        for (0..iters) |_| hk.ops.softmaxF32(logits, probs_opt);
         const dur_opt = @as(f64, @floatFromInt(t1.untilNow(io).raw.nanoseconds)) / (@as(f64, @floatFromInt(iters)) * 1e3);
 
         const speedup = dur_base / dur_opt;
@@ -275,7 +275,7 @@ pub fn main(init: std.process.Init) !void {
         const dur_base = @as(f64, @floatFromInt(t0.untilNow(io).raw.nanoseconds)) / (@as(f64, @floatFromInt(iters)) * 1e3);
 
         const t1 = std.Io.Clock.Timestamp.now(io, .awake);
-        for (0..iters) |_| hk.tensor_ops.gemvQ8_0(W_bytes, x, null, y_opt, M, K);
+        for (0..iters) |_| try hk.engine.abi_ops.gemvQ8_0(W_bytes, x, null, y_opt, M, K);
         const dur_opt = @as(f64, @floatFromInt(t1.untilNow(io).raw.nanoseconds)) / (@as(f64, @floatFromInt(iters)) * 1e3);
 
         const speedup = dur_base / dur_opt;

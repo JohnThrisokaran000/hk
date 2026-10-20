@@ -7,6 +7,7 @@ pub const model = @import("engine/model.zig");
 pub const kv = @import("engine/kv.zig");
 pub const session = @import("engine/session.zig");
 
+pub const abi_ops = @import("engine/abi_ops.zig");
 pub const Model = model.Model;
 pub const Options = model.Options;
 pub const Config = config.Config;

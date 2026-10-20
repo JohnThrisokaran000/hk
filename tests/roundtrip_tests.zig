@@ -437,7 +437,7 @@ test "simd tensor ops: dot product and gemv" {
     const a = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0 };
     const b = [_]f32{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
 
-    const dot = hk.tensor_ops.dotProductF32(&a, &b);
+    const dot = try hk.engine.abi_ops.dotF32(&a, &b);
     // sum(1..10) * 0.5 = 55 * 0.5 = 27.5
     try std.testing.expectApproxEqAbs(@as(f32, 27.5), dot, 1e-5);
 
@@ -450,7 +450,7 @@ test "simd tensor ops: dot product and gemv" {
     const bias = [_]f32{ 10.0, 20.0 };
     var y: [2]f32 = undefined;
 
-    hk.tensor_ops.gemvF32(&w, &x, &bias, &y, 2, 4);
+    try hk.engine.abi_ops.gemvF32(&w, &x, &bias, &y, 2, 4);
     // row 0: 1+2+3+4 + 10 = 20
     // row 1: 5+6+7+8 + 20 = 46
     try std.testing.expectEqual(@as(f32, 20.0), y[0]);
@@ -466,7 +466,7 @@ test "simd gemv q8_0" {
     const bytes = std.mem.sliceAsBytes(&blocks);
     var x: [64]f32 = @as([64]f32, @splat(1.0));
     var y: [2]f32 = undefined;
-    hk.tensor_ops.gemvQ8_0(bytes, &x, null, &y, 2, 64);
+    try hk.engine.abi_ops.gemvQ8_0(bytes, &x, null, &y, 2, 64);
     try std.testing.expectEqual(@as(f32, 64.0), y[0]);
     try std.testing.expectEqual(@as(f32, 64.0), y[1]);
 }
@@ -480,7 +480,7 @@ test "simd gemv q4_0" {
     const bytes = std.mem.sliceAsBytes(&blocks);
     var x: [64]f32 = @as([64]f32, @splat(1.0));
     var y: [2]f32 = undefined;
-    hk.tensor_ops.gemvQ4_0(bytes, &x, null, &y, 2, 64);
+    try hk.engine.abi_ops.gemvQ4_0(bytes, &x, null, &y, 2, 64);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), y[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), y[1], 1e-4);
 }
@@ -496,7 +496,7 @@ test "simd gemv q4_k" {
     const bytes = std.mem.sliceAsBytes(&blocks);
     var x: [256]f32 = @as([256]f32, @splat(1.0));
     var y: [2]f32 = undefined;
-    hk.tensor_ops.gemvQ4_K(bytes, &x, null, &y, 2, 256);
+    try hk.engine.abi_ops.gemvQ4_K(bytes, &x, null, &y, 2, 256);
 }
 
 
@@ -522,10 +522,10 @@ test "net2wider function preservation" {
     // h1[0] = 1*1 + 2*0.5 + 3*(-1) + 0.1 = 1 + 1 - 3 + 0.1 = -0.9
     // h1[1] = 4*1 + 5*0.5 + 6*(-1) + 0.2 = 4 + 2.5 - 6 + 0.2 = 0.7
     var h1_orig: [2]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w1_old, &x, &b1_old, &h1_orig, 2, 3);
+    try hk.engine.abi_ops.gemvF32(&w1_old, &x, &b1_old, &h1_orig, 2, 3);
 
     var y_orig: [2]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w2_old, &h1_orig, &b2, &y_orig, 2, 2);
+    try hk.engine.abi_ops.gemvF32(&w2_old, &h1_orig, &b2, &y_orig, 2, 2);
 
     // Expand Layer 1 from 2 units to 4 units
     var w1_new: [4 * 3]f32 = undefined;
@@ -549,10 +549,10 @@ test "net2wider function preservation" {
 
     // Forward pass through wider network
     var h1_new: [4]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w1_new, &x, &b1_new, &h1_new, 4, 3);
+    try hk.engine.abi_ops.gemvF32(&w1_new, &x, &b1_new, &h1_new, 4, 3);
 
     var y_new: [2]f32 = undefined;
-    hk.tensor_ops.gemvF32(&w2_new, &h1_new, &b2, &y_new, 2, 4);
+    try hk.engine.abi_ops.gemvF32(&w2_new, &h1_new, &b2, &y_new, 2, 4);
 
     // Check exact equivalence: y_orig == y_new
     try std.testing.expectApproxEqAbs(y_orig[0], y_new[0], 1e-5);
@@ -886,7 +886,7 @@ test "native SwiGLU Net2Wider exact function preservation" {
     const out_old = try allocator.alloc(f32, out_f);
     defer allocator.free(out_old);
 
-    try hk.tensor_ops.forwardSwiGLUF32(
+    try hk.ops.forwardSwiGLUF32(
         x,
         w_gate_old,
         null,
@@ -938,7 +938,7 @@ test "native SwiGLU Net2Wider exact function preservation" {
     const out_new = try allocator.alloc(f32, out_f);
     defer allocator.free(out_new);
 
-    try hk.tensor_ops.forwardSwiGLUF32(
+    try hk.ops.forwardSwiGLUF32(
         x,
         w_gate_new,
         null,
@@ -1059,7 +1059,7 @@ test "native SIMD RMSNorm and SiLU activation" {
     }
 
     // Test RMSNorm
-    hk.tensor_ops.rmsNormF32(x, w, 1e-5, out);
+    hk.ops.rmsNormF32(x, w, 1e-5, out);
 
     // Compute expected RMS
     var sum_sq: f32 = 0.0;
@@ -1074,7 +1074,7 @@ test "native SIMD RMSNorm and SiLU activation" {
     // Test SiLU: f(0.0) = 0.0, f(2.0) = 2.0 / (1 + exp(-2))
     const silu_in = [_]f32{ 0.0, 2.0, -2.0 };
     var silu_out: [3]f32 = undefined;
-    hk.tensor_ops.siluF32(&silu_in, &silu_out);
+    hk.ops.siluF32(&silu_in, &silu_out);
 
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), silu_out[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.761594), silu_out[1], 1e-4);
@@ -1453,8 +1453,8 @@ test "raw weight storage roundtrip with universal page alignment" {
     try std.testing.expectEqual(4, read_bf16.len);
     try std.testing.expectEqual(@as(u16, 0x3F80), read_bf16[0]);
     // Check direct conversion to f32
-    try std.testing.expectEqual(@as(f32, 1.0), hk.tensor_ops.bf16ToF32(read_bf16[0]));
-    try std.testing.expectEqual(@as(f32, 2.0), hk.tensor_ops.bf16ToF32(read_bf16[1]));
+    try std.testing.expectEqual(@as(f32, 1.0), hk.ops.bf16ToF32(read_bf16[0]));
+    try std.testing.expectEqual(@as(f32, 2.0), hk.ops.bf16ToF32(read_bf16[1]));
 
     const e_i8 = reader.toc.find("raw_layer.int8").?;
     const read_i8 = try reader.getRawInt8(e_i8);
@@ -1540,13 +1540,13 @@ test "raw BF16 and F16 GEMV mathematical correctness" {
 
     // y[0] = 1.0*0.5 + 2.0*(-1.0) = 0.5 - 2.0 = -1.5
     // y[1] = 3.0*0.5 + 4.0*(-1.0) = 1.5 - 4.0 = -2.5
-    hk.tensor_ops.gemvBF16(&w_bf16, &x, null, &y, 2, 2);
+    try hk.engine.abi_ops.gemvBF16(&w_bf16, &x, null, &y, 2, 2);
     try std.testing.expectApproxEqAbs(@as(f32, -1.5), y[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, -2.5), y[1], 1e-5);
 
     // FP16 test
     const w_f16 = [_]f16{ 1.0, 2.0, 3.0, 4.0 };
-    hk.tensor_ops.gemvF16(&w_f16, &x, null, &y, 2, 2);
+    try hk.engine.abi_ops.gemvF16(&w_f16, &x, null, &y, 2, 2);
     try std.testing.expectApproxEqAbs(@as(f32, -1.5), y[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, -2.5), y[1], 1e-5);
 }
@@ -1961,4 +1961,137 @@ test "a block shorter than its tensor is an error, not silently skipped" {
     defer reader.deinit();
     var out: [512]f32 = undefined;
     try std.testing.expectError(error.UnsupportedStorageType, reader.dequantizeToF32(reader.toc.find("w").?, false, &out));
+}
+
+// -- C ABI matrix products on the engine kernels ---------------------------------------------------------------------
+
+/// Reference y = W x + bias in f64 with W decoded by the engine's decoders (the same meaning of the bytes `hk run` uses).
+fn referenceGemv(comptime t: hk.format.StorageType, w: []const u8, x: []const f32, bias: ?[]const f32, m: usize, k: usize, out: []f64, mag: []f64) !void {
+    const allocator = std.testing.allocator;
+    const info = hk.quant.blocks.info(t).?;
+    const row_bytes = k / info.elems * info.bytes;
+    const dec = try allocator.alloc(f32, k);
+    defer allocator.free(dec);
+    for (0..m) |r| {
+        try hk.quant.dequantizeRow(t, w[r * row_bytes ..][0..row_bytes], dec);
+        var s: f64 = if (bias) |b| b[r] else 0;
+        var a: f64 = if (bias) |b| @abs(b[r]) else 0;
+        for (dec, x) |u, v| {
+            s += @as(f64, u) * v;
+            a += @abs(@as(f64, u) * v);
+        }
+        out[r] = s;
+        mag[r] = a;
+    }
+}
+
+test "abi_ops products agree with a decoder-based f64 reference for dense and quantized weights" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(77);
+    const rand = prng.random();
+    const m: usize = 19;
+    const k: usize = 512;
+    const x = try allocator.alloc(f32, k);
+    defer allocator.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+    const bias = try allocator.alloc(f32, m);
+    defer allocator.free(bias);
+    for (bias) |*v| v.* = rand.floatNorm(f32);
+    const wf = try allocator.alloc(f32, m * k);
+    defer allocator.free(wf);
+    for (wf) |*v| v.* = rand.floatNorm(f32) * 0.1;
+    const want = try allocator.alloc(f64, m);
+    defer allocator.free(want);
+    const mag = try allocator.alloc(f64, m);
+    defer allocator.free(mag);
+    const got = try allocator.alloc(f32, m);
+    defer allocator.free(got);
+
+    // Dense weights: only float summation order differs, so the tolerance is tight.
+    const w16 = try allocator.alloc(f16, m * k);
+    defer allocator.free(w16);
+    for (w16, wf) |*d, s| d.* = @floatCast(s);
+    try referenceGemv(.f16, std.mem.sliceAsBytes(w16), x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvF16(w16, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 1e-5 * mag[r] + 1e-6);
+
+    try referenceGemv(.f32, std.mem.sliceAsBytes(wf), x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvF32(wf, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 1e-5 * mag[r] + 1e-6);
+
+    // Quantized weights multiply 8-bit activations: the error is bounded by a few tenths of a percent of the magnitude
+    // of the terms, never by the (possibly cancelling) result.
+    const nb8 = m * k / 32;
+    const q8 = try allocator.alloc(u8, nb8 * 34);
+    defer allocator.free(q8);
+    for (0..nb8) |b| {
+        var blk = std.mem.zeroes(hk.quantization.BlockQ8_0);
+        hk.quantization.quantizeBlockQ8_0(wf[b * 32 ..][0..32], &blk);
+        @memcpy(q8[b * 34 ..][0..34], std.mem.asBytes(&blk));
+    }
+    try referenceGemv(.q8_0, q8, x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvQ8_0(q8, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 0.01 * mag[r] + 1e-6);
+
+    const nbk = m * k / 256;
+    const qk = try allocator.alloc(u8, nbk * 144);
+    defer allocator.free(qk);
+    for (0..nbk) |b| {
+        var blk = std.mem.zeroes(hk.quantization.BlockQ4_K);
+        hk.quantization.quantizeSuperBlockQ4_K(wf[b * 256 ..][0..256], &blk);
+        @memcpy(qk[b * 144 ..][0..144], std.mem.asBytes(&blk));
+    }
+    try referenceGemv(.q4_k, qk, x, bias, m, k, want, mag);
+    try hk.engine.abi_ops.gemvQ4_K(qk, x, bias, got, m, k);
+    for (0..m) |r| try std.testing.expect(@abs(@as(f64, got[r]) - want[r]) <= 0.01 * mag[r] + 1e-6);
+}
+
+test "abi_ops gemm equals the naive product" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(78);
+    const rand = prng.random();
+    const m: usize = 13;
+    const k: usize = 70; // deliberately not a multiple of any block size: dense f32 needs none
+    const n: usize = 11;
+    const a = try allocator.alloc(f32, m * k);
+    defer allocator.free(a);
+    const b = try allocator.alloc(f32, k * n);
+    defer allocator.free(b);
+    for (a) |*v| v.* = rand.floatNorm(f32);
+    for (b) |*v| v.* = rand.floatNorm(f32);
+    const c = try allocator.alloc(f32, m * n);
+    defer allocator.free(c);
+    try hk.engine.abi_ops.gemmF32(a, b, c, m, k, n);
+    for (0..m) |i| for (0..n) |j| {
+        var s: f64 = 0;
+        var mag: f64 = 0;
+        for (0..k) |l| {
+            s += @as(f64, a[i * k + l]) * b[l * n + j];
+            mag += @abs(@as(f64, a[i * k + l]) * b[l * n + j]);
+        }
+        try std.testing.expect(@abs(@as(f64, c[i * n + j]) - s) <= 1e-5 * mag + 1e-6);
+    };
+}
+
+test "abi_ops refuses what it cannot compute instead of guessing" {
+    var y: [4]f32 = undefined;
+    var w: [4 * 34]u8 = @splat(0);
+    const x: [33]f32 = @splat(1);
+    // Q8_0 needs k to be a multiple of 32.
+    try std.testing.expectError(error.BadShape, hk.engine.abi_ops.gemvQ8_0(&w, &x, null, &y, 4, 33));
+    // Fewer weight bytes than the shape needs.
+    try std.testing.expectError(error.BadShape, hk.engine.abi_ops.gemvQ8_0(w[0 .. 3 * 34], x[0..32], null, &y, 4, 32));
+    // Output shorter than rows.
+    try std.testing.expectError(error.BadShape, hk.engine.abi_ops.gemvQ8_0(&w, x[0..32], null, y[0..3], 4, 32));
+    // A storage type the engine has no kernel for.
+    try std.testing.expectError(error.UnsupportedType, hk.engine.abi_ops.gemv(.int8, &w, x[0..32], null, &y, 4, 32));
+}
+
+test "the C ABI product functions poison their output on failure instead of leaving stale numbers" {
+    var w: [4 * 34]u8 = @splat(0);
+    const x: [33]f32 = @splat(1);
+    var y: [4]f32 = .{ 1, 2, 3, 4 };
+    // k = 33 is not a whole number of Q8_0 blocks, which the engine refuses.
+    hk.c_api.hk_gemv_q8_0(&w, &x, null, &y, 4, 33);
+    for (y) |v| try std.testing.expect(std.math.isNan(v));
 }

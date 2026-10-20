@@ -4,17 +4,17 @@
  "generated_by": "docs/graph/gen_graph.py",
  "stats": {
   "curated_nodes": 79,
-  "curated_edges": 153,
-  "file_nodes": 175,
-  "import_edges": 411,
+  "curated_edges": 152,
+  "file_nodes": 176,
+  "import_edges": 422,
   "unowned_files": 0,
   "status_counts": {
-   "done": 8,
+   "done": 9,
    "partial": 16,
    "in-progress": 2,
    "prototype": 8,
    "storage-only": 1,
-   "legacy": 2,
+   "legacy": 1,
    "untested-hw": 0,
    "not-started": 22
   }
@@ -250,10 +250,10 @@
    "note": "x86: avx512/avx2vnni/avx2/generic. ARM: dotprod/neon (never run on ARM)."
   },
   {
-   "id": "kernels-legacy",
+   "id": "c-abi-ops",
    "type": "subsystem",
-   "label": "Legacy kernels (C ABI / Python stack)",
-   "status": "legacy",
+   "label": "C ABI products and quantizer API (on the engine kernels)",
+   "status": "done",
    "plan": [
     9,
     15,
@@ -261,9 +261,10 @@
     20
    ],
    "paths": [
-    "src/tensor_ops.zig"
+    "src/ops.zig",
+    "src/engine/abi_ops.zig"
    ],
-   "note": "Dense/quantized gemv, gemm, dot and small f32 ops behind the C ABI. The duplicate block formats and the quantizers moved to src/quant (encode, research, compat) and are verified against the engine decoders; this file is next to be retired (owner decision 2026-10-20)."
+   "note": "Engine-backed gemv/gemm/dot for the C ABI (strict sizes, NaN on failure), small f32 helpers. Replaced the single-threaded legacy tensor_ops.zig; 8-bit-activation numerics for quantized weights."
   },
   {
    "id": "kv-cache",
@@ -1556,7 +1557,7 @@
    "type": "file",
    "label": "src/c_api.zig",
    "lang": "zig",
-   "loc": 1913,
+   "loc": 1922,
    "owner": "c-abi"
   },
   {
@@ -1700,8 +1701,16 @@
    "type": "file",
    "label": "src/engine.zig",
    "lang": "zig",
-   "loc": 16,
+   "loc": 17,
    "owner": "engine"
+  },
+  {
+   "id": "file:src/engine/abi_ops.zig",
+   "type": "file",
+   "label": "src/engine/abi_ops.zig",
+   "lang": "zig",
+   "loc": 171,
+   "owner": "c-abi-ops"
   },
   {
    "id": "file:src/engine/attention.zig",
@@ -1920,6 +1929,14 @@
    "owner": "nf4-dq"
   },
   {
+   "id": "file:src/ops.zig",
+   "type": "file",
+   "label": "src/ops.zig",
+   "lang": "zig",
+   "loc": 157,
+   "owner": "c-abi-ops"
+  },
+  {
    "id": "file:src/pipeline.zig",
    "type": "file",
    "label": "src/pipeline.zig",
@@ -2004,7 +2021,7 @@
    "type": "file",
    "label": "src/quant/research.zig",
    "lang": "zig",
-   "loc": 394,
+   "loc": 655,
    "owner": "quant-formats"
   },
   {
@@ -2102,14 +2119,6 @@
    "lang": "zig",
    "loc": 261,
    "owner": "sparsity-storage"
-  },
-  {
-   "id": "file:src/tensor_ops.zig",
-   "type": "file",
-   "label": "src/tensor_ops.zig",
-   "lang": "zig",
-   "loc": 1245,
-   "owner": "kernels-legacy"
   },
   {
    "id": "file:src/tensor_toc.zig",
@@ -2236,7 +2245,7 @@
    "type": "file",
    "label": "tests/roundtrip_tests.zig",
    "lang": "zig",
-   "loc": 1964,
+   "loc": 2097,
    "owner": "tests-suite"
   },
   {
@@ -2300,7 +2309,7 @@
    "type": "file",
    "label": "tests/test_cuda.zig",
    "lang": "zig",
-   "loc": 360,
+   "loc": 359,
    "owner": "backend-cuda-standalone"
   },
   {
@@ -2609,7 +2618,7 @@
   },
   {
    "s": "runtime",
-   "t": "kernels-legacy",
+   "t": "c-abi-ops",
    "type": "contains"
   },
   {
@@ -2844,7 +2853,7 @@
   },
   {
    "s": "c-abi",
-   "t": "kernels-legacy",
+   "t": "c-abi-ops",
    "type": "depends_on"
   },
   {
@@ -2906,12 +2915,6 @@
    "s": "pruning",
    "t": "sparsity-storage",
    "type": "depends_on"
-  },
-  {
-   "s": "backend-cuda-standalone",
-   "t": "kernels-legacy",
-   "type": "supersedes",
-   "note": "Independent code path; shares nothing at runtime."
   },
   {
    "s": "backend-abstraction",
@@ -3526,8 +3529,13 @@
    "type": "implemented_by"
   },
   {
-   "s": "kernels-legacy",
-   "t": "file:src/tensor_ops.zig",
+   "s": "c-abi-ops",
+   "t": "file:src/engine/abi_ops.zig",
+   "type": "implemented_by"
+  },
+  {
+   "s": "c-abi-ops",
+   "t": "file:src/ops.zig",
    "type": "implemented_by"
   },
   {
@@ -4752,6 +4760,11 @@
   },
   {
    "s": "file:src/c_api.zig",
+   "t": "file:src/engine/abi_ops.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/c_api.zig",
    "t": "file:src/format.zig",
    "type": "imports"
   },
@@ -4787,6 +4800,11 @@
   },
   {
    "s": "file:src/c_api.zig",
+   "t": "file:src/ops.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/c_api.zig",
    "t": "file:src/pipeline.zig",
    "type": "imports"
   },
@@ -4798,6 +4816,11 @@
   {
    "s": "file:src/c_api.zig",
    "t": "file:src/quant/compat.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/c_api.zig",
+   "t": "file:src/quant/research.zig",
    "type": "imports"
   },
   {
@@ -4818,11 +4841,6 @@
   {
    "s": "file:src/c_api.zig",
    "t": "file:src/sparsity.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/c_api.zig",
-   "t": "file:src/tensor_ops.zig",
    "type": "imports"
   },
   {
@@ -5052,6 +5070,11 @@
   },
   {
    "s": "file:src/engine.zig",
+   "t": "file:src/engine/abi_ops.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine.zig",
    "t": "file:src/engine/config.zig",
    "type": "imports"
   },
@@ -5083,6 +5106,41 @@
   {
    "s": "file:src/engine.zig",
    "t": "file:src/engine/weights.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/abi_ops.zig",
+   "t": "file:src/cores.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/abi_ops.zig",
+   "t": "file:src/engine/matmul.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/abi_ops.zig",
+   "t": "file:src/engine/weights.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/abi_ops.zig",
+   "t": "file:src/format.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/abi_ops.zig",
+   "t": "file:src/kernels.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/abi_ops.zig",
+   "t": "file:src/pool.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/engine/abi_ops.zig",
+   "t": "file:src/quant.zig",
    "type": "imports"
   },
   {
@@ -5471,6 +5529,16 @@
    "type": "imports"
   },
   {
+   "s": "file:src/ops.zig",
+   "t": "file:src/engine/abi_ops.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/ops.zig",
+   "t": "file:src/engine/ops.zig",
+   "type": "imports"
+  },
+  {
    "s": "file:src/quant.zig",
    "t": "file:src/quant/blocks.zig",
    "type": "imports"
@@ -5593,6 +5661,16 @@
   {
    "s": "file:src/quant/gemm.zig",
    "t": "file:src/quant/vecdot.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant/research.zig",
+   "t": "file:src/format.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/quant/research.zig",
+   "t": "file:src/nf4.zig",
    "type": "imports"
   },
   {
@@ -5812,6 +5890,11 @@
   },
   {
    "s": "file:src/root.zig",
+   "t": "file:src/ops.zig",
+   "type": "imports"
+  },
+  {
+   "s": "file:src/root.zig",
    "t": "file:src/pipeline.zig",
    "type": "imports"
   },
@@ -5863,11 +5946,6 @@
   {
    "s": "file:src/root.zig",
    "t": "file:src/sparsity.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/root.zig",
-   "t": "file:src/tensor_ops.zig",
    "type": "imports"
   },
   {
@@ -5978,21 +6056,6 @@
   {
    "s": "file:src/server/scheduler.zig",
    "t": "file:src/tokenizer.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/tensor_ops.zig",
-   "t": "file:src/format.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/tensor_ops.zig",
-   "t": "file:src/nf4.zig",
-   "type": "imports"
-  },
-  {
-   "s": "file:src/tensor_ops.zig",
-   "t": "file:src/quant/compat.zig",
    "type": "imports"
   },
   {
@@ -6354,6 +6417,11 @@
   },
   {
    "s": "c-abi",
+   "t": "c-abi-ops",
+   "imports": 2
+  },
+  {
+   "s": "c-abi",
    "t": "converters",
    "imports": 3
   },
@@ -6379,11 +6447,6 @@
   },
   {
    "s": "c-abi",
-   "t": "kernels-legacy",
-   "imports": 1
-  },
-  {
-   "s": "c-abi",
    "t": "nf4-dq",
    "imports": 1
   },
@@ -6395,7 +6458,7 @@
   {
    "s": "c-abi",
    "t": "quant-formats",
-   "imports": 1
+   "imports": 2
   },
   {
    "s": "c-abi",
@@ -6410,6 +6473,26 @@
   {
    "s": "c-abi",
    "t": "tokenizer",
+   "imports": 1
+  },
+  {
+   "s": "c-abi-ops",
+   "t": "engine",
+   "imports": 5
+  },
+  {
+   "s": "c-abi-ops",
+   "t": "format-core",
+   "imports": 1
+  },
+  {
+   "s": "c-abi-ops",
+   "t": "kernels-engine",
+   "imports": 1
+  },
+  {
+   "s": "c-abi-ops",
+   "t": "quant-formats",
    "imports": 1
   },
   {
@@ -6455,6 +6538,11 @@
   {
    "s": "engine",
    "t": "backend-vulkan",
+   "imports": 1
+  },
+  {
+   "s": "engine",
+   "t": "c-abi-ops",
    "imports": 1
   },
   {
@@ -6548,21 +6636,6 @@
    "imports": 5
   },
   {
-   "s": "kernels-legacy",
-   "t": "format-core",
-   "imports": 1
-  },
-  {
-   "s": "kernels-legacy",
-   "t": "nf4-dq",
-   "imports": 1
-  },
-  {
-   "s": "kernels-legacy",
-   "t": "quant-formats",
-   "imports": 1
-  },
-  {
    "s": "kv-cache",
    "t": "engine",
    "imports": 1
@@ -6625,7 +6698,12 @@
   {
    "s": "quant-formats",
    "t": "format-core",
-   "imports": 5
+   "imports": 6
+  },
+  {
+   "s": "quant-formats",
+   "t": "nf4-dq",
+   "imports": 1
   },
   {
    "s": "sampler",

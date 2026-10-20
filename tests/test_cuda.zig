@@ -1,7 +1,6 @@
 const std = @import("std");
 const hk = @import("hk");
 const cuda = hk.cuda;
-const tensor_ops = hk.tensor_ops;
 const quantization = hk.quantization;
 
 test "cuda device detected" {
@@ -36,7 +35,7 @@ test "cuda gemv f32 matches cpu reference" {
 
     const y_cpu = try allocator.alloc(f32, M);
     defer allocator.free(y_cpu);
-    tensor_ops.gemvF32(W, x, null, y_cpu, M, K);
+    try hk.engine.abi_ops.gemvF32(W, x, null, y_cpu, M, K);
 
     const d_w = try cuda.DeviceBuffer.upload(std.mem.sliceAsBytes(W));
     defer d_w.free();
@@ -91,7 +90,7 @@ test "cuda gemv q8_0 matches cpu reference" {
 
     const y_cpu = try allocator.alloc(f32, M);
     defer allocator.free(y_cpu);
-    tensor_ops.gemvQ8_0(W_q8, x, null, y_cpu, M, K);
+    try hk.engine.abi_ops.gemvQ8_0(W_q8, x, null, y_cpu, M, K);
 
     const d_w = try cuda.DeviceBuffer.upload(W_q8);
     defer d_w.free();
@@ -130,7 +129,7 @@ test "cuda rmsnorm matches cpu reference" {
 
     const out_cpu = try allocator.alloc(f32, dim);
     defer allocator.free(out_cpu);
-    tensor_ops.rmsNormF32(x, w, 1e-5, out_cpu);
+    hk.ops.rmsNormF32(x, w, 1e-5, out_cpu);
 
     const d_x = try cuda.DeviceBuffer.upload(std.mem.sliceAsBytes(x));
     defer d_x.free();

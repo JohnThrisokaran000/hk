@@ -31,7 +31,7 @@ user-facing claims; if this file and the code disagree, **the code wins** — fi
 | Stack | Path | Used by | Notes |
 |:--|:--|:--|:--|
 | **Engine** (live) | `src/engine/*` → `src/quant/*` + `src/kernels/*` (ISA-dispatched, `kernels_impl.zig` compiled per level) → `src/vk/*` | `hk run/chat/serve`, Zig tests | Integer-dot-product design, register-tiled prefill, split-KV decode attention |
-| **Legacy** | `src/c_api.zig` → `src/tensor_ops.zig` + `src/quantization.zig` | Python `native.py`, all language bindings, converters, `reader.dequantizeToF32` | Holds the v1.1.0 optimizations (`gemmF32` zero-skip, RoPE angle table, FP8 E4M3 LUT, 4-row tiled GEMV). Not what the engine executes. |
+| **C ABI** (was a second "legacy" stack until 2026-10-20) | `src/c_api.zig` → `src/engine/abi_ops.zig` (engine kernels) + `src/quant/{compat,encode,research}.zig` + `src/ops.zig` | Python `native.py`, all language bindings, converters, `reader.dequantizeToF32` | Same CPU kernels as the engine. The old `tensor_ops.zig`/`quantization.zig` were deleted; their single-threaded gemv/gemm are replaced (Q8_0 gemv 1.7x and f32 gemm 3x faster in a one-run check, f32 gemv equal). |
 | **Standalone CUDA** | `src/cuda.zig`, `src/cuda/*.cu`, `*.ptx` | `tools/hk_gpu_bench.zig`, `tests/test_cuda.zig` only | **Not wired into the engine or the C API.** Docs say "no CUDA-in-engine". |
 
 Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20) mostly refer to the *legacy* stack. Whether they should be re-expressed in the engine stack is an open design question — see HANDOFF.

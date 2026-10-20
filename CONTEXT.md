@@ -54,7 +54,7 @@ src/                    Zig core (library + C ABI)
   convert/       streaming GGUF / safetensors / HF → .hk; .hk → safetensors
   tokenizer/ tokenizer.zig chat/    BPE + SentencePiece; Jinja subset for chat templates
   sampler.zig                                                    temp/top-k/top-p/min-p/penalties
-  tensor_ops.zig quantization.zig c_api.zig                      LEGACY stack behind C ABI / Python / bindings
+  c_api.zig ops.zig engine/abi_ops.zig                           C ABI / Python / bindings, on the engine kernels
   cuda.zig cuda/                                                 standalone CUDA (NOT in engine)
   growth.zig adaptive.zig expansion.zig sparsity.zig nf4.zig sandbox.zig   research-side Zig
 tools/          hk_cli.zig (the `hk` binary), hk_compare.zig, hk_probe.zig, hk_gpu_bench.zig, GUI, generators
@@ -65,10 +65,11 @@ benchmarks/     results.md (reproduce with hk-compare)             docs/wiki/  u
 docs/plan/      MASTER_PLAN, STATUS, HANDOFF                       docs/graph/ knowledge graph (+ generator)
 ```
 
-**Two kernel stacks** (most common source of wasted effort): the live engine uses `engine → quant + kernels → vk`.
-`tensor_ops.zig` + `quantization.zig` (where the v1.1.0 "gemmF32 zero-skip / RoPE table / FP8 LUT"
-optimizations live) are reached only through `c_api.zig`, Python, and the converters. `cuda.zig` is wired into
-neither. Check which stack a change belongs to before optimizing anything.
+**One kernel stack** (since the 2.0 work): `engine → quant + kernels`, with `vk` and `cuda` as device backends behind
+`backend.Device`. The C ABI, Python and the importers use the same kernels (`engine/abi_ops.zig`, `quant/compat.zig`); the
+former second stack (`tensor_ops.zig`, `quantization.zig`) was removed after it turned out to contain a private "Q4_K"
+layout and a broken Q3_K encoder (see CHANGELOG). The one leftover is the old standalone CUDA kernel set in `src/cuda.zig`,
+used only by `hk-gpu-bench` and `test-cuda`.
 
 ## 4. Commands
 

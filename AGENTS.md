@@ -29,8 +29,9 @@ put proposed changes in HANDOFF "Open decisions".
 
 ## Workflow
 
-- **Which stack?** Engine path = `src/engine`, `src/quant`, `src/kernels`, `src/vk`. Legacy path = `src/tensor_ops.zig`,
-  `src/quantization.zig`, `src/c_api.zig`. Standalone = `src/cuda*`. Confirm before optimizing (CONTEXT §3).
+- **Which stack?** There is one CPU kernel stack: `src/engine`, `src/quant`, `src/kernels`. Devices: `src/vk` (Vulkan) and
+  `src/cuda/engine.zig` + `src/cuda_device.zig` (CUDA, device code in Zig). The C ABI (`src/c_api.zig`) runs on the same kernels
+  through `src/engine/abi_ops.zig`. `src/cuda.zig` also holds the legacy standalone CUDA kernels used only by `hk-gpu-bench`.
 - **Tests live next to the code** (`test "…"` blocks, pulled in via `src/root.zig`'s `refAllDecls`) and in `tests/`
   (Zig suites registered in `build.zig`; pytest; `tests/bindings/run.sh`). New Zig test files must be added to `build.zig`.
 - **Kernel changes:** run `zig build test -Doptimize=ReleaseFast` (all levels), then the forced low levels
@@ -64,7 +65,7 @@ agent has none of your conversation.
 
 ## Pitfalls already paid for
 
-- Optimizing `tensor_ops.zig` and expecting `hk run` to speed up (it won't; see "two kernel stacks").
+- Assuming a block format has one definition per tool: the GGML formats are defined once (`src/quant/blocks.zig`) and decoded once (`dequant.zig`); a second, private copy of Q4_K once shipped and silently disagreed.
 - Quoting "137+ architectures" or "CUDA support" as supported features (neither runs in the engine).
 - Trusting `NativeSandbox`'s `timed_out` (it doesn't enforce a timeout) or `CodeSandbox`'s Docker mode (it can silently fall back).
 - Editing a `.hk` file's metadata through an mmap of that same file — the TOC is read through the mapping you are overwriting (1.1.1 bug; see the in-place patch tests).

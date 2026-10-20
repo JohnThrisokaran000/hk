@@ -7,7 +7,15 @@ const nf4 = @import("nf4.zig");
 const quantization = @import("quant/compat.zig");
 const sparsity = @import("sparsity.zig");
 const tiling = @import("tiling.zig");
-const tensor_ops_mod = @import("tensor_ops.zig");
+const abi_ops = @import("engine/abi_ops.zig");
+const ops_mod = @import("ops.zig");
+const research = @import("quant/research.zig");
+
+/// The ABI's product functions return nothing, so a failure (an unsupported shape, no memory) must still be visible:
+/// the output is filled with NaN rather than left holding whatever was there.
+fn poison(y: []f32) void {
+    @memset(y, std.math.nan(f32));
+}
 const growth_mod = @import("growth.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const engine_mod = @import("engine.zig");
@@ -892,7 +900,7 @@ pub export fn hk_appendix_rollback(file_path_c: [*:0]const u8, target_generation
 }
 
 pub export fn hk_dot_product_f32(a: [*]const f32, b: [*]const f32, count: u64) f32 {
-    return tensor_ops_mod.dotProductF32(a[0..@intCast(count)], b[0..@intCast(count)]);
+    return abi_ops.dotF32(a[0..@intCast(count)], b[0..@intCast(count)]) catch std.math.nan(f32);
 }
 
 pub export fn hk_gemv_f32(
@@ -904,7 +912,8 @@ pub export fn hk_gemv_f32(
     K: u64,
 ) void {
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..@intCast(M)] else null;
-    tensor_ops_mod.gemvF32(W[0..@intCast(M * K)], x[0..@intCast(K)], bias_slice, y[0..@intCast(M)], @intCast(M), @intCast(K));
+    const y_slice = y[0..@intCast(M)];
+    abi_ops.gemv(.f32, std.mem.sliceAsBytes(W[0..@intCast(M * K)]), x[0..@intCast(K)], bias_slice, y_slice, @intCast(M), @intCast(K)) catch poison(y_slice);
 }
 
 pub export fn hk_gemm_f32(
@@ -915,7 +924,7 @@ pub export fn hk_gemm_f32(
     K: u64,
     N: u64,
 ) void {
-    tensor_ops_mod.gemmF32(A[0..@intCast(M * K)], B[0..@intCast(K * N)], C[0..@intCast(M * N)], @intCast(M), @intCast(K), @intCast(N));
+    abi_ops.gemmF32(A[0..@intCast(M * K)], B[0..@intCast(K * N)], C[0..@intCast(M * N)], @intCast(M), @intCast(K), @intCast(N)) catch poison(C[0..@intCast(M * N)]);
 }
 
 pub export fn hk_fused_gemv_nf4(
@@ -931,7 +940,7 @@ pub export fn hk_fused_gemv_nf4(
     const k_bytes = (K + 1) / 2;
     const num_blocks = M * ((K + block_size - 1) / block_size);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..@intCast(M)] else null;
-    tensor_ops_mod.fusedGemvNF4(
+    research.fusedGemvNF4(
         packed_W[0..@intCast(M * k_bytes)],
         scales[0..@intCast(num_blocks)],
         x[0..@intCast(K)],
@@ -955,7 +964,7 @@ pub export fn hk_fused_gemv_dq8(
 ) void {
     const num_blocks = M * ((K + block_size - 1) / block_size);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..@intCast(M)] else null;
-    tensor_ops_mod.fusedGemvDQ8(
+    research.fusedGemvDQ8(
         W_i8[0..@intCast(M * K)],
         scales[0..@intCast(num_blocks)],
         x[0..@intCast(K)],
@@ -1113,7 +1122,7 @@ pub export fn hk_forward_swiglu(
     const bu: ?[]const f32 = if (b_up) |b| b[0..@intCast(inter_f)] else null;
     const bd: ?[]const f32 = if (b_down) |b| b[0..@intCast(out_f)] else null;
 
-    tensor_ops_mod.forwardSwiGLUF32(
+    ops_mod.forwardSwiGLUF32(
         x[0..@intCast(in_f)],
         w_gate[0..@intCast(inter_f * in_f)],
         bg,
@@ -1137,7 +1146,7 @@ pub export fn hk_forward_rmsnorm(
     out: [*]f32,
     len: u64,
 ) void {
-    tensor_ops_mod.rmsNormF32(
+    ops_mod.rmsNormF32(
         x[0..@intCast(len)],
         weight[0..@intCast(len)],
         eps,
@@ -1146,7 +1155,7 @@ pub export fn hk_forward_rmsnorm(
 }
 
 pub export fn hk_forward_silu(x: [*]const f32, out: [*]f32, len: u64) void {
-    tensor_ops_mod.siluF32(x[0..@intCast(len)], out[0..@intCast(len)]);
+    ops_mod.siluF32(x[0..@intCast(len)], out[0..@intCast(len)]);
 }
 
 pub const hk_writer_t = opaque {};
@@ -1349,16 +1358,16 @@ pub export fn hk_export_gguf(input_path_c: [*:0]const u8, output_path_c: [*:0]co
 
 pub export fn hk_rope_permute_hf_to_gguf(in: [*]const f32, out: [*]f32, total_len: u64, n_heads: u64, head_dim: u64) void {
     const len: usize = @intCast(total_len);
-    tensor_ops_mod.ropePermuteHFToGGUF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
+    ops_mod.ropePermuteHFToGGUF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
 }
 
 pub export fn hk_rope_unpermute_gguf_to_hf(in: [*]const f32, out: [*]f32, total_len: u64, n_heads: u64, head_dim: u64) void {
     const len: usize = @intCast(total_len);
-    tensor_ops_mod.ropeUnpermuteGGUFToHF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
+    ops_mod.ropeUnpermuteGGUFToHF(in[0..len], out[0..len], @intCast(n_heads), @intCast(head_dim));
 }
 
 pub export fn hk_layernorm_offset_f32(data: [*]f32, len: u64, offset: f32) void {
-    tensor_ops_mod.layerNormOffsetF32(data[0..@intCast(len)], offset);
+    ops_mod.layerNormOffsetF32(data[0..@intCast(len)], offset);
 }
 
 pub export fn hk_gemv_q8_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32, y: [*]f32, M: u64, K: u64) void {
@@ -1366,7 +1375,7 @@ pub export fn hk_gemv_q8_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32,
     const k: usize = @intCast(K);
     const w_bytes_len = m * (k / 32) * @sizeOf(quantization.BlockQ8_0);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvQ8_0(W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k);
+    abi_ops.gemv(.q8_0, W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_q4_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32, y: [*]f32, M: u64, K: u64) void {
@@ -1374,7 +1383,7 @@ pub export fn hk_gemv_q4_0(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32,
     const k: usize = @intCast(K);
     const w_bytes_len = m * (k / 32) * @sizeOf(quantization.BlockQ4_0);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvQ4_0(W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k);
+    abi_ops.gemv(.q4_0, W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_q4_k(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32, y: [*]f32, M: u64, K: u64) void {
@@ -1382,7 +1391,7 @@ pub export fn hk_gemv_q4_k(W: [*]const u8, x: [*]const f32, bias: ?[*]const f32,
     const k: usize = @intCast(K);
     const w_bytes_len = m * (k / 256) * @sizeOf(quantization.BlockQ4_K);
     const bias_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvQ4_K(W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k);
+    abi_ops.gemv(.q4_k, W[0..w_bytes_len], x[0..k], bias_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1867,7 +1876,7 @@ pub export fn hk_gemv_bf16(
     k: usize,
 ) void {
     const b_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvBF16(w_bf16[0 .. m * k], x[0..k], b_slice, y[0..m], m, k);
+    abi_ops.gemv(.bf16, std.mem.sliceAsBytes(w_bf16[0 .. m * k]), x[0..k], b_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_f16(
@@ -1879,7 +1888,7 @@ pub export fn hk_gemv_f16(
     k: usize,
 ) void {
     const b_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvF16(w_f16[0 .. m * k], x[0..k], b_slice, y[0..m], m, k);
+    abi_ops.gemv(.f16, std.mem.sliceAsBytes(w_f16[0 .. m * k]), x[0..k], b_slice, y[0..m], m, k) catch poison(y[0..m]);
 }
 
 pub export fn hk_gemv_int8(
@@ -1892,19 +1901,19 @@ pub export fn hk_gemv_int8(
     k: usize,
 ) void {
     const b_slice: ?[]const f32 = if (bias) |b| b[0..m] else null;
-    tensor_ops_mod.gemvInt8Scaled(w_i8[0 .. m * k], x[0..k], scale_w, b_slice, y[0..m], m, k);
+    research.gemvInt8Scaled(w_i8[0 .. m * k], x[0..k], scale_w, b_slice, y[0..m], m, k);
 }
 
 pub export fn hk_dot_bf16(a: [*]const u16, b: [*]const f32, len: usize) f32 {
-    return tensor_ops_mod.dotProductBF16(a[0..len], b[0..len]);
+    return abi_ops.dotBF16(a[0..len], b[0..len]) catch std.math.nan(f32);
 }
 
 pub export fn hk_dot_f16(a: [*]const f16, b: [*]const f32, len: usize) f32 {
-    return tensor_ops_mod.dotProductF16(a[0..len], b[0..len]);
+    return abi_ops.dotF16(a[0..len], b[0..len]) catch std.math.nan(f32);
 }
 
 pub export fn hk_dot_int8(a: [*]const i8, b: [*]const i8, len: usize) i32 {
-    return tensor_ops_mod.dotProductInt8(a[0..len], b[0..len]);
+    return research.dotProductInt8(a[0..len], b[0..len]);
 }
 
 

@@ -392,3 +392,264 @@ pub fn dequantizeBlockNVFP4(packed_fp4: []const u8, fp8_scale: u8, count: usize,
     }
 }
 
+
+// -- research products (no engine counterpart) -----------------------------------------------------------------------
+// Moved unchanged from the removed legacy `tensor_ops.zig`.
+
+const nf4 = @import("../nf4.zig");
+const format = @import("../format.zig");
+
+const FusedGemvNF4Ctx = struct {
+    packed_W: []const u8,
+    scales: []const f32,
+    x: []const f32,
+    bias: ?[]const f32,
+    y: []f32,
+    K: usize,
+    block_size: usize,
+    blocks_per_row: usize,
+};
+
+/// Fused NF4 Dequantize-and-GEMV: computes y = Dequant(W_nf4) * x + bias
+/// Does not materialize dequantized float32 weight matrix in RAM!
+pub fn fusedGemvNF4(
+    packed_W: []const u8,
+    scales: []const f32,
+    x: []const f32,
+    bias: ?[]const f32,
+    y: []f32,
+    M: usize,
+    K: usize,
+    block_size: usize,
+) void {
+    const safe_M = @min(M, y.len);
+    const blocks_per_row = (K + block_size - 1) / block_size;
+    fusedGemvNF4Worker(packed_W, scales, x, bias, y, 0, safe_M, K, block_size, blocks_per_row);
+}
+
+fn fusedGemvNF4Task(ctx_ptr: *anyopaque, start_r: usize, end_r: usize) void {
+    const ctx: *const FusedGemvNF4Ctx = @ptrCast(@alignCast(ctx_ptr));
+    fusedGemvNF4Worker(ctx.packed_W, ctx.scales, ctx.x, ctx.bias, ctx.y, start_r, end_r, ctx.K, ctx.block_size, ctx.blocks_per_row);
+}
+
+fn fusedGemvNF4Worker(
+    packed_W: []const u8,
+    scales: []const f32,
+    x: []const f32,
+    bias: ?[]const f32,
+    y: []f32,
+    start_r: usize,
+    end_r: usize,
+    K: usize,
+    block_size: usize,
+    blocks_per_row: usize,
+) void {
+    const k_bytes = (K + 1) / 2;
+    for (start_r..end_r) |r| {
+        const row_packed = packed_W[r * k_bytes .. (r + 1) * k_bytes];
+        var dot: f32 = 0.0;
+        var global_block_idx = r * blocks_per_row;
+
+        var k: usize = 0;
+        while (k < K) {
+            const block_scale = if (global_block_idx < scales.len) scales[global_block_idx] else 1.0;
+            global_block_idx += 1;
+
+            const cur_block_len = @min(block_size, K - k);
+            for (0..cur_block_len) |bi| {
+                const elem_idx = k + bi;
+                const byte_val = row_packed[elem_idx / 2];
+                const code: usize = if (elem_idx % 2 == 0)
+                    (byte_val & 0x0F)
+                else
+                    ((byte_val >> 4) & 0x0F);
+
+                const w_val = nf4.NF4_TABLE[code] * block_scale;
+                dot += w_val * x[elem_idx];
+            }
+            k += cur_block_len;
+        }
+
+        if (bias) |b| {
+            if (r < b.len) dot += b[r];
+        }
+        y[r] = dot;
+    }
+}
+
+/// Fused DQ8 Dequantize-and-GEMV: computes y = (W_i8 * scale) * x + bias
+pub fn fusedGemvDQ8(
+    W_i8: []const i8,
+    scales: []const f32,
+    x: []const f32,
+    bias: ?[]const f32,
+    y: []f32,
+    M: usize,
+    K: usize,
+    block_size: usize,
+) void {
+    const safe_M = @min(M, y.len);
+    const blocks_per_row = (K + block_size - 1) / block_size;
+    fusedGemvDQ8Worker(W_i8, scales, x, bias, y, 0, safe_M, K, block_size, blocks_per_row);
+}
+
+fn fusedGemvDQ8Worker(
+    W_i8: []const i8,
+    scales: []const f32,
+    x: []const f32,
+    bias: ?[]const f32,
+    y: []f32,
+    start_r: usize,
+    end_r: usize,
+    K: usize,
+    block_size: usize,
+    blocks_per_row: usize,
+) void {
+    for (start_r..end_r) |r| {
+        const row_i8 = W_i8[r * K .. (r + 1) * K];
+        var dot: f32 = 0.0;
+        var global_block_idx = r * blocks_per_row;
+
+        var k: usize = 0;
+        while (k < K) {
+            const block_scale = if (global_block_idx < scales.len) scales[global_block_idx] else 1.0;
+            global_block_idx += 1;
+
+            const cur_block_len = @min(block_size, K - k);
+            var bi: usize = 0;
+            while (bi < cur_block_len) : (bi += 1) {
+                const elem_idx = k + bi;
+                const w_val = @as(f32, @floatFromInt(row_i8[elem_idx])) * block_scale;
+                dot += w_val * x[elem_idx];
+            }
+            k += cur_block_len;
+        }
+
+        if (bias) |b| {
+            if (r < b.len) dot += b[r];
+        }
+        y[r] = dot;
+    }
+}
+
+/// Fast INT8 dot product (optimized for Intel VNNI and ARM NEON pipelines, 32 elements/iter)
+pub fn dotProductInt8(a: []const i8, b: []const i8) i32 {
+    const len = @min(a.len, b.len);
+    var i: usize = 0;
+
+    var acc0: @Vector(8, i32) = @splat(0);
+    var acc1: @Vector(8, i32) = @splat(0);
+    var acc2: @Vector(8, i32) = @splat(0);
+    var acc3: @Vector(8, i32) = @splat(0);
+
+    while (i + 32 <= len) : (i += 32) {
+        const v0_a: @Vector(8, i8) = a[i + 0 ..][0..8].*;
+        const v0_b: @Vector(8, i8) = b[i + 0 ..][0..8].*;
+        acc0 += @as(@Vector(8, i32), v0_a) * @as(@Vector(8, i32), v0_b);
+
+        const v1_a: @Vector(8, i8) = a[i + 8 ..][0..8].*;
+        const v1_b: @Vector(8, i8) = b[i + 8 ..][0..8].*;
+        acc1 += @as(@Vector(8, i32), v1_a) * @as(@Vector(8, i32), v1_b);
+
+        const v2_a: @Vector(8, i8) = a[i + 16 ..][0..8].*;
+        const v2_b: @Vector(8, i8) = b[i + 16 ..][0..8].*;
+        acc2 += @as(@Vector(8, i32), v2_a) * @as(@Vector(8, i32), v2_b);
+
+        const v3_a: @Vector(8, i8) = a[i + 24 ..][0..8].*;
+        const v3_b: @Vector(8, i8) = b[i + 24 ..][0..8].*;
+        acc3 += @as(@Vector(8, i32), v3_a) * @as(@Vector(8, i32), v3_b);
+    }
+
+    var sum = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
+
+    while (i + 8 <= len) : (i += 8) {
+        const va: @Vector(8, i8) = a[i..][0..8].*;
+        const vb: @Vector(8, i8) = b[i..][0..8].*;
+        sum += @reduce(.Add, @as(@Vector(8, i32), va) * @as(@Vector(8, i32), vb));
+    }
+
+    while (i < len) : (i += 1) {
+        sum += @as(i32, a[i]) * @as(i32, b[i]);
+    }
+    return sum;
+}
+
+/// Fast Matrix-Vector Multiplication for Raw INT8 Weights with f32 activation (SIMD accelerated):
+/// y = (W_int8 * x) * scale + bias
+pub fn gemvInt8Scaled(
+    W_i8: []const i8,
+    x: []const f32,
+    scale_w: f32,
+    bias: ?[]const f32,
+    y: []f32,
+    M: usize,
+    K: usize,
+) void {
+    const safe_M = @min(M, y.len);
+    if (scale_w == 0.0) {
+        for (0..safe_M) |r| {
+            y[r] = if (bias) |b| (if (r < b.len) b[r] else 0.0) else 0.0;
+        }
+        return;
+    }
+    const is_unit_scale = (scale_w == 1.0);
+    for (0..safe_M) |r| {
+        const row_start = r * K;
+        const row_end = @min(row_start + K, W_i8.len);
+        if (row_start >= W_i8.len) {
+            y[r] = if (bias) |b| (if (r < b.len) b[r] else 0.0) else 0.0;
+            continue;
+        }
+        const row = W_i8[row_start..row_end];
+        var row_sum = dotProductInt8F32(row, x);
+        if (!is_unit_scale) {
+            row_sum *= scale_w;
+        }
+        if (bias) |b| {
+            if (r < b.len) row_sum += b[r];
+        }
+        y[r] = row_sum;
+    }
+}
+
+/// Fast SIMD dot product of INT8 weights with float32 activations (32 elements/iter)
+pub fn dotProductInt8F32(a: []const i8, b: []const f32) f32 {
+    const len = @min(a.len, b.len);
+    var i: usize = 0;
+
+    var acc0: @Vector(8, f32) = @splat(0.0);
+    var acc1: @Vector(8, f32) = @splat(0.0);
+    var acc2: @Vector(8, f32) = @splat(0.0);
+    var acc3: @Vector(8, f32) = @splat(0.0);
+
+    while (i + 32 <= len) : (i += 32) {
+        const v0_i8: @Vector(8, i8) = a[i + 0 ..][0..8].*;
+        const vb0: @Vector(8, f32) = b[i + 0 ..][0..8].*;
+        acc0 += @as(@Vector(8, f32), @floatFromInt(v0_i8)) * vb0;
+
+        const v1_i8: @Vector(8, i8) = a[i + 8 ..][0..8].*;
+        const vb1: @Vector(8, f32) = b[i + 8 ..][0..8].*;
+        acc1 += @as(@Vector(8, f32), @floatFromInt(v1_i8)) * vb1;
+
+        const v2_i8: @Vector(8, i8) = a[i + 16 ..][0..8].*;
+        const vb2: @Vector(8, f32) = b[i + 16 ..][0..8].*;
+        acc2 += @as(@Vector(8, f32), @floatFromInt(v2_i8)) * vb2;
+
+        const v3_i8: @Vector(8, i8) = a[i + 24 ..][0..8].*;
+        const vb3: @Vector(8, f32) = b[i + 24 ..][0..8].*;
+        acc3 += @as(@Vector(8, f32), @floatFromInt(v3_i8)) * vb3;
+    }
+
+    var sum = @reduce(.Add, (acc0 + acc1) + (acc2 + acc3));
+
+    while (i + 8 <= len) : (i += 8) {
+        const v_i8: @Vector(8, i8) = a[i..][0..8].*;
+        const vb: @Vector(8, f32) = b[i..][0..8].*;
+        sum += @reduce(.Add, @as(@Vector(8, f32), @floatFromInt(v_i8)) * vb);
+    }
+
+    while (i < len) : (i += 1) {
+        sum += @as(f32, @floatFromInt(a[i])) * b[i];
+    }
+    return sum;
+}
