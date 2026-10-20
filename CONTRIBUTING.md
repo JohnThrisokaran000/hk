@@ -1,6 +1,6 @@
-# Contributing to HK Neural Tensor Framework
+# Contributing to hk
 
-Thank you for your interest in contributing to HK! We welcome contributions across all areas: native Zig kernels, high-performance quantizers, quantization zoo expansions, multilingual SDKs, Python framework bridges, documentation, and benchmarks.
+Thank you for your interest in contributing to hk. Kernels, backends, model support, bindings, documentation and benchmarks are all welcome. Please keep claims honest: say what you ran, on which hardware, and mark anything you did not run as "not run".
 
 ---
 
@@ -12,17 +12,24 @@ We are committed to providing a welcoming, inclusive, and harassment-free enviro
 
 ## 2. Architecture Overview
 
-HK is structured as a layered, multi-language system:
-- **`src/`**: High-performance core engine written in Zig 0.17. Includes:
-  - `format.zig`: Binary container layout, headers, TOC, metadata, and chunk formats.
-  - `quant/`: the GGML block formats. `dequant.zig` (decoders, checked against llama.cpp), `encode.zig` (encoders), `vecdot.zig`/`gemm.zig` (CPU kernels), `research.zig` (HK-private NF4/DQ/FP8 formats), `compat.zig` (names the C ABI uses).
-  - `engine/abi_ops.zig`: the C ABI's matrix products, on the engine's kernels. `ops.zig`: small f32 helpers behind the ABI.
-  - `gguf.zig`: Native binary GGUF reader, writer, and zero-copy bitstream transcoders.
-  - `c_api.zig`: ABI-stable C interface exported as a shared library (`hk.dll`, `libhk.so`, `libhk.dylib`).
-- **`include/`**: C and C++ header files (`hk.h`, `hk.hpp`).
-- **`python/hk/`**: Python SDK with PyTorch zero-copy tensors, safe open, packed execution (`HKQuantizedLinear`), and tokenizer integration.
-- **`bindings/`**: Official foreign function interfaces for Rust, C#, Go, Java, and TypeScript.
-- **`tests/`**: Comprehensive pytest and native unit test suites.
+- **`src/`**: the engine, written in Zig 0.17.
+  - `format.zig`, `convert/`: the `.hk` container (header, TOC, metadata, seal) and the streaming converters (GGUF, safetensors).
+  - `quant/`: the 26 storage formats. `blocks.zig` defines each block once, `dequant.zig` decodes (checked against llama.cpp), `encode.zig` encodes, `vecdot.zig`/`gemm.zig` are the CPU kernels.
+  - `kernels/`, `engine/`: the CPU engine (model, KV cache, sampler, sessions) and the kernels it runs, built per instruction-set level.
+  - `backend/`: the device interface and `select.zig`, the pure planner that picks CPU, Vulkan or CUDA and decides how many layers go to the device.
+  - `cuda/`, `cuda_device.zig`, `cuda.zig`: the CUDA engine; its kernels are written in Zig and compiled to PTX at build time (no `nvcc`).
+  - `vk/`, `shaders/`: the Vulkan engine and its GLSL compute shaders (the compiled SPIR-V is checked in; `shaders/build.sh` regenerates it).
+  - `hub/`, `server/`, `tokenizer/`, `chat/`: model download, the OpenAI-compatible server, tokenizers and chat templates.
+  - `c_api.zig`: the stable C interface exported as `hk.dll`, `libhk.so` or `libhk.dylib`, running on the same kernels.
+- **`tools/`**: the `hk` CLI and the benchmark and probe tools.
+- **`include/`**: the C and C++ headers (`hk.h`, `hk.hpp`).
+- **`python/hk/`**: the Python package, a thin layer over the C interface plus PyTorch and Hugging Face integration.
+- **`bindings/`**: Rust, C#, Go, Java and TypeScript bindings.
+- **`tests/`**: Zig test suites, end-to-end tests that run the built binary, the binding tests and pytest.
+- **`benchmarks/`**: the comparison scripts against llama.cpp and Transformers, and the recorded results.
+- **`docs/`**: the wiki (`docs/wiki`), the plan and project state (`docs/plan`) and a queryable map of the code (`docs/graph`). `graphify-out/` is a generated knowledge graph of the repository.
+
+For a map of the project and its working rules, start with [AGENTS.md](AGENTS.md) and [docs/plan/CONTEXT.md](docs/plan/CONTEXT.md).
 
 ---
 
