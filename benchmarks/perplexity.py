@@ -9,8 +9,9 @@ are used, and only the second half of each window is scored.
         --tokenizer ~/hk-bench/models/Qwen__Qwen3-0.6B --text wiki.test.raw --ctx 512 --chunks 20
 
 Token ids for hk are made with the Hugging Face tokenizer of the model; llama.cpp tokenizes the text itself. Models that
-prepend a BOS token per window (Llama) are not supported by this script: hk-probe does not replace the first token of a
-window the way llama-perplexity does, so use models without BOS (Qwen) for a like-for-like number.
+prepend a BOS token per window (Llama): hk-probe does not replace the first token of a
+window the way llama-perplexity does unless you pass --bos <id> (then hk-probe puts that token first in every window, like
+llama-perplexity does; the Hugging Face tokenizer's ids are made without special tokens, so the text itself is unchanged).
 """
 import argparse
 import json
@@ -42,8 +43,11 @@ def llama_ppl(build, gguf, text, ctx, chunks, ngl):
     return (float(m.group(1)), float(m.group(2))) if m else None
 
 
-def hk_ppl(hk, ids, ctx, backend):
-    out = run([HK_BIN / "hk-probe", hk, "--ppl", ids, ctx], env={"HK_BACKEND": backend})
+def hk_ppl(hk, ids, ctx, backend, bos=None):
+    env = {"HK_BACKEND": backend}
+    if bos is not None:
+        env["HK_PPL_BOS"] = str(bos)
+    out = run([HK_BIN / "hk-probe", hk, "--ppl", ids, ctx], env=env)
     m = re.search(r"tokens (\d+) mean_nll ([\d.]+) ppl ([\d.]+)", out)
     return (float(m.group(3)), int(m.group(1))) if m else None
 
@@ -76,6 +80,7 @@ def main():
     ap.add_argument("--text", required=True)
     ap.add_argument("--ctx", type=int, default=512)
     ap.add_argument("--chunks", type=int, default=20)
+    ap.add_argument("--bos", type=int, help="token id llama-perplexity puts first in every window (models that add BOS, e.g. Llama)")
     ap.add_argument("--hf", action="store_true", help="also run Transformers on the safetensors weights in --tokenizer")
     ap.add_argument("--hf-dtype", default="float32")
     ap.add_argument("--out", help="write the results as JSON")
@@ -86,6 +91,8 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(a.tokenizer)
     ids = tok(Path(a.text).read_text(encoding="utf-8"), add_special_tokens=False)["input_ids"]
+    if a.bos is not None:
+        ids = [a.bos] + ids  # llama-perplexity tokenizes with the BOS the model asks for
     ids = ids[: a.ctx * a.chunks]
     ids_path = Path(tempfile.mkdtemp()) / "ids.u32"
     np.array(ids, dtype=np.uint32).tofile(ids_path)
@@ -97,7 +104,7 @@ def main():
         if r:
             res[name] = {"ppl": r[0], "stderr": r[1]}
     for backend in ["cpu", "vulkan", "cuda"]:
-        r = hk_ppl(a.hk, ids_path, a.ctx, backend)
+        r = hk_ppl(a.hk, ids_path, a.ctx, backend, a.bos)
         if r:
             res[f"hk {backend}"] = {"ppl": r[0], "scored_tokens": r[1]}
     if a.hf:

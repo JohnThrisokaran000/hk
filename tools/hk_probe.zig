@@ -91,7 +91,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, arg2, "--ppl")) {
         const ids_path = it.next() orelse return usage();
         const ctx_len: usize = if (it.next()) |s| try std.fmt.parseInt(usize, s, 10) else 512;
-        return perplexity(allocator, io, &model, ids_path, ctx_len);
+        const bos: ?u32 = if (init.environ_map.get("HK_PPL_BOS")) |v| std.fmt.parseInt(u32, v, 10) catch null else null;
+        return perplexity(allocator, io, &model, ids_path, ctx_len, bos);
     }
 
     var ids: std.ArrayList(u32) = .empty;
@@ -121,11 +122,19 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn perplexity(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, ids_path: []const u8, ctx_len: usize) !void {
+fn perplexity(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, ids_path: []const u8, ctx_len: usize, bos: ?u32) !void {
     const cwd = std.Io.Dir.cwd();
     const bytes = try cwd.readFileAlloc(io, ids_path, allocator, .limited(1 << 30));
     defer allocator.free(bytes);
-    const ids: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, bytes));
+    const ids_in: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, bytes));
+    // Models whose vocabulary adds a beginning-of-sequence token: llama-perplexity puts it at the start of every window
+    // (replacing the first token), so HK_PPL_BOS=<id> does the same.
+    const ids = try allocator.dupe(u32, ids_in);
+    defer allocator.free(ids);
+    if (bos) |b| {
+        var w: usize = 0;
+        while (w + ctx_len <= ids.len) : (w += ctx_len) ids[w] = b;
+    }
 
     var nll: f64 = 0;
     var count: usize = 0;
