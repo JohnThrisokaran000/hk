@@ -51,7 +51,7 @@ I would rather you hear this from me.
 
 - Only Llama, Qwen2 and Qwen3 style dense models run. No Gemma, Phi, Mistral with sliding window, mixture of experts, or vision models.
 - The tokenizer.json importer handles byte-level BPE only, so a safetensors repository with a SentencePiece or Unigram tokenizer is refused with a message. Its GGUF version will work.
-- GPU support is a Vulkan backend (`-ngl`, `HK_GPU=1`) and a first CUDA backend (`--backend cuda`), each running a whole model on one device. Both were tested on one NVIDIA card only. Vulkan is slower than llama.cpp's; CUDA is a correct but unoptimized first version (no batched prompt kernel, no fusion, no Tensor Cores) and has not been benchmarked. There is no Metal, ROCm or TPU backend.
+- GPU support is a Vulkan backend (`-ngl`, `HK_GPU=1`) and a first CUDA backend (`--backend cuda`), each running a whole model on one device. Both were tested on one NVIDIA card only. Vulkan is slower than llama.cpp's; CUDA is correct but early: on one synthetic model it generates at about 90 % of Vulkan's speed and processes prompts at about a fifth of it (no fusion, graphs or Tensor Cores yet). There is no Metal, ROCm or TPU backend.
 - The CPU kernels are built for each instruction set level (AVX-512 VNNI, AVX2, generic on x86; NEON with and without dot product on ARM) and chosen at startup. The ARM kernels pass the portable tests but have not been run on ARM hardware, and the older x86 levels have not been benchmarked on real older CPUs.
 - Split GGUF files (`-00001-of-00003.gguf`) are not downloaded yet.
 - No grammar or JSON-schema constrained decoding, and no tool-call parsing.

@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("HK_THREADS")) |v| n_threads = std.fmt.parseInt(usize, v, 10) catch 0;
     const want_gpu = if (init.environ_map.get("HK_GPU")) |v| std.mem.eql(u8, v, "1") else false;
     gpu_profile = init.environ_map.get("HK_GPU_PROFILE") != null;
+    cuda_events = init.environ_map.get("HK_CUDA_EVENTS") != null;
     // HK_BACKEND=vulkan|cuda picks the device (and implies HK_GPU=1); cpu forces the CPU.
     var backend: hk.backend.select.Choice = .auto;
     var gpu_mode: hk.engine.model.GpuMode = if (want_gpu) .on else .off;
@@ -160,6 +161,8 @@ fn nowNs(io: std.Io) i128 {
 /// Prefill and decode throughput with synthetic tokens. Decode feeds the previous argmax back
 /// in, exactly like generation, so it includes the output projection every step.
 var gpu_profile = false;
+/// Per kernel GPU timing for CUDA (synchronizes after every launch, so it distorts speed).
+var cuda_events = false;
 
 fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_prompt: usize, n_gen: usize) !void {
     const prompt = try allocator.alloc(u32, n_prompt);
@@ -167,6 +170,12 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     for (prompt, 0..) |*t, i| t.* = @intCast(1 + (i * 7919) % (model.cfg.vocab - 1));
 
     model.cpu.profile.enabled = true;
+    const cuda_profile = cuda_events and isCuda(model);
+    if (gpu_profile) if (model.gpu) |dev| switch (dev) {
+        .cuda => |e| e.enablePassTiming() catch {},
+        .vulkan => {},
+    };
+    if (cuda_profile) hk.cuda.profiling.enable() catch |e| std.debug.print("cuda profiling unavailable: {s}\n", .{@errorName(e)});
     printMem(io, "loaded");
     const t0 = nowNs(io);
     var pos: usize = 0;
@@ -175,8 +184,16 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
         try model.forward(prompt[pos..][0..n], pos);
         pos += n;
     }
+    // A prefill ends with the first prediction. Device passes run asynchronously, so without reading the logits the
+    // clock would stop while the GPU is still busy and that time would be charged to the first decode steps.
+    _ = model.logitsFor((n_prompt - 1) % model.n_batch);
     const t1 = nowNs(io);
     printProfile("prefill", &model.cpu.profile);
+    if (cuda_profile) {
+        std.debug.print("cuda kernels, prefill:\n", .{});
+        printCudaProfile();
+        hk.cuda.profiling.reset();
+    }
     model.cpu.profile = .{ .enabled = true };
     if (vkEngine(model)) |g| {
         g.kind_ns = @splat(0);
@@ -198,6 +215,14 @@ fn bench(allocator: std.mem.Allocator, io: std.Io, model: *hk.engine.Model, n_pr
     }
     const t2 = nowNs(io);
     printProfile("decode ", &model.cpu.profile);
+    if (cuda_profile) {
+        std.debug.print("cuda kernels, decode:\n", .{});
+        printCudaProfile();
+    }
+    if (gpu_profile) if (model.gpu) |dev| switch (dev) {
+        .cuda => |e| std.debug.print("cuda host time: {d} passes, issuing launches {d:.1} ms, waiting for results {d:.1} ms; gpu time of the passes read back by logits {d:.1} ms\n", .{ e.prof_passes, e.prof_launch_s * 1e3, e.prof_wait_s * 1e3, e.prof_gpu_ms }),
+        .vulkan => {},
+    };
     if (vkEngine(model)) |g| if (g.tq != null) {
         const names = [_][]const u8{ "embed", "norm", "mmv", "mm", "rope", "attn", "swiglu", "add" };
         std.debug.print("gpu kernels (ms per token):", .{});
@@ -349,4 +374,16 @@ fn vkEngine(model: *hk.engine.Model) ?*hk.gpu.Engine {
         .vulkan => |e| e,
         .cuda => null,
     };
+}
+
+fn isCuda(model: *hk.engine.Model) bool {
+    const dev = model.gpu orelse return false;
+    return dev.kind() == .cuda;
+}
+
+fn printCudaProfile() void {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    hk.cuda.profiling.report(&w) catch {};
+    std.debug.print("{s}", .{w.buffered()});
 }

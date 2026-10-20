@@ -14,6 +14,8 @@ pub const Options = struct {
     n_kv: usize = 2,
     ffn: usize = 128,
     seed: u64 = 7,
+    /// `<arch>.context_length` written to the file.
+    ctx: usize = 256,
     chat_template: ?[]const u8 = null,
     /// Store the weight matrices as Q8_0 instead of f32.
     q8_0: bool = false,
@@ -127,7 +129,7 @@ pub fn makeTinyGguf(allocator: std.mem.Allocator, io: std.Io, path: []const u8, 
     }.of;
     try kvu32.putS(&kv, &n_kv, "general.architecture", arch);
     try kvu32.put(&kv, &n_kv, k(arena, arch, "block_count"), @intCast(o.n_layers));
-    try kvu32.put(&kv, &n_kv, k(arena, arch, "context_length"), 256);
+    try kvu32.put(&kv, &n_kv, k(arena, arch, "context_length"), @intCast(o.ctx));
     try kvu32.put(&kv, &n_kv, k(arena, arch, "embedding_length"), @intCast(o.dim));
     try kvu32.put(&kv, &n_kv, k(arena, arch, "feed_forward_length"), @intCast(o.ffn));
     try kvu32.put(&kv, &n_kv, k(arena, arch, "attention.head_count"), @intCast(o.n_heads));

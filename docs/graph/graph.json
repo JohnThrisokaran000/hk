@@ -693,7 +693,7 @@
     "src/cuda_device.zig",
     "src/cuda/engine.zig"
    ],
-   "note": "First engine: whole network on one NVIDIA GPU via the driver API; device code in Zig (nvptx64 PTX built by build.zig, no CUDA toolkit). One generic GEMV kernel for all 26 CPU formats reuses quant/dequant.zig. Parity with CPU verified on one RTX 3050 (llama/qwen2/qwen3, f32/Q8_0, multi-slot). Unoptimized and unbenchmarked: no batched prefill, fusion, graphs or Tensor Cores."
+   "note": "First engine: whole network on one NVIDIA GPU via the driver API; device code in Zig (nvptx64 PTX built by build.zig, no CUDA toolkit). One generic GEMV kernel for all 26 CPU formats reuses quant/dequant.zig. Parity with CPU verified on one RTX 3050 (llama/qwen2/qwen3, f32/Q8_0, multi-slot). Early performance (synthetic model: prefill 1,190 / decode 360 tok/s vs Vulkan 5,719 / 406): tiled GEMM, split-KV attention; no fusion, graphs or Tensor Cores."
   },
   {
    "id": "backend-metal",
@@ -1661,7 +1661,7 @@
    "type": "file",
    "label": "src/cuda.zig",
    "lang": "zig",
-   "loc": 1072,
+   "loc": 1149,
    "owner": "backend-cuda-standalone"
   },
   {
@@ -1669,7 +1669,7 @@
    "type": "file",
    "label": "src/cuda/engine.zig",
    "lang": "zig",
-   "loc": 486,
+   "loc": 593,
    "owner": "backend-cuda-engine"
   },
   {
@@ -1693,7 +1693,7 @@
    "type": "file",
    "label": "src/cuda_device.zig",
    "lang": "zig",
-   "loc": 320,
+   "loc": 611,
    "owner": "backend-cuda-engine"
   },
   {
@@ -2261,7 +2261,7 @@
    "type": "file",
    "label": "tests/support/tiny_model.zig",
    "lang": "zig",
-   "loc": 368,
+   "loc": 370,
    "owner": "tests-suite"
   },
   {
@@ -2285,7 +2285,7 @@
    "type": "file",
    "label": "tests/test_cuda.zig",
    "lang": "zig",
-   "loc": 351,
+   "loc": 360,
    "owner": "backend-cuda-standalone"
   },
   {
@@ -2333,7 +2333,7 @@
    "type": "file",
    "label": "tests/test_gpu.zig",
    "lang": "zig",
-   "loc": 198,
+   "loc": 256,
    "owner": "tests-suite"
   },
   {
@@ -2429,7 +2429,7 @@
    "type": "file",
    "label": "tests/tiny_model_tool.zig",
    "lang": "zig",
-   "loc": 25,
+   "loc": 48,
    "owner": "tests-suite"
   },
   {
@@ -2509,7 +2509,7 @@
    "type": "file",
    "label": "tools/hk_probe.zig",
    "lang": "zig",
-   "loc": 352,
+   "loc": 389,
    "owner": "bench-tools"
   },
   {

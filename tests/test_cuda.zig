@@ -285,20 +285,22 @@ fn randomBlocks(comptime t: hk.format.StorageType, rand: std.Random, dst: []u8) 
     }
 }
 
-test "device gemv matches the CPU decoders for every format the CPU runs" {
+test "device gemm matches the CPU decoders for every format the CPU runs" {
     if (!cuda.isAvailable()) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(2024);
     const rand = prng.random();
-    const M: usize = 9;
+    const M: usize = 21; // one full tile of 16 rows and a partial one
     const K: usize = 512; // a whole number of blocks for 1, 32, 64 and 256 element formats
 
-    const x = try allocator.alloc(f32, K);
+    // Up to 19 tokens: two full tiles of eight and a partial tile of three, so both tile edges are exercised.
+    const max_tokens: usize = 19;
+    const x = try allocator.alloc(f32, max_tokens * K);
     defer allocator.free(x);
     for (x) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
     const d_x = try cuda.DeviceBuffer.upload(std.mem.sliceAsBytes(x));
     defer d_x.free();
-    const d_y = try cuda.DeviceBuffer.allocUninit(M * @sizeOf(f32));
+    const d_y = try cuda.DeviceBuffer.allocUninit(max_tokens * M * @sizeOf(f32));
     defer d_y.free();
 
     var tested: usize = 0;
@@ -310,39 +312,46 @@ test "device gemv matches the CPU decoders for every format the CPU runs" {
             defer allocator.free(w);
             try randomBlocks(t, rand, w);
 
-            const dec = try allocator.alloc(f32, K);
-            defer allocator.free(dec);
-            const want = try allocator.alloc(f64, M);
-            defer allocator.free(want);
-            const scale = try allocator.alloc(f64, M);
-            defer allocator.free(scale);
-            for (0..M) |r| {
-                try hk.quant.dequantizeRow(t, w[r * row_bytes ..][0..row_bytes], dec);
-                var s: f64 = 0;
-                var mag: f64 = 0;
-                for (dec, x) |a, b| {
-                    s += @as(f64, a) * b;
-                    mag += @abs(@as(f64, a) * b);
+            // One token takes the decode kernel, several the batch kernel; both must match the reference.
+            for ([_]usize{ 1, max_tokens }) |N| {
+                const dec = try allocator.alloc(f32, K);
+                defer allocator.free(dec);
+                const want = try allocator.alloc(f64, N * M);
+                defer allocator.free(want);
+                const scale = try allocator.alloc(f64, N * M);
+                defer allocator.free(scale);
+                for (0..M) |r| {
+                    try hk.quant.dequantizeRow(t, w[r * row_bytes ..][0..row_bytes], dec);
+                    for (0..N) |tok| {
+                        const xs = x[tok * K ..][0..K];
+                        var s: f64 = 0;
+                        var mag: f64 = 0;
+                        for (dec, xs) |a, b| {
+                            s += @as(f64, a) * b;
+                            mag += @abs(@as(f64, a) * b);
+                        }
+                        want[tok * M + r] = s;
+                        scale[tok * M + r] = mag;
+                    }
                 }
-                want[r] = s;
-                scale[r] = mag;
-            }
 
-            const d_w = try cuda.DeviceBuffer.upload(w);
-            defer d_w.free();
-            try cuda.deviceGemv(t, d_w, d_x, d_y, M, K);
-            try cuda.synchronize();
-            const got = try allocator.alloc(f32, M);
-            defer allocator.free(got);
-            try d_y.download(std.mem.sliceAsBytes(got));
+                const d_w = try cuda.DeviceBuffer.upload(w);
+                defer d_w.free();
+                try cuda.deviceGemm(t, d_w, d_x, d_y, M, K, N);
+                try cuda.synchronize();
+                const got = try allocator.alloc(f32, N * M);
+                defer allocator.free(got);
+                try d_y.download(std.mem.sliceAsBytes(got));
 
-            for (0..M) |r| {
-                // f32 accumulation in a different order: error scales with the sum of magnitudes, not the result.
-                const tol = 1e-4 * scale[r] + 1e-6;
-                if (@abs(@as(f64, got[r]) - want[r]) > tol) {
-                    std.debug.print("format {s} row {d}: device {d} cpu {d} (tol {d})\n", .{ @tagName(t), r, got[r], want[r], tol });
-                    return error.DeviceMismatch;
+                for (0..N * M) |i| {
+                    // f32 accumulation in a different order: error scales with the sum of magnitudes, not the result.
+                    const tol = 1e-4 * scale[i] + 1e-6;
+                    if (@abs(@as(f64, got[i]) - want[i]) > tol) {
+                        std.debug.print("format {s} token {d} row {d}: device {d} cpu {d} (tol {d})\n", .{ @tagName(t), i / M, i % M, got[i], want[i], tol });
+                        return error.DeviceMismatch;
+                    }
                 }
+
             }
             tested += 1;
         }

@@ -1,10 +1,10 @@
 //! The CUDA engine: the whole network on one NVIDIA device, driven through the CUDA driver API (loaded at run time)
 //! with kernels written in Zig (`src/cuda_device.zig`).
 //!
-//! Scope of this first version, stated plainly:
-//!   * correctness first (plan §152). Every item of a pass runs the full network on its own, one kernel launch after
-//!     another, so a prompt of N tokens costs N sequential decode steps. There is no batched prefill GEMM, no fusion,
-//!     no CUDA graphs and no Tensor Cores yet; those are later stages of HK 2.0/2.1;
+//! Scope, stated plainly:
+//!   * a pass runs the whole batch through each layer at once: the matrix kernel decodes every weight block once for
+//!     groups of eight tokens, and attention, RoPE and the cache writes are batched over tokens. There is still no
+//!     fusion, no CUDA graphs (one launch per kernel) and no Tensor Cores; those are later stages of HK 2.0/2.1;
 //!   * weights are copied to the device once (a deliberate copy, counted by `bytesNeeded`) straight from the mapped
 //!     container, with no staging copy in host memory;
 //!   * the token embedding is decoded on the host (one row per token) and uploaded, so the embedding matrix itself
@@ -23,6 +23,10 @@ const ops = @import("../engine/ops.zig");
 const Config = config_mod.Config;
 const Mat = weights_mod.Mat;
 const StorageType = format.StorageType;
+
+fn nowSecs() f64 {
+    return @as(f64, @floatFromInt(std.Io.Timestamp.now(std.Options.debug_io, .awake).nanoseconds)) / 1e9;
+}
 
 pub const Error = error{
     UnsupportedType,
@@ -47,8 +51,16 @@ pub const Options = struct {
 const block_threads: u32 = 128;
 /// Threads per block of the elementwise kernels.
 const elem_threads: u32 = 256;
+/// Threads per block of the attention kernel: one per position of a tile (`attn_tile` in the device code).
+const attn_threads: u32 = 128;
 /// Largest head width the attention kernel supports.
 const max_head_dim = 256;
+/// Split-KV attention: slices of the context per (token, head) at most, and the smallest slice worth a block.
+const max_splits = 8;
+const min_split_positions = 256;
+/// Attention uses one block per (token, head) when there are at least this many of them; fewer is decode-like work
+/// that cannot fill the device without slicing the context.
+const split_below_blocks = 64;
 /// Logit rows that can be read back at once.
 const max_logit_rows = 64;
 
@@ -85,8 +97,11 @@ const Kernels = struct {
     rms_norm: cuda.Kernel,
     head_norm: cuda.Kernel,
     rope: cuda.Kernel,
+    add_bias: cuda.Kernel,
     kv_write: cuda.Kernel,
     attention: cuda.Kernel,
+    attention_part: cuda.Kernel,
+    attention_combine: cuda.Kernel,
     swiglu: cuda.Kernel,
     add: cuda.Kernel,
 };
@@ -104,9 +119,11 @@ pub fn bytesNeeded(w: *const weights_mod.Weights, cfg: Config, o: Options) u64 {
     total += w.output.data.len + 4 * w.out_norm.len;
     const kv_per_layer: u64 = 2 * @as(u64, o.slots) * o.n_ctx * cfg.n_kv_heads * cfg.head_dim * 2;
     total += kv_per_layer * cfg.n_layers;
-    total += @as(u64, cfg.n_heads) * o.n_ctx * 4; // attention scores
-    const act: u64 = (6 * @as(u64, cfg.dim) + 2 * cfg.qDim() + 2 * cfg.kvDim() + 2 * cfg.ffn_dim) * 4;
-    total += act + @as(u64, o.n_batch) * (cfg.dim + cfg.rope_dim) * 4; // hidden rows, cos/sin
+    // Activations are [batch][...]: xb, hidden, tmp (dim); q, att (qDim); k, v (kvDim); gate, up (ffn); cos, sin.
+    const per_token: u64 = (3 * @as(u64, cfg.dim) + 2 * cfg.qDim() + 2 * cfg.kvDim() + 2 * cfg.ffn_dim + cfg.rope_dim) * 4 + 8;
+    total += per_token * o.n_batch;
+    total += @as(u64, split_below_blocks) * max_splits * (cfg.head_dim + 2) * 4;
+    total += 16 * @as(u64, o.slots);
     total += @as(u64, max_logit_rows) * cfg.vocab * 4;
     return total + (64 << 20);
 }
@@ -125,7 +142,8 @@ pub const Engine = struct {
     inv_freq: []const f32,
     mscale: f32,
     k: Kernels,
-    gemv: std.EnumArray(StorageType, ?cuda.Kernel),
+    /// Matrix kernels per storage type: [0] decode (one token), [1] batch (tiled).
+    gemm: std.EnumArray(StorageType, ?[2]cuda.Kernel),
 
     /// Single token activations.
     xb: cuda.DeviceMem,
@@ -133,25 +151,42 @@ pub const Engine = struct {
     kk: cuda.DeviceMem,
     vv: cuda.DeviceMem,
     att: cuda.DeviceMem,
+    /// Partial softmax states of split-KV attention: [block][head_dim + 2] floats.
+    attn_part: cuda.DeviceMem,
     tmp: cuda.DeviceMem,
     gate: cuda.DeviceMem,
     up: cuda.DeviceMem,
-    scores: cuda.DeviceMem,
     /// Final hidden state of every item of the last pass, and the residual stream while it runs.
     hidden: cuda.DeviceMem,
     cos_dev: cuda.DeviceMem,
     sin_dev: cuda.DeviceMem,
     logits_dev: cuda.DeviceMem,
+    /// Base addresses of every slot's caches, and the slot and position of each item of the current pass.
+    slot_k_tbl: cuda.DeviceMem,
+    slot_v_tbl: cuda.DeviceMem,
+    item_slot: cuda.DeviceMem,
+    item_pos: cuda.DeviceMem,
     /// Per slot key and value caches: [layer][kv head][position][head_dim] in f16.
     kcache: []cuda.DeviceMem,
     vcache: []cuda.DeviceMem,
     owners: []?*const kv_mod.KvCache,
 
+    slot_h: []u32,
+    pos_h: []u32,
     embed_h: []f32,
     cos_h: []f32,
     sin_h: []f32,
     logits_h: []f32,
     n_last: usize = 0,
+    /// Largest position of the current pass, which decides how finely attention is split.
+    max_pos: u32 = 0,
+    /// Host seconds spent issuing launches (forward) and waiting for results (logits), summed; for HK_GPU_PROFILE.
+    prof_launch_s: f64 = 0,
+    prof_wait_s: f64 = 0,
+    prof_passes: u64 = 0,
+    /// GPU milliseconds across whole passes (two events around a pass, no per kernel syncing), when enabled.
+    prof_gpu_ms: f64 = 0,
+    pass_events: ?[2]cuda.CudaEvent = null,
     name_buf: [128]u8 = undefined,
     name_len: usize = 0,
 
@@ -189,20 +224,30 @@ pub const Engine = struct {
         self.tok_embd = w.tok_embd;
         self.inv_freq = inv_freq;
         self.mscale = mscale;
+        // `self` starts undefined, so the fields that have declared defaults must be set here too.
         self.n_last = 0;
+        self.max_pos = 0;
         self.name_len = 0;
+        self.prof_launch_s = 0;
+        self.prof_wait_s = 0;
+        self.prof_passes = 0;
+        self.prof_gpu_ms = 0;
+        self.pass_events = null;
         if (cuda.getDeviceName(&self.name_buf)) |nm| self.name_len = nm.len else |_| {}
 
         self.k = .{
             .rms_norm = cuda.deviceKernel("rms_norm") catch return error.DeviceFailed,
             .head_norm = cuda.deviceKernel("head_norm") catch return error.DeviceFailed,
             .rope = cuda.deviceKernel("rope") catch return error.DeviceFailed,
+            .add_bias = cuda.deviceKernel("add_bias") catch return error.DeviceFailed,
             .kv_write = cuda.deviceKernel("kv_write") catch return error.DeviceFailed,
             .attention = cuda.deviceKernel("attention") catch return error.DeviceFailed,
+            .attention_part = cuda.deviceKernel("attention_part") catch return error.DeviceFailed,
+            .attention_combine = cuda.deviceKernel("attention_combine") catch return error.DeviceFailed,
             .swiglu = cuda.deviceKernel("swiglu") catch return error.DeviceFailed,
             .add = cuda.deviceKernel("add") catch return error.DeviceFailed,
         };
-        self.gemv = std.EnumArray(StorageType, ?cuda.Kernel).initFill(null);
+        self.gemm = std.EnumArray(StorageType, ?[2]cuda.Kernel).initFill(null);
 
         // Everything below is released by `deinit`; track what exists so a failure part way frees exactly that.
         var made = Made{ .allocator = allocator };
@@ -230,16 +275,17 @@ pub const Engine = struct {
         self.output = try self.upload(&made, w.output);
 
         const f = 4; // bytes of an f32
-        self.xb = try made.empty(cfg.dim * f);
-        self.q = try made.empty(cfg.qDim() * f);
-        self.kk = try made.empty(cfg.kvDim() * f);
-        self.vv = try made.empty(cfg.kvDim() * f);
-        self.att = try made.empty(cfg.qDim() * f);
-        self.tmp = try made.empty(cfg.dim * f);
-        self.gate = try made.empty(cfg.ffn_dim * f);
-        self.up = try made.empty(cfg.ffn_dim * f);
-        self.scores = try made.empty(cfg.n_heads * o.n_ctx * f);
-        self.hidden = try made.empty(o.n_batch * cfg.dim * f);
+        const rows = o.n_batch;
+        self.xb = try made.empty(rows * cfg.dim * f);
+        self.q = try made.empty(rows * cfg.qDim() * f);
+        self.kk = try made.empty(rows * cfg.kvDim() * f);
+        self.vv = try made.empty(rows * cfg.kvDim() * f);
+        self.att = try made.empty(rows * cfg.qDim() * f);
+        self.attn_part = try made.empty(split_below_blocks * max_splits * (cfg.head_dim + 2) * f);
+        self.tmp = try made.empty(rows * cfg.dim * f);
+        self.gate = try made.empty(rows * cfg.ffn_dim * f);
+        self.up = try made.empty(rows * cfg.ffn_dim * f);
+        self.hidden = try made.empty(rows * cfg.dim * f);
         const half = cfg.rope_dim / 2;
         self.cos_dev = try made.empty(o.n_batch * half * f);
         self.sin_dev = try made.empty(o.n_batch * half * f);
@@ -255,9 +301,30 @@ pub const Engine = struct {
             vc.* = try made.empty(kv_bytes);
         }
 
+        self.slot_k_tbl = try made.empty(o.slots * 8);
+        self.slot_v_tbl = try made.empty(o.slots * 8);
+        self.item_slot = try made.empty(o.n_batch * 4);
+        self.item_pos = try made.empty(o.n_batch * 4);
+        {
+            const kt = try allocator.alloc(u64, o.slots);
+            defer allocator.free(kt);
+            const vt = try allocator.alloc(u64, o.slots);
+            defer allocator.free(vt);
+            for (self.kcache, self.vcache, kt, vt) |kc, vc, *k_, *v_| {
+                k_.* = kc.addr;
+                v_.* = vc.addr;
+            }
+            cuda.copyToDevice(self.slot_k_tbl.addr, std.mem.sliceAsBytes(kt)) catch |e| return mapErr(e);
+            cuda.copyToDevice(self.slot_v_tbl.addr, std.mem.sliceAsBytes(vt)) catch |e| return mapErr(e);
+        }
+
         self.owners = try allocator.alloc(?*const kv_mod.KvCache, o.slots);
         errdefer allocator.free(self.owners);
         @memset(self.owners, null);
+        self.slot_h = try allocator.alloc(u32, o.n_batch);
+        errdefer allocator.free(self.slot_h);
+        self.pos_h = try allocator.alloc(u32, o.n_batch);
+        errdefer allocator.free(self.pos_h);
         self.embed_h = try allocator.alloc(f32, o.n_batch * cfg.dim);
         errdefer allocator.free(self.embed_h);
         self.cos_h = try allocator.alloc(f32, o.n_batch * half);
@@ -323,10 +390,10 @@ pub const Engine = struct {
     };
 
     fn upload(self: *Engine, made: *Made, m: Mat) Error!DevMat {
-        if (self.gemv.get(m.t) == null) {
-            var nbuf: [48]u8 = undefined;
-            const name = std.fmt.bufPrint(&nbuf, "gemv_{s}", .{@tagName(m.t)}) catch return error.UnsupportedType;
-            self.gemv.set(m.t, cuda.deviceKernel(name) catch return error.UnsupportedType);
+        if (self.gemm.get(m.t) == null) {
+            const one = cuda.gemmKernel(m.t, 1) catch return error.UnsupportedType;
+            const many = cuda.gemmKernel(m.t, 2) catch return error.UnsupportedType;
+            self.gemm.set(m.t, .{ one, many });
         }
         return .{ .mem = try made.bytes(m.data), .t = m.t, .rows = m.rows, .cols = m.cols };
     }
@@ -342,7 +409,7 @@ pub const Engine = struct {
         a.free(self.layers);
         cuda.deviceFree(self.out_norm);
         cuda.deviceFree(self.output.mem);
-        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.tmp, self.gate, self.up, self.scores, self.hidden, self.cos_dev, self.sin_dev, self.logits_dev }) |m| cuda.deviceFree(m);
+        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
         for (self.kcache, self.vcache) |kc, vc| {
             cuda.deviceFree(kc);
             cuda.deviceFree(vc);
@@ -350,10 +417,20 @@ pub const Engine = struct {
         a.free(self.kcache);
         a.free(self.vcache);
         a.free(self.owners);
+        a.free(self.slot_h);
+        a.free(self.pos_h);
         a.free(self.embed_h);
         a.free(self.cos_h);
         a.free(self.sin_h);
         a.free(self.logits_h);
+    }
+
+    /// Starts timing whole passes on the device (see `prof_gpu_ms`).
+    pub fn enablePassTiming(self: *Engine) Error!void {
+        if (self.pass_events != null) return;
+        const a = cuda.CudaEvent.create() catch |e| return mapErr(e);
+        const b = cuda.CudaEvent.create() catch |e| return mapErr(e);
+        self.pass_events = .{ a, b };
     }
 
     pub fn deviceName(self: *const Engine) []const u8 {
@@ -385,62 +462,78 @@ pub const Engine = struct {
         return @intCast((n + per - 1) / per);
     }
 
-    fn mv(self: *Engine, m: DevMat, x: u64, y: u64) Error!void {
-        const kern = self.gemv.get(m.t).?;
-        cuda.launchKernel(kern, @intCast(m.rows), block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)) }) catch |e| return mapErr(e);
+    /// y[token][0..rows] = m * x[token] for `n` tokens.
+    fn mm(self: *Engine, m: DevMat, x: u64, y: u64, n: usize) Error!void {
+        const kernels = self.gemm.get(m.t).?;
+        const kern = if (n <= 1) kernels[0] else kernels[1];
+        const g = cuda.gemmGrid(m.rows, n);
+        cuda.launchKernel2D(kern, g[0], g[1], block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
     }
 
-    fn rmsNorm(self: *Engine, out: u64, x: u64, w: u64) Error!void {
-        cuda.launchKernel(self.k.rms_norm, 1, block_threads, .{ out, x, w, @as(u32, @intCast(self.cfg.dim)), self.cfg.rms_eps }) catch |e| return mapErr(e);
+    fn rmsNorm(self: *Engine, out: u64, x: u64, w: u64, rows: usize) Error!void {
+        cuda.launchKernel(self.k.rms_norm, @intCast(rows), block_threads, .{ out, x, w, @as(u32, @intCast(self.cfg.dim)), self.cfg.rms_eps }) catch |e| return mapErr(e);
     }
 
     fn addInto(self: *Engine, x: u64, y: u64, n: usize) Error!void {
         cuda.launchKernel(self.k.add, grid(n, elem_threads), elem_threads, .{ x, y, @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
     }
 
-    /// Runs the whole network for the token whose embedding is in `hidden[row]`, at position `pos` of `slot`.
-    fn runItem(self: *Engine, row: usize, slot: usize, pos: u32) Error!void {
+    fn addBias(self: *Engine, x: u64, bias: u64, len: usize, rows: usize) Error!void {
+        const total = len * rows;
+        cuda.launchKernel(self.k.add_bias, grid(total, elem_threads), elem_threads, .{ x, bias, @as(u32, @intCast(len)), @as(u32, @intCast(total)) }) catch |e| return mapErr(e);
+    }
+
+    /// Runs the whole network for the `n` tokens whose embeddings are in `hidden`, one layer at a time.
+    fn runBatch(self: *Engine, n: usize) Error!void {
         const cfg = self.cfg;
-        const f = 4;
-        const x = self.hidden.at(row * cfg.dim * f);
         const half = cfg.rope_dim / 2;
-        const cos = self.cos_dev.at(row * half * f);
-        const sin = self.sin_dev.at(row * half * f);
         const neox: u32 = if (cfg.rope_style == .neox) 1 else 0;
         const hd: u32 = @intCast(cfg.head_dim);
-        const group: u32 = @intCast(cfg.n_heads / cfg.n_kv_heads);
+        const n_heads: u32 = @intCast(cfg.n_heads);
+        const n_kv: u32 = @intCast(cfg.n_kv_heads);
+        const group: u32 = n_heads / n_kv;
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
         const layer_elems = cfg.n_kv_heads * self.n_ctx * cfg.head_dim;
+        const ctx: u32 = @intCast(self.n_ctx);
+        const x = self.hidden.addr;
+        // Few (token, head) blocks cannot fill the device, so a long context is sliced across several blocks each.
+        const splits: u32 = if (n * cfg.n_heads >= split_below_blocks) 1 else @intCast(std.math.clamp((self.max_pos + min_split_positions) / min_split_positions, 1, max_splits));
 
         for (self.layers, 0..) |l, li| {
-            try self.rmsNorm(self.xb.addr, x, l.attn_norm.addr);
-            try self.mv(l.wq, self.xb.addr, self.q.addr);
-            try self.mv(l.wk, self.xb.addr, self.kk.addr);
-            try self.mv(l.wv, self.xb.addr, self.vv.addr);
-            if (l.bq) |b| try self.addInto(self.q.addr, b.addr, cfg.qDim());
-            if (l.bk) |b| try self.addInto(self.kk.addr, b.addr, cfg.kvDim());
-            if (l.bv) |b| try self.addInto(self.vv.addr, b.addr, cfg.kvDim());
+            try self.rmsNorm(self.xb.addr, x, l.attn_norm.addr, n);
+            try self.mm(l.wq, self.xb.addr, self.q.addr, n);
+            try self.mm(l.wk, self.xb.addr, self.kk.addr, n);
+            try self.mm(l.wv, self.xb.addr, self.vv.addr, n);
+            if (l.bq) |b| try self.addBias(self.q.addr, b.addr, cfg.qDim(), n);
+            if (l.bk) |b| try self.addBias(self.kk.addr, b.addr, cfg.kvDim(), n);
+            if (l.bv) |b| try self.addBias(self.vv.addr, b.addr, cfg.kvDim(), n);
 
-            if (l.q_norm) |w| cuda.launchKernel(self.k.head_norm, @intCast(cfg.n_heads), block_threads, .{ self.q.addr, w.addr, hd, cfg.rms_eps }) catch |e| return mapErr(e);
-            if (l.k_norm) |w| cuda.launchKernel(self.k.head_norm, @intCast(cfg.n_kv_heads), block_threads, .{ self.kk.addr, w.addr, hd, cfg.rms_eps }) catch |e| return mapErr(e);
-            cuda.launchKernel(self.k.rope, @intCast(cfg.n_heads), block_threads, .{ self.q.addr, cos, sin, hd, @as(u32, @intCast(half)), neox }) catch |e| return mapErr(e);
-            cuda.launchKernel(self.k.rope, @intCast(cfg.n_kv_heads), block_threads, .{ self.kk.addr, cos, sin, hd, @as(u32, @intCast(half)), neox }) catch |e| return mapErr(e);
+            if (l.q_norm) |w| cuda.launchKernel(self.k.head_norm, @intCast(n * cfg.n_heads), block_threads, .{ self.q.addr, w.addr, hd, cfg.rms_eps }) catch |e| return mapErr(e);
+            if (l.k_norm) |w| cuda.launchKernel(self.k.head_norm, @intCast(n * cfg.n_kv_heads), block_threads, .{ self.kk.addr, w.addr, hd, cfg.rms_eps }) catch |e| return mapErr(e);
+            cuda.launchKernel(self.k.rope, @intCast(n * cfg.n_heads), block_threads, .{ self.q.addr, self.cos_dev.addr, self.sin_dev.addr, hd, @as(u32, @intCast(half)), neox, n_heads }) catch |e| return mapErr(e);
+            cuda.launchKernel(self.k.rope, @intCast(n * cfg.n_kv_heads), block_threads, .{ self.kk.addr, self.cos_dev.addr, self.sin_dev.addr, hd, @as(u32, @intCast(half)), neox, n_kv }) catch |e| return mapErr(e);
 
-            const kbase = self.kcache[slot].at(li * layer_elems * 2);
-            const vbase = self.vcache[slot].at(li * layer_elems * 2);
+            // Keys and values of the whole batch go in first so a token sees its predecessors in the same pass.
+            const layer_off: u64 = @as(u64, li) * layer_elems * 2;
             const kvd: u32 = @intCast(cfg.kvDim());
-            cuda.launchKernel(self.k.kv_write, grid(cfg.kvDim(), elem_threads), elem_threads, .{ self.kk.addr, self.vv.addr, kbase, vbase, pos, @as(u32, @intCast(self.n_ctx)), hd, kvd }) catch |e| return mapErr(e);
-            cuda.launchKernel(self.k.attention, @intCast(cfg.n_heads), block_threads, .{ self.q.addr, kbase, vbase, self.att.addr, self.scores.addr, pos, @as(u32, @intCast(self.n_ctx)), hd, group, scale }) catch |e| return mapErr(e);
+            const kv_total: u32 = @intCast(n * cfg.kvDim());
+            cuda.launchKernel(self.k.kv_write, grid(kv_total, elem_threads), elem_threads, .{ self.kk.addr, self.vv.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, ctx, hd, kvd, kv_total }) catch |e| return mapErr(e);
+            if (splits == 1) {
+                cuda.launchKernel(self.k.attention, @intCast(n * cfg.n_heads), attn_threads, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.att.addr, ctx, hd, n_heads, group, scale }) catch |e| return mapErr(e);
+            } else {
+                cuda.launchKernel(self.k.attention_part, @intCast(n * cfg.n_heads * splits), attn_threads, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.attn_part.addr, ctx, hd, n_heads, group, scale, splits }) catch |e| return mapErr(e);
+                cuda.launchKernel(self.k.attention_combine, @intCast(n * cfg.n_heads), attn_threads, .{ self.attn_part.addr, self.att.addr, hd, splits }) catch |e| return mapErr(e);
+            }
 
-            try self.mv(l.wo, self.att.addr, self.tmp.addr);
-            try self.addInto(x, self.tmp.addr, cfg.dim);
+            try self.mm(l.wo, self.att.addr, self.tmp.addr, n);
+            try self.addInto(x, self.tmp.addr, n * cfg.dim);
 
-            try self.rmsNorm(self.xb.addr, x, l.ffn_norm.addr);
-            try self.mv(l.w_gate, self.xb.addr, self.gate.addr);
-            try self.mv(l.w_up, self.xb.addr, self.up.addr);
-            cuda.launchKernel(self.k.swiglu, grid(cfg.ffn_dim, elem_threads), elem_threads, .{ self.gate.addr, self.up.addr, @as(u32, @intCast(cfg.ffn_dim)) }) catch |e| return mapErr(e);
-            try self.mv(l.w_down, self.gate.addr, self.tmp.addr);
-            try self.addInto(x, self.tmp.addr, cfg.dim);
+            try self.rmsNorm(self.xb.addr, x, l.ffn_norm.addr, n);
+            try self.mm(l.w_gate, self.xb.addr, self.gate.addr, n);
+            try self.mm(l.w_up, self.xb.addr, self.up.addr, n);
+            cuda.launchKernel(self.k.swiglu, grid(n * cfg.ffn_dim, elem_threads), elem_threads, .{ self.gate.addr, self.up.addr, @as(u32, @intCast(n * cfg.ffn_dim)) }) catch |e| return mapErr(e);
+            try self.mm(l.w_down, self.gate.addr, self.tmp.addr, n);
+            try self.addInto(x, self.tmp.addr, n * cfg.dim);
         }
     }
 
@@ -457,14 +550,24 @@ pub const Engine = struct {
             quant.dequantizeRow(self.tok_embd.t, row, self.embed_h[t * cfg.dim ..][0..cfg.dim]) catch return error.UnsupportedType;
             ops.ropeAngles(self.cos_h[t * half ..][0..half], self.sin_h[t * half ..][0..half], self.inv_freq, it.pos, self.mscale);
         }
+        for (items, 0..) |it, t| {
+            self.slot_h[t] = @intCast(try self.slotFor(it.kv));
+            self.pos_h[t] = it.pos;
+        }
         cuda.copyToDevice(self.hidden.addr, std.mem.sliceAsBytes(self.embed_h[0 .. n * cfg.dim])) catch |e| return mapErr(e);
         cuda.copyToDevice(self.cos_dev.addr, std.mem.sliceAsBytes(self.cos_h[0 .. n * half])) catch |e| return mapErr(e);
         cuda.copyToDevice(self.sin_dev.addr, std.mem.sliceAsBytes(self.sin_h[0 .. n * half])) catch |e| return mapErr(e);
+        cuda.copyToDevice(self.item_slot.addr, std.mem.sliceAsBytes(self.slot_h[0..n])) catch |e| return mapErr(e);
+        cuda.copyToDevice(self.item_pos.addr, std.mem.sliceAsBytes(self.pos_h[0..n])) catch |e| return mapErr(e);
 
-        for (items, 0..) |it, t| {
-            const slot = try self.slotFor(it.kv);
-            try self.runItem(t, slot, it.pos);
-        }
+        self.max_pos = 0;
+        for (items) |it| self.max_pos = @max(self.max_pos, it.pos);
+        const t0 = nowSecs();
+        if (self.pass_events) |ev| ev[0].record(null) catch |e| return mapErr(e);
+        try self.runBatch(n);
+        if (self.pass_events) |ev| ev[1].record(null) catch |e| return mapErr(e);
+        self.prof_launch_s += nowSecs() - t0;
+        self.prof_passes += 1;
         self.n_last = n;
     }
 
@@ -476,11 +579,15 @@ pub const Engine = struct {
         const f = 4;
         for (indices, 0..) |idx, r| {
             std.debug.assert(idx < self.n_last);
-            try self.rmsNorm(self.xb.addr, self.hidden.at(idx * cfg.dim * f), self.out_norm.addr);
-            try self.mv(self.output, self.xb.addr, self.logits_dev.at(r * cfg.vocab * f));
+            try self.rmsNorm(self.xb.at(r * cfg.dim * f), self.hidden.at(idx * cfg.dim * f), self.out_norm.addr, 1);
         }
+        // One pass over the output matrix for every requested row.
+        try self.mm(self.output, self.xb.addr, self.logits_dev.addr, indices.len);
         const out = self.logits_h[0 .. indices.len * cfg.vocab];
+        const t0 = nowSecs();
         cuda.copyFromDevice(std.mem.sliceAsBytes(out), self.logits_dev.addr) catch |e| return mapErr(e);
+        self.prof_wait_s += nowSecs() - t0;
+        if (self.pass_events) |ev| self.prof_gpu_ms += ev[0].elapsedMs(&ev[1]) catch 0;
         return out;
     }
 };

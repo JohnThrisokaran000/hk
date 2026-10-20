@@ -967,13 +967,16 @@ pub fn fusedSwiGluResidual(gate: anytype, up: anytype, res: anytype, hidden_dim:
 // Device module built from Zig (src/cuda_device.zig)
 // ---------------------------------------------------------------------
 
+/// A kernel of the Zig device module, resolved once. `name` is stable for the life of the process.
+pub const Kernel = struct { f: CuFunction, name: []const u8 };
+
 /// Looks up a kernel of the Zig device module by name; the handle is cached.
-fn deviceFunction(name: []const u8) !CuFunction {
+fn deviceFunction(name: []const u8) !Kernel {
     const s = try ensureDriver();
     if (s.dev_module == null) return CudaError.KernelNotFound;
     global_mutex.lock();
     defer global_mutex.unlock();
-    if (s.dev_fns.get(name)) |f| return f;
+    if (s.dev_fns.getEntry(name)) |e| return .{ .f = e.value_ptr.*, .name = e.key_ptr.* };
     var buf: [64]u8 = undefined;
     if (name.len >= buf.len) return CudaError.KernelNotFound;
     @memcpy(buf[0..name.len], name);
@@ -982,30 +985,45 @@ fn deviceFunction(name: []const u8) !CuFunction {
     if (s.api.?.cuModuleGetFunction(&f, s.dev_module, @ptrCast(&buf)) != 0 or f == null) return CudaError.KernelNotFound;
     const key = std.heap.page_allocator.dupe(u8, name) catch return error.OutOfMemory;
     s.dev_fns.put(std.heap.page_allocator, key, f) catch return error.OutOfMemory;
-    return f;
+    return .{ .f = f, .name = key };
 }
 
-/// Threads per block of the matrix-vector kernels (one block per output row).
-pub const gemv_block_threads: c_uint = 128;
+/// Threads per block of the matrix kernels: the decode kernel's reduction width, and exactly the
+/// `gemm_tile_rows * gemm_tile_tokens` outputs of one tile of the batched kernel.
+pub const gemm_block_threads: c_uint = 128;
+/// Output rows one block of the decode kernel computes, a warp each (see `gemv_rows` in cuda_device.zig).
+pub const gemv_rows: usize = 4;
+/// Output rows and tokens of one tile of the batched matrix kernel (see `tile_rows`/`tile_tokens` in cuda_device.zig).
+pub const gemm_tile_rows: usize = 16;
+pub const gemm_tile_tokens: usize = 8;
 
-/// y[0..m] = W[m x k] * x, with W stored as `t` blocks row after row (the container's layout), run by the Zig device
-/// kernel for that format. `k` must be a whole number of blocks. The same block decoders the CPU engine uses run on
-/// the device, so every format the CPU decodes is available here.
-pub fn deviceGemv(t: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize) !void {
+/// Grid of a matrix launch for `m` output rows and `n` tokens: one block per `gemv_rows` rows for a single token, one
+/// block per `gemm_tile_rows` x `gemm_tile_tokens` tile otherwise.
+pub fn gemmGrid(m: usize, n: usize) [2]u32 {
+    if (n <= 1) return .{ @intCast((m + gemv_rows - 1) / gemv_rows), 1 };
+    return .{ @intCast((m + gemm_tile_rows - 1) / gemm_tile_rows), @intCast((n + gemm_tile_tokens - 1) / gemm_tile_tokens) };
+}
+
+/// The matrix kernel for `fmt` suited to `n` tokens: a single token gets the lean decode (matrix-vector) kernel,
+/// anything larger the tiled kernel that stages activations in shared memory and reuses each decoded weight block.
+pub fn gemmKernel(fmt: format.StorageType, n: usize) !Kernel {
     var name_buf: [48]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buf, "gemv_{s}", .{@tagName(t)}) catch return CudaError.UnsupportedStorageType;
-    const f = deviceFunction(name) catch |e| switch (e) {
-        error.KernelNotFound => return CudaError.UnsupportedStorageType,
-        else => return e,
+    const name = std.fmt.bufPrint(&name_buf, "{s}_{s}", .{ if (n <= 1) "gemv" else "gemm", @tagName(fmt) }) catch return CudaError.UnsupportedStorageType;
+    return deviceKernel(name) catch |e| switch (e) {
+        error.KernelNotFound => CudaError.UnsupportedStorageType,
+        else => e,
     };
-    const s = try ensureDriver();
-    var d_w = toDevicePtr(w);
-    var d_x = toDevicePtr(x);
-    var d_y = toDevicePtr(y);
-    var k_val: u32 = @intCast(k);
-    var params = [_]?*anyopaque{ @ptrCast(&d_w), @ptrCast(&d_x), @ptrCast(&d_y), @ptrCast(&k_val) };
-    const res = s.api.?.cuLaunchKernel(f, @intCast(m), 1, 1, gemv_block_threads, 1, 1, 0, null, &params, null);
-    if (res != 0) return CudaError.CudaCallFailed;
+}
+
+/// y[t][0..m] = W[m x k] * x[t] for `n` tokens (x is [n][k], y is [n][m]), with W stored as `fmt` blocks row after row
+/// (the container's layout), run by the Zig device kernel for that format. `k` must be a whole number of blocks. The
+/// same block decoders the CPU engine uses run on the device, so every format the CPU decodes is available here.
+pub fn deviceGemm(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize, n: usize) !void {
+    const kernel = try gemmKernel(fmt, n);
+    const g = gemmGrid(m, n);
+    try launchKernel2D(kernel, g[0], g[1], gemm_block_threads, .{
+        @as(u64, toDevicePtr(w)), @as(u64, toDevicePtr(x)), @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -1053,20 +1071,79 @@ pub fn copyFromDevice(dst: []u8, src: u64) !void {
     if (s.api.?.cuMemcpyDtoH_v2(dst.ptr, src, dst.len) != 0) return CudaError.CudaCallFailed;
 }
 
-/// A kernel of the Zig device module, resolved once.
-pub const Kernel = struct { f: CuFunction };
-
 pub fn deviceKernel(name: []const u8) !Kernel {
-    return .{ .f = try deviceFunction(name) };
+    return deviceFunction(name);
 }
 
 /// Launches `k` on the default stream with a one dimensional grid. `args` is a tuple whose fields match the kernel's
 /// parameters exactly in size: device pointers as `u64`, counts as `u32`, scalars as `f32`.
 pub fn launchKernel(k: Kernel, grid: u32, block: u32, args: anytype) !void {
+    return launchKernel2D(k, grid, 1, block, args);
+}
+
+/// Like `launchKernel` with a two dimensional grid.
+pub fn launchKernel2D(k: Kernel, grid_x: u32, grid_y: u32, block: u32, args: anytype) !void {
     const s = try ensureDriver();
     var storage = args;
     const n = args.len;
     var ptrs: [n]?*anyopaque = undefined;
     inline for (0..n) |i| ptrs[i] = @ptrCast(&storage[i]);
-    if (s.api.?.cuLaunchKernel(k.f, grid, 1, 1, block, 1, 1, 0, null, &ptrs, null) != 0) return CudaError.CudaCallFailed;
+    if (profiling.on) try profiling.begin(s);
+    if (s.api.?.cuLaunchKernel(k.f, grid_x, grid_y, 1, block, 1, 1, 0, null, &ptrs, null) != 0) return CudaError.CudaCallFailed;
+    if (profiling.on) try profiling.end(s, k.name);
 }
+
+/// Per kernel GPU time, measured with events around each launch. It synchronizes after every launch, so it slows the
+/// run down and exists to say where the time goes, not to measure speed.
+pub const profiling = struct {
+    const max_kernels = 96;
+    var on = false;
+    var start: CuEvent = null;
+    var stop: CuEvent = null;
+    var names: [max_kernels][]const u8 = undefined;
+    var ms: [max_kernels]f64 = @splat(0);
+    var calls: [max_kernels]u64 = @splat(0);
+    var count: usize = 0;
+
+    pub fn enable() !void {
+        const s = try ensureDriver();
+        if (on) return;
+        if (s.api.?.cuEventCreate(&start, 0) != 0 or s.api.?.cuEventCreate(&stop, 0) != 0) return CudaError.CudaCallFailed;
+        on = true;
+    }
+
+    pub fn reset() void {
+        ms = @splat(0);
+        calls = @splat(0);
+    }
+
+    fn begin(s: *DriverState) !void {
+        if (s.api.?.cuEventRecord(start, null) != 0) return CudaError.CudaCallFailed;
+    }
+
+    fn end(s: *DriverState, name: []const u8) !void {
+        if (s.api.?.cuEventRecord(stop, null) != 0 or s.api.?.cuEventSynchronize(stop) != 0) return CudaError.CudaCallFailed;
+        var t: f32 = 0;
+        if (s.api.?.cuEventElapsedTime(&t, start, stop) != 0) return CudaError.CudaCallFailed;
+        var i: usize = 0;
+        while (i < count and !std.mem.eql(u8, names[i], name)) : (i += 1) {}
+        if (i == count) {
+            if (count == max_kernels) return;
+            names[count] = name;
+            count += 1;
+        }
+        ms[i] += t;
+        calls[i] += 1;
+    }
+
+    /// One line per kernel: calls, total ms, mean microseconds, share of the total.
+    pub fn report(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var total: f64 = 0;
+        for (ms[0..count]) |v| total += v;
+        for (names[0..count], ms[0..count], calls[0..count]) |nm, t, c| {
+            const mean_us = if (c == 0) 0 else t * 1000.0 / @as(f64, @floatFromInt(c));
+            try w.print("  {s:<18} {d:>7} calls {d:>9.2} ms  {d:>8.1} us/call  {d:>5.1}%\n", .{ nm, c, t, mean_us, if (total > 0) 100.0 * t / total else 0 });
+        }
+        try w.print("  total {d:.2} ms\n", .{total});
+    }
+};

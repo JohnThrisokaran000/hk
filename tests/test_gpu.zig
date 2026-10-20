@@ -21,9 +21,9 @@ fn cosine(a: []const f32, b: []const f32) f64 {
     return dot / (@sqrt(na) * @sqrt(nb));
 }
 
-fn load(path: []const u8, gpu: hk.engine.model.GpuMode, backend: Choice, slots: usize, reader: *hk.HKReader) !hk.engine.Model {
+fn load(path: []const u8, gpu: hk.engine.model.GpuMode, backend: Choice, slots: usize, n_ctx: usize, reader: *hk.HKReader) !hk.engine.Model {
     var diag = hk.engine.Diag{};
-    return hk.engine.Model.init(gpa, reader, .{ .n_ctx = 256, .n_threads = 2, .gpu = gpu, .backend = backend, .gpu_slots = slots }, &diag) catch |e| {
+    return hk.engine.Model.init(gpa, reader, .{ .n_ctx = n_ctx, .n_threads = 2, .gpu = gpu, .backend = backend, .gpu_slots = slots }, &diag) catch |e| {
         if (gpu == .off) std.debug.print("load {s}: {s}: {s}\n", .{ path, @errorName(e), diag.message() });
         return e;
     };
@@ -47,7 +47,7 @@ fn check(dir: []const u8, name: []const u8, o: tiny.Options, min_cos: f64, backe
     defer gpa.free(h);
     var reader = try hk.HKReader.open(h, gpa);
     defer reader.deinit();
-    var gpu_model = load(h, .on, backend, 1, &reader) catch |e| switch (e) {
+    var gpu_model = load(h, .on, backend, 1, 256, &reader) catch |e| switch (e) {
         error.GpuFailed => return error.SkipZigTest,
         else => return e,
     };
@@ -55,7 +55,7 @@ fn check(dir: []const u8, name: []const u8, o: tiny.Options, min_cos: f64, backe
     // The device must really be the one asked for, not a quiet CPU run.
     try std.testing.expect(gpu_model.gpu != null);
     try std.testing.expectEqual(expectedKind(backend), gpu_model.gpu.?.kind());
-    var cpu_model = try load(h, .off, .cpu, 1, &reader);
+    var cpu_model = try load(h, .off, .cpu, 1, 256, &reader);
     defer cpu_model.deinit();
 
     // A prompt batch (the batched kernels), then single steps (the decode kernels).
@@ -128,12 +128,12 @@ fn checkSlots(backend: Choice) !void {
     defer gpa.free(h);
     var reader = try hk.HKReader.open(h, gpa);
     defer reader.deinit();
-    var dev = load(h, .on, backend, 2, &reader) catch |e| switch (e) {
+    var dev = load(h, .on, backend, 2, 256, &reader) catch |e| switch (e) {
         error.GpuFailed => return error.SkipZigTest,
         else => return e,
     };
     defer dev.deinit();
-    var cpu = try load(h, .off, .cpu, 1, &reader);
+    var cpu = try load(h, .off, .cpu, 1, 256, &reader);
     defer cpu.deinit();
 
     const Kv = hk.engine.KvCache;
@@ -195,4 +195,62 @@ test "the Vulkan engine keeps sequences apart and runs out of slots loudly" {
 
 test "the CUDA engine keeps sequences apart and runs out of slots loudly" {
     try checkSlots(.cuda);
+}
+
+/// A context long enough that decode slices attention across several blocks (more than 256 positions), checked token
+/// by token against the CPU. Prompt processing runs the whole-context kernel; every decode step runs the split one.
+fn checkLongContext(backend: Choice) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+    const h = try makeModel(dir, "longctx", .{ .arch = .qwen3, .ctx = 1024 });
+    defer gpa.free(h);
+    var reader = try hk.HKReader.open(h, gpa);
+    defer reader.deinit();
+    var dev = load(h, .on, backend, 1, 1024, &reader) catch |e| switch (e) {
+        error.GpuFailed => return error.SkipZigTest,
+        else => return e,
+    };
+    defer dev.deinit();
+    var cpu = try load(h, .off, .cpu, 1, 1024, &reader);
+    defer cpu.deinit();
+
+    const prompt_len = 700;
+    var prompt: [prompt_len]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 7919) % 200);
+    var pos: usize = 0;
+    while (pos < prompt_len) {
+        const n = @min(dev.n_batch, prompt_len - pos);
+        try dev.forward(prompt[pos..][0..n], pos);
+        try cpu.forward(prompt[pos..][0..n], pos);
+        pos += n;
+    }
+    const lg = try gpa.dupe(f32, dev.logitsFor((prompt_len - 1) % dev.n_batch));
+    defer gpa.free(lg);
+    try std.testing.expect(cosine(lg, cpu.logitsFor((prompt_len - 1) % cpu.n_batch)) > 0.9999);
+
+    var tok: u32 = 9;
+    for (0..4) |_| {
+        try dev.forward(&.{tok}, pos);
+        try cpu.forward(&.{tok}, pos);
+        const a = try gpa.dupe(f32, dev.logitsFor(0));
+        defer gpa.free(a);
+        const b = cpu.logitsFor(0);
+        try std.testing.expect(cosine(a, b) > 0.9999);
+        var best: usize = 0;
+        for (b, 0..) |x, i| if (x > b[best]) {
+            best = i;
+        };
+        tok = @intCast(best);
+        pos += 1;
+    }
+}
+
+test "the Vulkan engine matches the CPU on a long context" {
+    try checkLongContext(.vulkan);
+}
+
+test "the CUDA engine matches the CPU on a long context (split-KV attention)" {
+    try checkLongContext(.cuda);
 }

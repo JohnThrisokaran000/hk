@@ -459,7 +459,7 @@ flowchart LR
 | `hub-pull` | Hub downloader (hk pull) | partial | 93 | 7 | 2096 | Resume, retries, SHA-256; GGUF + sharded safetensors. No split-GGUF, parallel, S3, registry. |
 | `converters` | Streaming converters | partial | 90, 95 | 10 | 3142 | GGUF/safetensors/HF → .hk streaming; .hk → safetensors/GGUF. BPE-only tokenizer.json import. |
 | `cli` | hk CLI | partial | 124 | 3 | 2588 | ~30 commands; missing quantize/compact/fsck/history/diff/merge/sign/profile/distributed. |
-| `bench-tools` | Benchmarks (hk-compare, hk-kernels) | partial | 85, 84 | 3 | 854 | Reproducible vs llama.cpp only. |
+| `bench-tools` | Benchmarks (hk-compare, hk-kernels) | partial | 85, 84 | 3 | 891 | Reproducible vs llama.cpp only. |
 | `bindings` | Language bindings | partial | 91 | — | — | C, C++, Rust, Go, C#, Java, TypeScript tested. Kotlin/Swift/ObjC absent. |
 | `python-sdk` | Python SDK | partial | 87, 88, 89 | 21 | 10728 | Native engine/tokenizer wrappers + torch integration. No DLPack; NativeHKTensor/Model/Trainer absent. |
 | `architecture-registry` | Python architecture registry (169 aliases / 79 names) | prototype | 46, 47 | 1 | 315 | Conversion/tensor-name mapping only. NOT engine support. |
@@ -471,8 +471,8 @@ flowchart LR
 | `self-training` | Self-training / self-conversation / SPIN | prototype | 32, 34, 35 | 2 | 469 | Components, not a validated loop. No demonstrated improvement. |
 | `code-sandbox` | Code sandboxes | prototype | 33 | 2 | 355 | PLAN VIOLATION: Docker mode silently degrades to unsandboxed subprocess; Zig NativeSandbox does not enforce its timeout and is unused. |
 | `backend-abstraction` | Backend abstraction (Device seam) | partial | 1, 131, 132, 136, 137 | 3 | 499 | Stage 1a: tagged-union Device over whole-network executors (Vulkan only today); Model goes through it. CPU is still inline in engine/model.zig; no capability table, selection or memory planner yet. |
-| `backend-cuda-engine` | CUDA engine backend (Tensor Cores, graphs) | partial | 57, 150 | 2 | 806 | First engine: whole network on one NVIDIA GPU via the driver API; device code in Zig (nvptx64 PTX built by build.zig, no CUDA toolkit). One generic GEMV kernel for all 26 CPU formats reuses quant/dequant.zig. Parity with CPU verified on one RTX 3050 (llama/qwen2/qwen3, f32/Q8_0, multi-slot). Unoptimized and unbenchmarked: no batched prefill, fusion, graphs or Tensor Cores. |
-| `tests-suite` | Test suites | partial | 102, 103, 104, 138 | 24 | 7628 | Zig unit/e2e suites, pytest, bindings runner. Reference tests: gguf package (quant decoders), HF Transformers (logits), llama.cpp (perplexity, tokenizer). No MMLU/code/math/long-context suites; no fuzzing. |
+| `backend-cuda-engine` | CUDA engine backend (Tensor Cores, graphs) | partial | 57, 150 | 2 | 1204 | First engine: whole network on one NVIDIA GPU via the driver API; device code in Zig (nvptx64 PTX built by build.zig, no CUDA toolkit). One generic GEMV kernel for all 26 CPU formats reuses quant/dequant.zig. Parity with CPU verified on one RTX 3050 (llama/qwen2/qwen3, f32/Q8_0, multi-slot). Early performance (synthetic model: prefill 1,190 / decode 360 tok/s vs Vulkan 5,719 / 406): tiled GEMM, split-KV attention; no fusion, graphs or Tensor Cores. |
+| `tests-suite` | Test suites | partial | 102, 103, 104, 138 | 24 | 7711 | Zig unit/e2e suites, pytest, bindings runner. Reference tests: gguf package (quant decoders), HF Transformers (logits), llama.cpp (perplexity, tokenizer). No MMLU/code/math/long-context suites; no fuzzing. |
 | `dev-tools` | Dev tools (generators, probes, HF Space app) | done | 84 | 5 | 996 | Quant fixture/table and Unicode table generators, hk-probe, SPIR-V extraction helper, HF Space demo. |
 
 ### Backends
@@ -480,7 +480,7 @@ flowchart LR
 | id | label | status | plan § | files | LOC | note |
 |:--|:--|:--|:--|--:|--:|:--|
 | `backend-vulkan` | Vulkan backend | partial | 60, 72 | 14 | 3356 | Whole model on one device; one NVIDIA card tested; slower than llama.cpp Vulkan; no coop matrices. |
-| `backend-cuda-standalone` | CUDA (standalone, not in engine) | legacy | 57 | 5 | 2708 | Driver-API wrapper + embedded PTX; only bench and its own tests use it. |
+| `backend-cuda-standalone` | CUDA (standalone, not in engine) | legacy | 57 | 5 | 2794 | Driver-API wrapper + embedded PTX; only bench and its own tests use it. |
 
 ### Planned (no code yet)
 
