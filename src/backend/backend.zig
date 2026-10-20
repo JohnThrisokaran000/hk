@@ -16,6 +16,9 @@ const std = @import("std");
 const kv_mod = @import("../engine/kv.zig");
 const vk_engine = @import("../vk/engine.zig");
 
+pub const caps = @import("caps.zig");
+pub const select = @import("select.zig");
+
 pub const Kind = enum { vulkan };
 
 pub const Error = vk_engine.Error;
