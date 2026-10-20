@@ -43,7 +43,18 @@ Measured on a Ryzen 7 7445HS (6 cores), CPU only, 6 threads, same models. Median
 | Prompt processing | faster on 8 of 10 models (106 to 240 percent), tied on f16, 91 percent on IQ4_XS |
 | Decode speed | slightly behind: 92 to 99 percent, tied on f16 |
 
-So memory is a clear win, prompt processing is mostly ahead, and decode is a few percent behind. I have not closed that gap. The Vulkan GPU backend works but is much slower than llama.cpp's Vulkan backend (roughly 25 to 40 percent on prompts, 65 to 80 percent on decode, one NVIDIA laptop GPU).
+So memory is a clear win, prompt processing is mostly ahead, and decode is a few percent behind. I have not closed that gap.
+
+On the GPU (one RTX 3050 6 GB laptop, 4 real models, hk and llama.cpp loading the same GGUF bytes, 3 interleaved repeats; tables with memory in [benchmarks/results/2026-10-21-four-models.md](benchmarks/results/2026-10-21-four-models.md)):
+
+| | hk CUDA vs llama.cpp CUDA | hk Vulkan vs llama.cpp Vulkan |
+|:---|:---|:---|
+| Prompt processing, Q8_0 | 96 % | 69 % |
+| Prompt processing, Q4_K_M (three models) | 67 to 71 % | 44 to 55 % |
+| Decode, Q8_0 | 91 to 94 % | 83 % |
+| Decode, Q4_K_M (three models) | 88 to 93 % | 59 to 81 % |
+
+Perplexity agrees with llama.cpp and Transformers (Qwen3-0.6B Q8_0 on wikitext-2: 23.64 to 23.68 for hk against 23.67 to 23.68 for llama.cpp and 23.73 for Transformers on the original weights). The numbers are one laptop; read them as "same ballpark, not yet equal".
 
 ## What it does not do yet
 
@@ -51,7 +62,7 @@ I would rather you hear this from me.
 
 - Only Llama, Qwen2 and Qwen3 style dense models run. No Gemma, Phi, Mistral with sliding window, mixture of experts, or vision models.
 - The tokenizer.json importer handles byte-level BPE only, so a safetensors repository with a SentencePiece or Unigram tokenizer is refused with a message. Its GGUF version will work.
-- GPU support is a Vulkan backend (`-ngl`, `HK_GPU=1`) and a first CUDA backend (`--backend cuda`), each running a whole model on one device. Both were tested on one NVIDIA card only. Vulkan is slower than llama.cpp's; CUDA is correct but early: on one synthetic model it generates at about 90 % of Vulkan's speed and processes prompts at about a fifth of it (no fusion, graphs or Tensor Cores yet). There is no Metal, ROCm or TPU backend.
+- GPU support is a CUDA backend (tensor cores on compute capability 8.0 and newer) and a Vulkan backend (cooperative matrices when the driver has them), chosen automatically (`--backend auto|cpu|vulkan|cuda`, `-ngl N` for a number of layers); a model that does not fit in device memory runs its leading layers on the device and the rest on the CPU. Everything was tested on one NVIDIA laptop GPU only. The Vulkan backend is the slower of the two (K-quant models especially); nothing was run on AMD, Intel or Apple GPUs. There is no Metal, ROCm or TPU backend.
 - The CPU kernels are built for each instruction set level (AVX-512 VNNI, AVX2, generic on x86; NEON with and without dot product on ARM) and chosen at startup. The ARM kernels pass the portable tests but have not been run on ARM hardware, and the older x86 levels have not been benchmarked on real older CPUs.
 - Split GGUF files (`-00001-of-00003.gguf`) are not downloaded yet.
 - No grammar or JSON-schema constrained decoding, and no tool-call parsing.
