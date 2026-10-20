@@ -4,9 +4,9 @@ Thank you for your interest in contributing to hk. Kernels, backends, model supp
 
 ---
 
-## 1. Code of Conduct
+## 1. Be kind
 
-We are committed to providing a welcoming, inclusive, and harassment-free environment for everyone. Please be respectful, constructive, and collaborative in all discussions and pull requests.
+hk is a personal project of mine (Harshit Khandelwal). I'd like it to be a friendly place to work: please be respectful and constructive in issues and pull requests. If something goes wrong, or you just want to talk about an idea before you start, email me at `harshitkhandelwal208@gmail.com` or open a Discussion.
 
 ---
 

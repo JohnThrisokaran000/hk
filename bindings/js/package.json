@@ -36,7 +36,7 @@
     "gguf",
     "safetensors"
   ],
-  "author": "HK AI Research Team",
+  "author": "Harshit Khandelwal <harshitkhandelwal208@gmail.com>",
   "license": "Apache-2.0",
   "devDependencies": {
     "typescript": "^5.0.0"

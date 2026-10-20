@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Authorship and contact now name me directly (Harshit Khandelwal, `harshitkhandelwal208@gmail.com`) in `SECURITY.md`, `CONTRIBUTING.md`, the README, `LICENSE`, `CITATION.cff` and the Python, npm, NuGet, crates.io and Maven package metadata, replacing "HK AI Research Team" and the `security@hk-ai.org` address. The package metadata reaches the registries with the next release.
 - The README, wiki home, repository description and package description now present hk as one project that is both a fast runtime and a model format with bigger ambitions (zero-copy mmap, 2:4 sparse storage, Net2Net growth, in-file version history, self-learning loops), with a status for each.
 - Repository root cleaned up for the public repo: `README.md` is rewritten as a landing page (measured 2.0 numbers, including where hk is behind llama.cpp, and the limits); `CONTRIBUTING.md` describes the current source layout; the agent orientation file `CONTEXT.md` moved to `docs/plan/CONTEXT.md`.
 - `graphify-out/` (a generated knowledge graph of the code: `graph.json`, `GRAPH_REPORT.md`, `graph.html`, `manifest.json`) is now part of the repository.

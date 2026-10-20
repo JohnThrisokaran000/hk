@@ -12,6 +12,13 @@
     <description>Java / Android JNI bindings (reader and writer) for the HK neural tensor format.</description>
     <url>https://github.com/harshitkhandelwal208/hk</url>
 
+    <developers>
+        <developer>
+            <name>Harshit Khandelwal</name>
+            <email>harshitkhandelwal208@gmail.com</email>
+        </developer>
+    </developers>
+
     <licenses>
         <license>
             <name>Apache License, Version 2.0</name>

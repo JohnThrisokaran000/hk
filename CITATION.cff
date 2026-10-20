@@ -1,10 +1,12 @@
 cff-version: 1.2.0
-message: "If you use the HK Neural Tensor Framework in your research or production systems, please cite it as below."
+message: "If you use hk in your research or production systems, please cite it as below."
 authors:
-  - name: "HK AI Research Team"
-title: "HK: Next-Generation AI Framework featuring Dual-Mode Quantization, Native SIMD Zig Engine, and Adaptive Architecture Growth"
+  - family-names: "Khandelwal"
+    given-names: "Harshit"
+    email: "harshitkhandelwal208@gmail.com"
+title: "hk: a from-scratch LLM runtime and model format in Zig"
 version: 2.0.0
-date-released: 2026-09-13
+date-released: 2026-10-21
 url: "https://github.com/harshitkhandelwal208/hk"
 repository-code: "https://github.com/harshitkhandelwal208/hk"
 license: "Apache-2.0"

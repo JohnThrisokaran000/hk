@@ -1,6 +1,6 @@
 # Security Policy
 
-The HK team takes the security and integrity of our codebase, binary containers, and parser interfaces seriously.
+hk is my project, and I take the security of its parsers, file formats and server seriously: model files, tokenizers, chat templates and HTTP input are all treated as hostile.
 
 ---
 
@@ -22,14 +22,12 @@ If you discover a security vulnerability in the HK binary format, Zig runtime, C
 
 Instead, please report it through one of the following channels:
 1. **GitHub Private Vulnerability Reporting**: Go to the **Security** tab of the HK repository and click **"Report a vulnerability"**.
-2. **Email**: Send details directly to `security@hk-ai.org` (or the repository maintainers).
+2. **Email**: Send details to me, Harshit Khandelwal, at `harshitkhandelwal208@gmail.com`.
 
 ### What to Include in Your Report
 - A description of the vulnerability and its potential impact.
 - Clear step-by-step reproduction steps or a minimal proof-of-concept (`.hk` or `.gguf` file).
 - The operating system, architecture, and version of HK being run.
 
-### Response Timeline
-- **Initial Acknowledgement**: Within 48 hours.
-- **Triage & Reproduction**: Within 5 business days.
-- **Fix & Advisory**: We will coordinate a release date and credit your contribution in release notes and CVE filings (unless you prefer anonymity).
+### What to expect
+This is a personal project, so I can't promise a support-desk turnaround, but I read every report. I'll acknowledge it, reproduce it, and fix it in the next release (or sooner for something serious). If you want credit in the release notes, tell me how you'd like to be named; if you prefer to stay anonymous, say so.

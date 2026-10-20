@@ -2,6 +2,7 @@
 name = "hknt"
 version = "2.0.0"
 edition = "2021"
+authors = ["Harshit Khandelwal <harshitkhandelwal208@gmail.com>"]
 description = "Safe idiomatic Rust bindings for the HK neural tensor format (reader, writer and kernel helpers)."
 license = "Apache-2.0"
 repository = "https://github.com/harshitkhandelwal208/hk"
