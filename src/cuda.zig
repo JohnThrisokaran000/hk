@@ -1068,8 +1068,12 @@ pub fn deviceGemm(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m
 /// Like `deviceGemm`, on the tensor core kernel (f16 operands, f32 accumulation). Fails where the device has none.
 pub fn deviceGemmTensor(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize, n: usize) !void {
     const kernel = tensorKernel(fmt) orelse return CudaError.KernelNotFound;
+    // The kernel takes halves: convert the f32 activations into scratch first.
+    const half = try deviceAlloc(n * k * 2);
+    defer deviceFree(half);
+    try launchKernel(try deviceKernel("to_half"), @intCast((n * k / 2 + 255) / 256), 256, .{ half.addr, @as(u64, toDevicePtr(x)), @as(u32, @intCast(n * k / 2)) });
     try launchKernel2D(kernel, @intCast((m + tensor_tile_rows - 1) / tensor_tile_rows), @intCast((n + tensor_tile_tokens - 1) / tensor_tile_tokens), tensor_block_threads, .{
-        @as(u64, toDevicePtr(w)), @as(u64, toDevicePtr(x)), @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+        @as(u64, toDevicePtr(w)), half.addr, @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
     });
 }
 

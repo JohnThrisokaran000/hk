@@ -159,7 +159,7 @@ inline fn decodeBlock(comptime t: format.StorageType, src: []const u8, out: *[bl
 /// Rows one thread block of the decode kernel computes: one warp per row.
 const gemv_rows = 4;
 /// Activation elements staged in shared memory per step of the decode kernel.
-const gemv_chunk = 4096;
+const gemv_chunk = 1024;
 /// The staged chunk is padded by one float per 32 so that 32 lanes reading 32 consecutive blocks hit 32 different
 /// banks instead of one.
 var gemv_x: [gemv_chunk + gemv_chunk / 32]f32 addrspace(.shared) = undefined;
@@ -345,7 +345,7 @@ inline fn mma16816(d: *[4]f32, a: [4]u32, b: [2]u32) void {
 /// through the same block decoders as the other kernels), then walks the round in steps of `tc_step`, staging that
 /// slice of the activations as f16 and multiplying with `mma.sync`. Operands are rounded to f16; products accumulate
 /// in f32. Grid x = row tiles, grid y = token tiles.
-inline fn gemmTensor(comptime t: format.StorageType, w: [*]const u8, x: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) void {
+inline fn gemmTensor(comptime t: format.StorageType, w: [*]const u8, x: [*]const f16, y: [*]f32, k: u32, m: u32, n: u32) void {
     const info = comptime blocks.info(t).?;
     const unit = comptime if (info.elems < 32) 32 else info.elems;
     const unit_bytes = comptime unit / info.elems * info.bytes;
@@ -386,24 +386,42 @@ inline fn gemmTensor(comptime t: format.StorageType, w: [*]const u8, x: [*]const
             while (e < unit) : (e += 2) words[e / 2] = packHalves(tmp[e], tmp[e + 1]);
         }
 
+        // Activations of tokens tok0.. for k in k0 + step .. + tc_step (already f16), `tc_vecs` copies of 16 bytes per
+        // thread. They are fetched into registers while the previous step is multiplied, so the global load overlaps
+        // the tensor core work; they are parked in shared memory once everyone has finished reading the old ones.
+        const tc_vecs = tc_tokens * (tc_step / 8) / tc_threads;
+        const stage = struct {
+            inline fn fetch(xp: [*]const f16, tok0_: u32, n_: u32, k_: u32, k0_: u32, step_: u32, len_: u32, out: *[tc_vecs]@Vector(4, u32)) void {
+                inline for (0..tc_vecs) |u| {
+                    const p: u32 = tid() + @as(u32, u) * tc_threads;
+                    const tok_ = tok0_ + p / (tc_step / 8);
+                    const kq_: u32 = (p % (tc_step / 8)) * 8;
+                    out[u] = .{ 0, 0, 0, 0 };
+                    if (tok_ < n_ and step_ + kq_ < len_) {
+                        const src: *align(2) const @Vector(4, u32) = @ptrCast(xp + @as(usize, tok_) * k_ + k0_ + step_ + kq_);
+                        out[u] = src.*;
+                    }
+                }
+            }
+            inline fn park(out: *const [tc_vecs]@Vector(4, u32)) void {
+                inline for (0..tc_vecs) |u| {
+                    const p: u32 = tid() + @as(u32, u) * tc_threads;
+                    const tt_ = p / (tc_step / 8);
+                    const kq_: u32 = (p % (tc_step / 8)) * 8;
+                    const dst: *addrspace(.shared) align(4) @Vector(4, u32) = @ptrCast(wordsOf(&tc_b) + (tt_ * tc_b_ld + kq_) / 2);
+                    dst.* = out[u];
+                }
+            }
+        };
+        var v: [tc_vecs]@Vector(4, u32) = undefined;
+        stage.fetch(x, tok0, n, k, k0, 0, len, &v);
+        stage.park(&v);
+        barSync(); // the decoded weights and the first activations are ready
+
         var step: u32 = 0;
         while (step < len) : (step += tc_step) {
-            // Activations of tokens tok0.. for k in k0 + step .. + 32, as packed halves.
-            var p: u32 = tid();
-            while (p < tc_tokens * (tc_step / 2)) : (p += tc_threads) {
-                const tt = p / (tc_step / 2);
-                const kk = (p % (tc_step / 2)) * 2;
-                const tok = tok0 + tt;
-                var lo: f32 = 0;
-                var hi: f32 = 0;
-                if (tok < n and step + kk < len) {
-                    const base = @as(usize, tok) * k + k0 + step + kk;
-                    lo = x[base];
-                    hi = x[base + 1];
-                }
-                wordsOf(&tc_b)[(tt * tc_b_ld + kk) / 2] = packHalves(lo, hi);
-            }
-            barSync();
+            const more = step + tc_step < len;
+            if (more) stage.fetch(x, tok0, n, k, k0, step + tc_step, len, &v);
 
             comptime var half_k = 0;
             inline while (half_k < tc_step) : (half_k += 16) {
@@ -426,7 +444,9 @@ inline fn gemmTensor(comptime t: format.StorageType, w: [*]const u8, x: [*]const
                     inline for (0..2) |mi| mma16816(&acc[mi][ni], af[mi], bf);
                 }
             }
-            barSync(); // the staged activations are overwritten by the next step, the decoded weights by the next round
+            barSync(); // everyone has read this step's activations
+            if (more) stage.park(&v);
+            barSync();
         }
     }
 
@@ -443,7 +463,7 @@ inline fn gemmTensor(comptime t: format.StorageType, w: [*]const u8, x: [*]const
 
 fn GemmTensorKernel(comptime t: format.StorageType) type {
     return struct {
-        fn run(w: [*]const u8, x: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
+        fn run(w: [*]const u8, x: [*]const f16, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
             gemmTensor(t, w, x, y, k, m, n);
         }
     };
@@ -1005,6 +1025,12 @@ fn attentionCombineKernel(part: [*]const f32, out: [*]f32, head_dim: u32, splits
 }
 
 /// gate[i] = silu(gate[i]) * up[i]
+/// dst[i] = f16(src[i]) for pairs of floats; the matrix kernels on tensor cores take their activations as halves.
+fn toHalfKernel(dst: [*]u32, src: [*]const f32, pairs: u32) callconv(.kernel) void {
+    const i = globalId();
+    if (i < pairs) dst[i] = packHalves(src[2 * i], src[2 * i + 1]);
+}
+
 fn swigluKernel(gate: [*]f32, up: [*]const f32, n: u32) callconv(.kernel) void {
     const i = globalId();
     if (i >= n) return;
@@ -1029,5 +1055,6 @@ comptime {
     @export(&attentionPartKernel, .{ .name = "attention_part" });
     @export(&attentionCombineKernel, .{ .name = "attention_combine" });
     @export(&swigluKernel, .{ .name = "swiglu" });
+    @export(&toHalfKernel, .{ .name = "to_half" });
     @export(&addKernel, .{ .name = "add" });
 }

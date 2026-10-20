@@ -120,6 +120,7 @@ const Kernels = struct {
     attention_tc: ?cuda.Kernel,
     swiglu: cuda.Kernel,
     add: cuda.Kernel,
+    to_half: cuda.Kernel,
 };
 
 /// Bytes the engine needs on the device for `w` with options `o`, with a margin for the driver.
@@ -189,6 +190,8 @@ pub const Engine = struct {
     up: cuda.DeviceMem,
     /// Final hidden state of every item of the last pass, and the residual stream while it runs.
     hidden: cuda.DeviceMem,
+    /// Input of the next tensor core matrix product, as halves.
+    x16: cuda.DeviceMem,
     cos_dev: cuda.DeviceMem,
     sin_dev: cuda.DeviceMem,
     logits_dev: cuda.DeviceMem,
@@ -288,6 +291,7 @@ pub const Engine = struct {
             },
             .swiglu = cuda.deviceKernel("swiglu") catch return error.DeviceFailed,
             .add = cuda.deviceKernel("add") catch return error.DeviceFailed,
+            .to_half = cuda.deviceKernel("to_half") catch return error.DeviceFailed,
         };
         self.gemm = std.EnumArray(StorageType, ?GemmKernels).initFill(null);
 
@@ -333,6 +337,7 @@ pub const Engine = struct {
         self.gate = try made.empty(rows * cfg.ffn_dim * f);
         self.up = try made.empty(rows * cfg.ffn_dim * f);
         self.hidden = try made.empty(rows * cfg.dim * f);
+        self.x16 = try made.empty(rows * @max(cfg.dim, @max(cfg.qDim(), cfg.ffn_dim)) * 2);
         const half = cfg.rope_dim / 2;
         self.cos_dev = try made.empty(o.n_batch * half * f);
         self.sin_dev = try made.empty(o.n_batch * half * f);
@@ -463,7 +468,7 @@ pub const Engine = struct {
             cuda.deviceFree(self.out_norm);
             cuda.deviceFree(self.output.mem);
         }
-        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
+        for ([_]cuda.DeviceMem{ self.xb, self.q, self.kk, self.vv, self.att, self.attn_part, self.tmp, self.gate, self.up, self.hidden, self.x16, self.cos_dev, self.sin_dev, self.logits_dev, self.slot_k_tbl, self.slot_v_tbl, self.item_slot, self.item_pos }) |m| cuda.deviceFree(m);
         for (self.kcache, self.vcache) |kc, vc| {
             cuda.deviceFree(kc);
             cuda.deviceFree(vc);
@@ -522,11 +527,21 @@ pub const Engine = struct {
         if (n >= cuda.tensor_min_tokens) if (kernels.tensor) |tc| {
             const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
             const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
-            return cuda.launchKernel2D(tc, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
+            // The tensor core kernel reads halves: `halve` has put this product's input in `x16`.
+            return cuda.launchKernel2D(tc, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, self.x16.addr, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
         };
         const kern = if (n <= 1) kernels.decode else kernels.tiled;
         const g = cuda.gemmGrid(m.rows, n);
         cuda.launchKernel2D(kern, g[0], g[1], block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
+    }
+
+    /// Converts `count` activations at `x` into `x16` when the coming products run on tensor cores (a pass of at least
+    /// `tensor_min_tokens` tokens on a device that has them); every `mm` of that pass reads `x16`, so call this after
+    /// each producer of a matrix input and before the products that read it.
+    fn halve(self: *Engine, x: u64, count: usize, n: usize) Error!void {
+        if (n < cuda.tensor_min_tokens or !cuda.hasTensorCores()) return;
+        const pairs: u32 = @intCast(count / 2);
+        cuda.launchKernel(self.k.to_half, grid(pairs, elem_threads), elem_threads, .{ self.x16.addr, x, pairs }) catch |e| return mapErr(e);
     }
 
     fn rmsNorm(self: *Engine, out: u64, x: u64, w: u64, rows: usize) Error!void {
@@ -560,6 +575,7 @@ pub const Engine = struct {
 
         for (self.layers, 0..) |l, li| {
             try self.rmsNorm(self.xb.addr, x, l.attn_norm.addr, n);
+            try self.halve(self.xb.addr, n * cfg.dim, n);
             try self.mm(l.wq, self.xb.addr, self.q.addr, n);
             try self.mm(l.wk, self.xb.addr, self.kk.addr, n);
             try self.mm(l.wv, self.xb.addr, self.vv.addr, n);
@@ -586,13 +602,16 @@ pub const Engine = struct {
                 cuda.launchKernel(self.k.attention_combine, @intCast(n * cfg.n_heads), attn_threads, .{ self.attn_part.addr, self.att.addr, hd, splits }) catch |e| return mapErr(e);
             }
 
+            try self.halve(self.att.addr, n * cfg.qDim(), n);
             try self.mm(l.wo, self.att.addr, self.tmp.addr, n);
             try self.addInto(x, self.tmp.addr, n * cfg.dim);
 
             try self.rmsNorm(self.xb.addr, x, l.ffn_norm.addr, n);
+            try self.halve(self.xb.addr, n * cfg.dim, n);
             try self.mm(l.w_gate, self.xb.addr, self.gate.addr, n);
             try self.mm(l.w_up, self.xb.addr, self.up.addr, n);
             cuda.launchKernel(self.k.swiglu, grid(n * cfg.ffn_dim, elem_threads), elem_threads, .{ self.gate.addr, self.up.addr, @as(u32, @intCast(n * cfg.ffn_dim)) }) catch |e| return mapErr(e);
+            try self.halve(self.gate.addr, n * cfg.ffn_dim, n);
             try self.mm(l.w_down, self.gate.addr, self.tmp.addr, n);
             try self.addInto(x, self.tmp.addr, n * cfg.dim);
         }
@@ -663,6 +682,7 @@ pub const Engine = struct {
             try self.rmsNorm(self.xb.at(r * cfg.dim * f), self.hidden.at(idx * cfg.dim * f), self.out_norm.addr, 1);
         }
         // One pass over the output matrix for every requested row.
+        try self.halve(self.xb.addr, indices.len * cfg.dim, indices.len);
         try self.mm(self.output, self.xb.addr, self.logits_dev.addr, indices.len);
         const out = self.logits_h[0 .. indices.len * cfg.vocab];
         const t0 = nowSecs();
