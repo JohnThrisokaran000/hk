@@ -25,7 +25,7 @@ Repo: `github.com/harshitkhandelwal208/hk` · Apache-2.0 · packages: PyPI `hknt
 
 | | |
 |:--|:--|
-| Version | 1.1.1 released (tag `v1.1.1`). Next release is **2.0** (plan §150); no 3.0.0 until the last milestone. **Uncommitted work in tree** — see HANDOFF |
+| Version | **2.0.0** (plan §150, Unified Runtime). Next is 2.1 (hardware acceleration), then 2.2 … 2.7; no 3.0.0 until the last milestone. See HANDOFF for the state of the next milestone |
 | Engine runs | Llama / Mistral (no sliding window) / Qwen2 / Qwen3 dense decoders — **3 architecture families** |
 | Formats | 26 weight storage formats decoded; CPU kernel for every one; Vulkan decodes a subset |
 | CPU perf | prefill 91–240 % of llama.cpp (faster on 8/10 models), decode 92–100 %, private RSS 5–9× lower |

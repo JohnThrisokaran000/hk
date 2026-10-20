@@ -77,7 +77,7 @@ The `.hk` container and the Python package carry a number of research features t
 | What | How |
 |:---|:---|
 | CLI and server | build from source: `zig build -Doptimize=ReleaseFast` (Zig 0.17.0 or newer) |
-| Python package | `pip install hknt` (1.1.1 and later bundle the current native library and CLI; 1.1.0 has the old engine) |
+| Python package | `pip install hknt` (1.1.1 and later bundle the current native library and CLI; 1.1.0 has the old engine; 2.0 adds the CUDA engine, partial offload and the container seal) |
 | Node.js | `npm install hkntf` |
 | C, C++, Rust, Go, C#, Java | bindings in [bindings/](bindings/) over the C header [include/hk.h](include/hk.h) |
 

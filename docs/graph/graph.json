@@ -5,7 +5,7 @@
  "stats": {
   "curated_nodes": 79,
   "curated_edges": 152,
-  "file_nodes": 181,
+  "file_nodes": 184,
   "import_edges": 425,
   "unowned_files": 1,
   "status_counts": {
@@ -1453,7 +1453,15 @@
    "type": "file",
    "label": "shaders/common.glsl",
    "lang": "glsl",
-   "loc": 464,
+   "loc": 507,
+   "owner": "backend-vulkan"
+  },
+  {
+   "id": "file:shaders/common_q.glsl",
+   "type": "file",
+   "label": "shaders/common_q.glsl",
+   "lang": "glsl",
+   "loc": 29,
    "owner": "backend-vulkan"
   },
   {
@@ -1486,6 +1494,22 @@
    "label": "shaders/mmv.comp",
    "lang": "glsl",
    "loc": 75,
+   "owner": "backend-vulkan"
+  },
+  {
+   "id": "file:shaders/mmvq.comp",
+   "type": "file",
+   "label": "shaders/mmvq.comp",
+   "lang": "glsl",
+   "loc": 192,
+   "owner": "backend-vulkan"
+  },
+  {
+   "id": "file:shaders/qact.comp",
+   "type": "file",
+   "label": "shaders/qact.comp",
+   "lang": "glsl",
+   "loc": 37,
    "owner": "backend-vulkan"
   },
   {
@@ -1693,7 +1717,7 @@
    "type": "file",
    "label": "src/cuda.zig",
    "lang": "zig",
-   "loc": 1249,
+   "loc": 1263,
    "owner": "backend-cuda-standalone"
   },
   {
@@ -1701,7 +1725,7 @@
    "type": "file",
    "label": "src/cuda/engine.zig",
    "lang": "zig",
-   "loc": 812,
+   "loc": 817,
    "owner": "backend-cuda-engine"
   },
   {
@@ -1725,7 +1749,7 @@
    "type": "file",
    "label": "src/cuda_device.zig",
    "lang": "zig",
-   "loc": 1841,
+   "loc": 1851,
    "owner": "backend-cuda-engine"
   },
   {
@@ -1797,7 +1821,7 @@
    "type": "file",
    "label": "src/engine/model.zig",
    "lang": "zig",
-   "loc": 336,
+   "loc": 344,
    "owner": "engine"
   },
   {
@@ -2221,7 +2245,7 @@
    "type": "file",
    "label": "src/vk/c.zig",
    "lang": "zig",
-   "loc": 952,
+   "loc": 961,
    "owner": "backend-vulkan"
   },
   {
@@ -2229,7 +2253,7 @@
    "type": "file",
    "label": "src/vk/engine.zig",
    "lang": "zig",
-   "loc": 1109,
+   "loc": 1300,
    "owner": "backend-vulkan"
   },
   {
@@ -2237,7 +2261,7 @@
    "type": "file",
    "label": "src/vk/vk.zig",
    "lang": "zig",
-   "loc": 807,
+   "loc": 831,
    "owner": "backend-vulkan"
   },
   {
@@ -2301,7 +2325,7 @@
    "type": "file",
    "label": "tests/support/http.zig",
    "lang": "zig",
-   "loc": 135,
+   "loc": 141,
    "owner": "tests-suite"
   },
   {
@@ -2317,7 +2341,7 @@
    "type": "file",
    "label": "tests/support/proc.zig",
    "lang": "zig",
-   "loc": 94,
+   "loc": 104,
    "owner": "tests-suite"
   },
   {
@@ -2397,7 +2421,7 @@
    "type": "file",
    "label": "tests/test_gpu.zig",
    "lang": "zig",
-   "loc": 413,
+   "loc": 481,
    "owner": "tests-suite"
   },
   {
@@ -2541,7 +2565,7 @@
    "type": "file",
    "label": "tools/hk_cli.zig",
    "lang": "zig",
-   "loc": 2129,
+   "loc": 2130,
    "owner": "cli"
   },
   {
@@ -2573,7 +2597,7 @@
    "type": "file",
    "label": "tools/hk_probe.zig",
    "lang": "zig",
-   "loc": 398,
+   "loc": 409,
    "owner": "bench-tools"
   },
   {
@@ -3655,6 +3679,11 @@
   },
   {
    "s": "backend-vulkan",
+   "t": "file:shaders/common_q.glsl",
+   "type": "implemented_by"
+  },
+  {
+   "s": "backend-vulkan",
    "t": "file:shaders/embed.comp",
    "type": "implemented_by"
   },
@@ -3671,6 +3700,16 @@
   {
    "s": "backend-vulkan",
    "t": "file:shaders/mmv.comp",
+   "type": "implemented_by"
+  },
+  {
+   "s": "backend-vulkan",
+   "t": "file:shaders/mmvq.comp",
+   "type": "implemented_by"
+  },
+  {
+   "s": "backend-vulkan",
+   "t": "file:shaders/qact.comp",
    "type": "implemented_by"
   },
   {

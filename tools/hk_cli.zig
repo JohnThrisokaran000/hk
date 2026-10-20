@@ -304,7 +304,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\HK CLI v1.2.0
+        \\HK CLI v2.0.0
         \\Usage: hk <command> [arguments]
         \\
         \\Commands:

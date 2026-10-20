@@ -1,6 +1,6 @@
 # HK — Plan vs. Reality (STATUS)
 
-**Measured against:** commit `43cf891` (v1.1.1 + fixes) **plus the uncommitted working tree** as of 2026-10-06.
+**Measured against:** HK **2.0.0** (2026-10-21). Rows not touched by the 2.0 work still describe v1.1.1 + fixes as measured on 2026-10-06.
 **Target:** [MASTER_PLAN.md](MASTER_PLAN.md) (§N below = plan section).
 **Rule for this file:** every row is backed by code or a measurement someone looked at. Where a claim
 was *not* verified, the row says `unverified`. Update a row in the same change that changes its truth.
@@ -228,9 +228,9 @@ Plan items that say "retain the previous optimization" (§9.2, §15, §17, §20)
 
 ## Known doc/code discrepancies to fix (found while building this file)
 
-1. `hk` CLI banner prints **v1.2.0** (`tools/hk_cli.zig` `printUsage`) while `build.zig.zon` and `pyproject.toml` say **1.1.1**.
-2. `SECURITY.md` lists **1.0.x** as the supported version.
+1. ~~`hk` CLI banner version mismatch~~ — fixed in 2.0.0 (banner, `build.zig.zon`, `pyproject.toml` and the bindings all say 2.0.0).
+2. ~~`SECURITY.md` listed 1.0.x~~ — fixed in 2.0.0.
 3. `CONTRIBUTING.md` describes an older layout (`tensor_ops.zig` as "the kernels") and says Python **3.10+** while `pyproject.toml` says `>=3.9`.
 4. `docs/wiki/Architecture-and-Ideology.md` is accurate; the commit message of `623718d` ("97 tok/s" CUDA) is not corroborated by current docs.
 5. `python/hk/models.py` docstring says "137+ distinct model architectures" — it is 79 canonical names (169 aliases), conversion-mapping only.
-6. `build.zig` defaults `-Dcuda` to **on** for non-macOS targets, though CUDA is not on the engine path (it builds `hk-gpu-bench` and `test-cuda` and links `dl`).
+6. ~~`-Dcuda` default-on while CUDA was off the engine path~~ — CUDA is now an engine backend; the default stays on (the device code is embedded PTX, no toolkit needed).

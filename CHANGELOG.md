@@ -9,7 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Work toward HK 2.0 (plan §150). Not released; no version number has been assigned.
+## [2.0.0] - 2026-10-21 - Unified runtime: backend abstraction, CUDA engine with tensor cores, partial offload, container integrity
+
+HK 2.0 (plan §150): every item of the milestone exists and was checked on one machine (Ryzen 7 7445HS, RTX 3050 6 GB laptop, Linux); see `docs/wiki/Compatibility.md` for what was run and what was not, and `benchmarks/results/` for the numbers. Highlights: a `backend.Device` seam with Vulkan and CUDA under it, a CUDA engine whose device code is written in Zig (sm_70/sm_80 PTX from `zig build`, no toolkit needed), int8/f16 tensor cores and CUDA graphs, Vulkan cooperative matrices and integer-dot decode, a memory planner with partial offload and automatic device selection (now the default), the kernel stacks unified on the engine's, a SHA-256 container seal with crash-safe edits, and perplexity that matches llama.cpp and Transformers.
+
+**Upgrading from 1.1.1**
+- Any `.hk` file whose Q4_K tensors were written by the old Python/C-ABI quantizer must be re-quantized (that layout was private and already unusable in the engine). Files made from GGUF files are unaffected.
+- `hk run`, `hk chat` and `hk serve` now use a CUDA or Vulkan device by default when one takes the model (`-ngl 0`, `--backend cpu` or `HK_GPU=0` for the CPU). `-ngl N` now means the first N layers, as in llama.cpp (it used to mean "the whole model" for any N above 0).
+- C ABI version is 2 (`hk_abi_version()`); the product functions report failure as NaN and validate sizes. `hk verify`, `hk metadata set` and `hk rollback` exit non-zero on failure. Python's metadata and appendix mutations need the native library.
+- The container format stays 1.0; files written by 2.0 carry an optional seal that 1.1.1 ignores.
 
 ### Container integrity and crash safety (plan §4, §5)
 - **SHA-256 container seal** (header flag bit 9). Every producer seals: `HKWriter`, the streaming converters, `hk metadata set`, and appendix append/rollback. Older files stay readable and verify as *legacy*; a legacy file is sealed by its first edit.
