@@ -7,16 +7,16 @@
   "curated_edges": 153,
   "file_nodes": 168,
   "import_edges": 375,
-  "unowned_files": 1,
+  "unowned_files": 0,
   "status_counts": {
    "done": 8,
-   "partial": 14,
+   "partial": 15,
    "in-progress": 2,
    "prototype": 8,
    "storage-only": 1,
    "legacy": 2,
    "untested-hw": 0,
-   "not-started": 24
+   "not-started": 23
   }
  },
  "nodes": [
@@ -625,9 +625,9 @@
   },
   {
    "id": "backend-abstraction",
-   "type": "planned",
-   "label": "Backend abstraction (Backend interface)",
-   "status": "not-started",
+   "type": "subsystem",
+   "label": "Backend abstraction (Device seam)",
+   "status": "partial",
    "plan": [
     1,
     131,
@@ -635,8 +635,10 @@
     136,
     137
    ],
-   "paths": [],
-   "note": "Gate for CUDA/Metal/ROCm. engine/model.zig calls the Vulkan engine directly today."
+   "paths": [
+    "src/backend"
+   ],
+   "note": "Stage 1a: tagged-union Device over whole-network executors (Vulkan only today); Model goes through it. CPU is still inline in engine/model.zig; no capability table, selection or memory planner yet."
   },
   {
    "id": "op-capability-table",
@@ -1521,7 +1523,7 @@
    "label": "src/backend/backend.zig",
    "lang": "zig",
    "loc": 82,
-   "owner": null
+   "owner": "backend-abstraction"
   },
   {
    "id": "file:src/buf.zig",
@@ -3936,6 +3938,11 @@
    "type": "implemented_by"
   },
   {
+   "s": "backend-abstraction",
+   "t": "file:src/backend/backend.zig",
+   "type": "implemented_by"
+  },
+  {
    "s": "tests-suite",
    "t": "file:tests/conftest.py",
    "type": "implemented_by"
@@ -5983,6 +5990,16 @@
    "imports": 1
   },
   {
+   "s": "backend-abstraction",
+   "t": "backend-vulkan",
+   "imports": 1
+  },
+  {
+   "s": "backend-abstraction",
+   "t": "kv-cache",
+   "imports": 1
+  },
+  {
    "s": "backend-cuda-standalone",
    "t": "format-core",
    "imports": 1
@@ -6100,6 +6117,11 @@
   {
    "s": "converters",
    "t": "quant-formats",
+   "imports": 1
+  },
+  {
+   "s": "engine",
+   "t": "backend-abstraction",
    "imports": 1
   },
   {
@@ -6353,7 +6375,5 @@
    "imports": 1
   }
  ],
- "unowned_files": [
-  "src/backend/backend.zig"
- ]
+ "unowned_files": []
 }
