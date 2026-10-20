@@ -20,9 +20,12 @@ pub const Result = struct {
 
 /// Path of the hk executable under test. The build installs it before the tests run and passes the path in
 /// `HK_EXE` (Zig 0.17 no longer knows the install prefix while configuring, so it cannot be compiled in).
-/// POSIX only: `getPosix` is not available on Windows, where these tests have not been run.
+/// The environment is copied once into a map that lives for the rest of the process (works on Windows too).
+var exe_env: ?std.process.Environ.Map = null;
+
 pub fn exePath() []const u8 {
-    return std.testing.environ.getPosix("HK_EXE") orelse
+    if (exe_env == null) exe_env = std.testing.environ.createMap(std.heap.page_allocator) catch @panic("out of memory");
+    return exe_env.?.get("HK_EXE") orelse
         @panic("HK_EXE is not set; run these tests through `zig build test-e2e`");
 }
 
