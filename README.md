@@ -2,15 +2,15 @@
 
 # hk
 
-**Run language models locally, in very little memory.**
+**A memory-first LLM runtime and universal model container, with research built in.**
 
-One small Zig program that downloads a model from Hugging Face, converts it to the `.hk` format as the bytes arrive, and runs it on your CPU, your NVIDIA GPU or any Vulkan GPU, in a terminal or behind an OpenAI-compatible server.
+Zero-copy mmap loading, streaming Hugging Face to `.hk` conversion, CPU / CUDA / Vulkan engines and an OpenAI-compatible server, plus 2:4 structured sparsity, Net2Net model growth, in-file version history and self-learning loops for LLMs. Written in Zig.
 
 [![CI](https://github.com/harshitkhandelwal208/hk/actions/workflows/ci.yml/badge.svg)](https://github.com/harshitkhandelwal208/hk/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/harshitkhandelwal208/hk)](https://github.com/harshitkhandelwal208/hk/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
-[Quick start](#quick-start) · [Why hk](#why-hk) · [How fast is it](#how-fast-is-it) · [What it does not do yet](#what-it-does-not-do-yet) · [Install](#install) · [Docs](#docs)
+[Quick start](#quick-start) · [What is inside](#what-is-inside) · [Why hk](#why-hk) · [How fast is it](#how-fast-is-it) · [What it does not do yet](#what-it-does-not-do-yet) · [Install](#install) · [Docs](#docs)
 
 </div>
 
@@ -32,6 +32,25 @@ zig build -Doptimize=ReleaseFast
 The first command downloads the model, converts it while it downloads and keeps only the `.hk` file. hk uses a CUDA or Vulkan GPU on its own when there is one that fits the model, and runs the rest of the layers on the CPU when the model is too big for the card. `-ngl 0` (or `--backend cpu`) forces the CPU.
 
 A GGUF repository works the same way and picks Q4_K_M unless you ask for another quant (`hk pull bartowski/SmolLM2-135M-Instruct-GGUF:Q8_0`). Already have a GGUF file? `hk convert-gguf model.gguf model.hk`.
+
+## What is inside
+
+hk is two things in one repository: a **runtime** that is fast and frugal with memory, and a **container and research toolkit** for the ideas around it. The status column is the honest part.
+
+| | What it is | Status |
+|:---|:---|:---|
+| **Zero-copy mmap loading** | Weights are memory mapped from the `.hk` file and never copied; the KV cache grows in small segments; converter and downloader use bounded buffers | Working, measured: 5 to 9× less private memory than llama.cpp on the CPU |
+| **Streaming Hub → `.hk`** | `hk pull` converts GGUF and safetensors while downloading (resumable, SHA-256 checked) | Working |
+| **CPU, CUDA and Vulkan engines** | Tensor cores and integer dot products, partial offload for models bigger than the card, CUDA kernels written in Zig (no toolkit needed) | Working; tested on one NVIDIA laptop GPU |
+| **OpenAI-compatible server** | Streaming, many conversations at once, shared prompt cache | Working |
+| **26 quantization formats** | f32 down to 1 and 2 bit IQ and ternary types, one definition per block format, checked against llama.cpp | Working |
+| **Sealed, crash-safe container** | SHA-256 seal, journaled in-place metadata edits, verify and repair | Working |
+| **2:4 structured sparsity** | Keeps 2 of every 4 weights; stored in the file and decoded on load | Storage only: no sparse kernels yet, so it does not speed up inference (sparse tensor cores are planned work) |
+| **Net2Net model growth** | Widen a model or grow its vocabulary without losing what it learned (`hk expand`) | Prototype: unit tested, not validated on large models |
+| **In-file version history** | A hash-chained history of changes stored inside the `.hk` file, with rollback | Working for append and rollback; branching and merging are not built |
+| **Self-learning loops for LLMs** | Python toolkit that generates solutions, tests them and trains on what passed | Experimental: building blocks, no result yet that it improves a model |
+
+Each research item has a page in the [wiki](docs/wiki/Home.md) that says what is tested and what is not.
 
 ## Why hk
 
@@ -83,8 +102,6 @@ Tests: `zig build test` (Zig), `zig build test-e2e` (the built CLI, server and d
 ## Docs
 
 Start with [Getting Started](docs/wiki/Getting-Started.md). The [wiki](docs/wiki/Home.md) also covers the [CLI](docs/wiki/CLI-Reference.md), [downloading models](docs/wiki/Downloading-Models.md), [serving](docs/wiki/Inference-and-Serving.md), [hardware and kernels](docs/wiki/Hardware-and-Kernels.md) and the [file format](docs/wiki/Format-Specification.md). Release notes are in the [CHANGELOG](CHANGELOG.md). Contributions are welcome: see [CONTRIBUTING](CONTRIBUTING.md). Security reports: [SECURITY](SECURITY.md).
-
-The `.hk` container and the Python package also carry older research features (growing a model's layers and vocabulary, a version history stored inside the file, 2:4 structured sparsity, a self-training pipeline). They pass their unit tests but have not been validated on large models, so treat them as experimental; each wiki page says what is tested.
 
 The repository also ships a [knowledge graph](graphify-out/GRAPH_REPORT.md) of the code (`graphify-out/`), handy for finding your way around.
 
