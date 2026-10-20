@@ -49,6 +49,10 @@ pub const Options = struct {
 
 /// Threads per block of the reduction kernels (one block per row/head).
 const block_threads: u32 = 128;
+
+/// The matrix kernels of one weight format: matrix-vector for a single token, the tiled kernel for small batches and,
+/// on GPUs of compute capability 8.0 and up, the tensor core kernel for prompts.
+const GemmKernels = struct { decode: cuda.Kernel, tiled: cuda.Kernel, tensor: ?cuda.Kernel };
 /// Threads per block of the elementwise kernels.
 const elem_threads: u32 = 256;
 /// Threads per block of the attention kernel: one per position of a tile (`attn_tile` in the device code).
@@ -102,6 +106,8 @@ const Kernels = struct {
     attention: cuda.Kernel,
     attention_part: cuda.Kernel,
     attention_combine: cuda.Kernel,
+    /// Tensor core prompt attention for this model's head size; null when the device has none or the size is not 64 / 128.
+    attention_tc: ?cuda.Kernel,
     swiglu: cuda.Kernel,
     add: cuda.Kernel,
 };
@@ -143,7 +149,7 @@ pub const Engine = struct {
     mscale: f32,
     k: Kernels,
     /// Matrix kernels per storage type: [0] decode (one token), [1] batch (tiled).
-    gemm: std.EnumArray(StorageType, ?[2]cuda.Kernel),
+    gemm: std.EnumArray(StorageType, ?GemmKernels),
 
     /// Single token activations.
     xb: cuda.DeviceMem,
@@ -180,6 +186,8 @@ pub const Engine = struct {
     n_last: usize = 0,
     /// Largest position of the current pass, which decides how finely attention is split.
     max_pos: u32 = 0,
+    /// The current pass is consecutive positions of one sequence, which is what the tensor core attention takes.
+    one_run: bool = false,
     /// Host seconds spent issuing launches (forward) and waiting for results (logits), summed; for HK_GPU_PROFILE.
     prof_launch_s: f64 = 0,
     prof_wait_s: f64 = 0,
@@ -227,6 +235,7 @@ pub const Engine = struct {
         // `self` starts undefined, so the fields that have declared defaults must be set here too.
         self.n_last = 0;
         self.max_pos = 0;
+        self.one_run = false;
         self.name_len = 0;
         self.prof_launch_s = 0;
         self.prof_wait_s = 0;
@@ -244,10 +253,15 @@ pub const Engine = struct {
             .attention = cuda.deviceKernel("attention") catch return error.DeviceFailed,
             .attention_part = cuda.deviceKernel("attention_part") catch return error.DeviceFailed,
             .attention_combine = cuda.deviceKernel("attention_combine") catch return error.DeviceFailed,
+            .attention_tc = if (!cuda.hasTensorCores()) null else switch (cfg.head_dim) {
+                64 => cuda.deviceKernel("attention_tc_64") catch null,
+                128 => cuda.deviceKernel("attention_tc_128") catch null,
+                else => null,
+            },
             .swiglu = cuda.deviceKernel("swiglu") catch return error.DeviceFailed,
             .add = cuda.deviceKernel("add") catch return error.DeviceFailed,
         };
-        self.gemm = std.EnumArray(StorageType, ?[2]cuda.Kernel).initFill(null);
+        self.gemm = std.EnumArray(StorageType, ?GemmKernels).initFill(null);
 
         // Everything below is released by `deinit`; track what exists so a failure part way frees exactly that.
         var made = Made{ .allocator = allocator };
@@ -393,9 +407,14 @@ pub const Engine = struct {
         if (self.gemm.get(m.t) == null) {
             const one = cuda.gemmKernel(m.t, 1) catch return error.UnsupportedType;
             const many = cuda.gemmKernel(m.t, 2) catch return error.UnsupportedType;
-            self.gemm.set(m.t, .{ one, many });
+            self.gemm.set(m.t, .{ .decode = one, .tiled = many, .tensor = cuda.tensorKernel(m.t) });
         }
         return .{ .mem = try made.bytes(m.data), .t = m.t, .rows = m.rows, .cols = m.cols };
+    }
+
+    /// True when prompt passes of one sequence run the tensor core attention kernel.
+    pub fn promptAttentionIsTensor(self: *const Engine) bool {
+        return self.k.attention_tc != null;
     }
 
     pub fn deinit(self: *Engine) void {
@@ -465,7 +484,12 @@ pub const Engine = struct {
     /// y[token][0..rows] = m * x[token] for `n` tokens.
     fn mm(self: *Engine, m: DevMat, x: u64, y: u64, n: usize) Error!void {
         const kernels = self.gemm.get(m.t).?;
-        const kern = if (n <= 1) kernels[0] else kernels[1];
+        if (n >= cuda.tensor_min_tokens) if (kernels.tensor) |tc| {
+            const gx: u32 = @intCast((m.rows + cuda.tensor_tile_rows - 1) / cuda.tensor_tile_rows);
+            const gy: u32 = @intCast((n + cuda.tensor_tile_tokens - 1) / cuda.tensor_tile_tokens);
+            return cuda.launchKernel2D(tc, gx, gy, cuda.tensor_block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
+        };
+        const kern = if (n <= 1) kernels.decode else kernels.tiled;
         const g = cuda.gemmGrid(m.rows, n);
         cuda.launchKernel2D(kern, g[0], g[1], block_threads, .{ m.mem.addr, x, y, @as(u32, @intCast(m.cols)), @as(u32, @intCast(m.rows)), @as(u32, @intCast(n)) }) catch |e| return mapErr(e);
     }
@@ -518,7 +542,9 @@ pub const Engine = struct {
             const kvd: u32 = @intCast(cfg.kvDim());
             const kv_total: u32 = @intCast(n * cfg.kvDim());
             cuda.launchKernel(self.k.kv_write, grid(kv_total, elem_threads), elem_threads, .{ self.kk.addr, self.vv.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, ctx, hd, kvd, kv_total }) catch |e| return mapErr(e);
-            if (splits == 1) {
+            if (self.k.attention_tc != null and self.one_run and n >= cuda.tensor_min_tokens) {
+                cuda.launchKernel2D(self.k.attention_tc.?, @intCast((n + 63) / 64), n_heads, 128, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.att.addr, ctx, @as(u32, @intCast(n)), n_heads, group, scale }) catch |e| return mapErr(e);
+            } else if (splits == 1) {
                 cuda.launchKernel(self.k.attention, @intCast(n * cfg.n_heads), attn_threads, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.att.addr, ctx, hd, n_heads, group, scale }) catch |e| return mapErr(e);
             } else {
                 cuda.launchKernel(self.k.attention_part, @intCast(n * cfg.n_heads * splits), attn_threads, .{ self.q.addr, self.slot_k_tbl.addr, self.slot_v_tbl.addr, layer_off, self.item_slot.addr, self.item_pos.addr, self.attn_part.addr, ctx, hd, n_heads, group, scale, splits }) catch |e| return mapErr(e);
@@ -562,6 +588,10 @@ pub const Engine = struct {
 
         self.max_pos = 0;
         for (items) |it| self.max_pos = @max(self.max_pos, it.pos);
+        self.one_run = true;
+        for (items, 0..) |it, t| {
+            if (it.kv != items[0].kv or it.pos != items[0].pos + t) self.one_run = false;
+        }
         const t0 = nowSecs();
         if (self.pass_events) |ev| ev[0].record(null) catch |e| return mapErr(e);
         try self.runBatch(n);

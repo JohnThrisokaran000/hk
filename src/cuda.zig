@@ -86,6 +86,7 @@ const DriverApi = struct {
     cuDeviceGetCount: *const fn (count: *c_int) callconv(.c) CuResult,
     cuDeviceGet: *const fn (device: *CuDevice, ordinal: c_int) callconv(.c) CuResult,
     cuDeviceGetName: *const fn (name: [*]u8, len: c_int, dev: CuDevice) callconv(.c) CuResult,
+    cuDeviceGetAttribute: *const fn (value: *c_int, attrib: c_int, dev: CuDevice) callconv(.c) CuResult,
     cuDeviceTotalMem_v2: *const fn (bytes: *usize, dev: CuDevice) callconv(.c) CuResult,
     cuMemGetInfo_v2: *const fn (free: *usize, total: *usize) callconv(.c) CuResult,
     cuCtxCreate_v2: *const fn (pctx: *CuContext, flags: c_uint, dev: CuDevice) callconv(.c) CuResult,
@@ -136,6 +137,8 @@ const PTX_SOURCE: [:0]const u8 = @embedFile("cuda/hk_cuda.ptx");
 
 /// PTX compiled by `build.zig` from `src/cuda_device.zig` (device code written in Zig, nvptx64).
 const DEVICE_PTX: [:0]const u8 = if (enabled) @embedFile("cuda_device_ptx") else "";
+/// The same device code built for sm_80, which adds the tensor core kernels.
+const DEVICE_PTX_SM80: [:0]const u8 = if (enabled) @embedFile("cuda_device_ptx_sm80") else "";
 
 const DriverState = struct {
     lib_handle: ?*anyopaque = null,
@@ -147,6 +150,8 @@ const DriverState = struct {
     module: CuModule = null,
     /// The Zig-built device module (`DEVICE_PTX`). Null when the driver rejected it; `deviceFunction` then reports it.
     dev_module: CuModule = null,
+    /// True when `dev_module` is the sm_80 build, i.e. the `gemm_tc_*` kernels exist.
+    tensor_cores: bool = false,
     /// Kernel handles of the device module, looked up on first use.
     dev_fns: std.StringHashMapUnmanaged(CuFunction) = .empty,
 
@@ -211,6 +216,7 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
         .cuDeviceGetCount = getProc(*const fn (*c_int) callconv(.c) CuResult, handle, "cuDeviceGetCount") orelse return CudaError.DriverNotLoaded,
         .cuDeviceGet = getProc(*const fn (*CuDevice, c_int) callconv(.c) CuResult, handle, "cuDeviceGet") orelse return CudaError.DriverNotLoaded,
         .cuDeviceGetName = getProc(*const fn ([*]u8, c_int, CuDevice) callconv(.c) CuResult, handle, "cuDeviceGetName") orelse return CudaError.DriverNotLoaded,
+        .cuDeviceGetAttribute = getProc(*const fn (*c_int, c_int, CuDevice) callconv(.c) CuResult, handle, "cuDeviceGetAttribute") orelse return CudaError.DriverNotLoaded,
         .cuDeviceTotalMem_v2 = getProc(*const fn (*usize, CuDevice) callconv(.c) CuResult, handle, "cuDeviceTotalMem_v2") orelse return CudaError.DriverNotLoaded,
         .cuMemGetInfo_v2 = getProc(*const fn (*usize, *usize) callconv(.c) CuResult, handle, "cuMemGetInfo_v2") orelse return CudaError.DriverNotLoaded,
         .cuCtxCreate_v2 = getProc(*const fn (*CuContext, c_uint, CuDevice) callconv(.c) CuResult, handle, "cuCtxCreate_v2") orelse return CudaError.DriverNotLoaded,
@@ -263,7 +269,17 @@ fn initFromHandle(handle: *anyopaque) !*DriverState {
     global_state.module = mod;
 
     var dmod: CuModule = null;
-    if (api.cuModuleLoadData(&dmod, DEVICE_PTX.ptr) == 0) global_state.dev_module = dmod;
+    // Compute capability 8.0 and newer get the sm_80 build of the device code (tensor cores); `HK_NO_TENSOR_CORES`
+    // keeps the portable build. If the driver rejects the sm_80 module the portable one is used instead.
+    var cc_major: c_int = 0;
+    _ = api.cuDeviceGetAttribute(&cc_major, 75, dev);
+    if (cc_major >= 8 and std.c.getenv("HK_NO_TENSOR_CORES") == null and api.cuModuleLoadData(&dmod, DEVICE_PTX_SM80.ptr) == 0) {
+        global_state.dev_module = dmod;
+        global_state.tensor_cores = true;
+    } else {
+        dmod = null;
+        if (api.cuModuleLoadData(&dmod, DEVICE_PTX.ptr) == 0) global_state.dev_module = dmod;
+    }
 
     _ = api.cuModuleGetFunction(&global_state.fn_gemv_f32, mod, "gemvF32KernelOpt");
     _ = api.cuModuleGetFunction(&global_state.fn_gemv_q8_0, mod, "gemvQ8_0KernelOpt");
@@ -1004,6 +1020,28 @@ pub fn gemmGrid(m: usize, n: usize) [2]u32 {
     return .{ @intCast((m + gemm_tile_rows - 1) / gemm_tile_rows), @intCast((n + gemm_tile_tokens - 1) / gemm_tile_tokens) };
 }
 
+/// True when this process uses the sm_80 build of the device code and so has the tensor core kernels.
+pub fn hasTensorCores() bool {
+    const s = ensureDriver() catch return false;
+    return s.tensor_cores;
+}
+
+/// Tokens from which the tensor core kernel is used: below this the 128 token tile is mostly padding and the tiled
+/// kernel is as fast.
+pub const tensor_min_tokens: usize = 16;
+/// Output rows and tokens of one block of the tensor core kernel, and its thread count (see `tc_*` in cuda_device.zig).
+pub const tensor_tile_rows: usize = 64;
+pub const tensor_tile_tokens: usize = 128;
+pub const tensor_block_threads: c_uint = 256;
+
+/// The tensor core matrix kernel for `fmt`, or null when the device has none.
+pub fn tensorKernel(fmt: format.StorageType) ?Kernel {
+    if (!hasTensorCores()) return null;
+    var name_buf: [48]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "gemm_tc_{s}", .{@tagName(fmt)}) catch return null;
+    return deviceKernel(name) catch null;
+}
+
 /// The matrix kernel for `fmt` suited to `n` tokens: a single token gets the lean decode (matrix-vector) kernel,
 /// anything larger the tiled kernel that stages activations in shared memory and reuses each decoded weight block.
 pub fn gemmKernel(fmt: format.StorageType, n: usize) !Kernel {
@@ -1022,6 +1060,14 @@ pub fn deviceGemm(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m
     const kernel = try gemmKernel(fmt, n);
     const g = gemmGrid(m, n);
     try launchKernel2D(kernel, g[0], g[1], gemm_block_threads, .{
+        @as(u64, toDevicePtr(w)), @as(u64, toDevicePtr(x)), @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
+    });
+}
+
+/// Like `deviceGemm`, on the tensor core kernel (f16 operands, f32 accumulation). Fails where the device has none.
+pub fn deviceGemmTensor(fmt: format.StorageType, w: anytype, x: anytype, y: anytype, m: usize, k: usize, n: usize) !void {
+    const kernel = tensorKernel(fmt) orelse return CudaError.KernelNotFound;
+    try launchKernel2D(kernel, @intCast((m + tensor_tile_rows - 1) / tensor_tile_rows), @intCast((n + tensor_tile_tokens - 1) / tensor_tile_tokens), tensor_block_threads, .{
         @as(u64, toDevicePtr(w)), @as(u64, toDevicePtr(x)), @as(u64, toDevicePtr(y)), @as(u32, @intCast(k)), @as(u32, @intCast(m)), @as(u32, @intCast(n)),
     });
 }

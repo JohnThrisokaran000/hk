@@ -292,8 +292,9 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
     const M: usize = 21; // one full tile of 16 rows and a partial one
     const K: usize = 512; // a whole number of blocks for 1, 32, 64 and 256 element formats
 
-    // Up to 19 tokens: two full tiles of eight and a partial tile of three, so both tile edges are exercised.
-    const max_tokens: usize = 19;
+    // 19 tokens: two full tiles of eight and a partial tile of three, so both tile edges are exercised. 150 tokens:
+    // one full tile of the tensor core kernel (128) and a partial one.
+    const max_tokens: usize = 150;
     const x = try allocator.alloc(f32, max_tokens * K);
     defer allocator.free(x);
     for (x) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
@@ -311,8 +312,18 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
             defer allocator.free(w);
             try randomBlocks(t, rand, w);
 
-            // One token takes the decode kernel, several the batch kernel; both must match the reference.
-            for ([_]usize{ 1, max_tokens }) |N| {
+            // One token takes the decode kernel, several the batch kernel, and on sm_80 and newer the tensor core kernel
+            // takes a prompt; each must match the reference. The tensor core kernel rounds both operands to f16, so its
+            // bound is looser (2^-10 of the sum of magnitudes at worst).
+            const runs = [_]struct { n: usize, tensor: bool }{
+                .{ .n = 1, .tensor = false },
+                .{ .n = 19, .tensor = false },
+                .{ .n = 19, .tensor = true },
+                .{ .n = max_tokens, .tensor = true },
+            };
+            for (runs) |run| {
+                if (run.tensor and !cuda.hasTensorCores()) continue;
+                const N = run.n;
                 const dec = try allocator.alloc(f32, K);
                 defer allocator.free(dec);
                 const want = try allocator.alloc(f64, N * M);
@@ -336,7 +347,7 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
 
                 const d_w = try cuda.DeviceBuffer.upload(w);
                 defer d_w.free();
-                try cuda.deviceGemm(t, d_w, d_x, d_y, M, K, N);
+                if (run.tensor) try cuda.deviceGemmTensor(t, d_w, d_x, d_y, M, K, N) else try cuda.deviceGemm(t, d_w, d_x, d_y, M, K, N);
                 try cuda.synchronize();
                 const got = try allocator.alloc(f32, N * M);
                 defer allocator.free(got);
@@ -344,7 +355,8 @@ test "device gemm matches the CPU decoders for every format the CPU runs" {
 
                 for (0..N * M) |i| {
                     // f32 accumulation in a different order: error scales with the sum of magnitudes, not the result.
-                    const tol = 1e-4 * scale[i] + 1e-6;
+                    const rel: f64 = if (run.tensor) 1.1e-3 else 1e-4;
+                    const tol = rel * scale[i] + 1e-6;
                     if (@abs(@as(f64, got[i]) - want[i]) > tol) {
                         std.debug.print("format {s} token {d} row {d}: device {d} cpu {d} (tol {d})\n", .{ @tagName(t), i / M, i % M, got[i], want[i], tol });
                         return error.DeviceMismatch;

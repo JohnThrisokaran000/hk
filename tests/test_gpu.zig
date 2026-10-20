@@ -255,10 +255,10 @@ test "the CUDA engine matches the CPU on a long context (split-KV attention)" {
     try checkLongContext(.cuda);
 }
 
-/// Prompt attention has a cooperative matrix kernel for head sizes 64 and 128 (the tiny models elsewhere use 16, which
-/// runs the per-token kernel). The prompt arrives in two chunks, so the second starts at a position that is not a
+/// Prompt attention has a matrix-unit kernel (Vulkan cooperative matrices, CUDA tensor cores) for head sizes 64 and 128
+/// (the tiny models elsewhere use 16, which runs the per-token kernel). The prompt arrives in two chunks, so the second starts at a position that is not a
 /// multiple of the kernel's 16 / 32 / 64 position tiles and attends over a cache the first one wrote.
-fn checkPromptAttention(head_dim: usize) !void {
+fn checkPromptAttention(head_dim: usize, backend: Choice) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -267,19 +267,18 @@ fn checkPromptAttention(head_dim: usize) !void {
     defer gpa.free(h);
     var reader = try hk.HKReader.open(h, gpa);
     defer reader.deinit();
-    var dev = load(h, .on, .vulkan, 1, 512, &reader) catch |e| switch (e) {
+    var dev = load(h, .on, backend, 1, 512, &reader) catch |e| switch (e) {
         error.GpuFailed => return error.SkipZigTest,
         else => return e,
     };
     defer dev.deinit();
     var cpu = try load(h, .off, .cpu, 1, 512, &reader);
     defer cpu.deinit();
-    const vkeng = switch (dev.gpu.?) {
-        .vulkan => |e| e,
-        else => return error.SkipZigTest,
-    };
-    // On a device with cooperative matrices the kernel must really be the one under test.
-    if (std.mem.startsWith(u8, vkeng.matmulPath(), "cooperative")) try std.testing.expect(vkeng.promptAttentionIsCooperative());
+    // On a device with matrix units the kernel must really be the one under test.
+    switch (dev.gpu.?) {
+        .vulkan => |e| if (std.mem.startsWith(u8, e.matmulPath(), "cooperative")) try std.testing.expect(e.promptAttentionIsCooperative()),
+        .cuda => |e| if (hk.cuda.hasTensorCores()) try std.testing.expect(e.promptAttentionIsTensor()),
+    }
 
     var prompt: [190]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 7919) % 200);
@@ -300,9 +299,17 @@ fn checkPromptAttention(head_dim: usize) !void {
 }
 
 test "the Vulkan prompt attention matches the CPU at head size 64" {
-    try checkPromptAttention(64);
+    try checkPromptAttention(64, .vulkan);
 }
 
 test "the Vulkan prompt attention matches the CPU at head size 128" {
-    try checkPromptAttention(128);
+    try checkPromptAttention(128, .vulkan);
+}
+
+test "the CUDA prompt attention matches the CPU at head size 64" {
+    try checkPromptAttention(64, .cuda);
+}
+
+test "the CUDA prompt attention matches the CPU at head size 128" {
+    try checkPromptAttention(128, .cuda);
 }

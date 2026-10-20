@@ -8,6 +8,7 @@
 //! are deliberately simple (one block of threads per output row) and are optimized only after they are right.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const format = @import("format.zig");
 const blocks = @import("quant/blocks.zig");
 const dequant = @import("quant/dequant.zig");
@@ -281,6 +282,427 @@ inline fn gemmTile(comptime t: format.StorageType, w: [*]const u8, x: [*]const f
         barSync(); // the tiles are overwritten by the next step
     }
     if (row0 + r < m and tok0 + tk < n) y[@as(usize, tok0 + tk) * m + row0 + r] = acc;
+}
+
+// -- tensor core matrix product (sm_80 and newer) --------------------------------------------------------------------
+
+/// `mma.sync.m16n8k16` with f16 operands needs sm_80; the sm_70 module has no such kernels and the host falls back to
+/// the tiled kernel above.
+pub const has_tensor_cores = builtin.cpu.arch == .nvptx64 and builtin.cpu.has(.nvptx, .sm_80);
+
+/// Output rows and tokens of one block of the tensor core kernel, and the weights per row decoded to f16 in one round.
+const tc_rows = 64;
+const tc_tokens = 128;
+const tc_round = 256;
+/// Activations staged per step inside a round.
+const tc_step = 32;
+/// Row strides of the staged tiles in halves. 8 extra halves put the eight rows a fragment load touches on distinct
+/// groups of banks.
+const tc_a_ld = tc_round + 8;
+const tc_b_ld = tc_step + 8;
+/// Threads per block: eight warps, a 2 x 4 grid of 32 x 32 sub-tiles.
+pub const tc_threads = 256;
+
+var tc_a: [tc_rows * tc_a_ld]f16 addrspace(.shared) = undefined;
+var tc_b: [tc_tokens * tc_b_ld]f16 addrspace(.shared) = undefined;
+
+/// A shared array of halves as an array of 32-bit words (two halves each).
+inline fn wordsOf(p: anytype) [*]addrspace(.shared) u32 {
+    return @ptrCast(@alignCast(p));
+}
+
+inline fn packHalves(lo: f32, hi: f32) u32 {
+    const a: f16 = @floatCast(lo);
+    const b: f16 = @floatCast(hi);
+    return @as(u32, @as(u16, @bitCast(a))) | (@as(u32, @as(u16, @bitCast(b))) << 16);
+}
+
+/// d += a * b for one 16 x 8 x 16 tile, accumulating in f32. The operands are fragments in the layout PTX defines:
+/// with g = lane / 4 and t = lane % 4, a0..a3 hold A[g][2t..2t+1], A[g+8][2t..], A[g][2t+8..], A[g+8][2t+8..] and b0, b1
+/// hold B[2t..2t+1][g], B[2t+8..2t+9][g] as packed halves; d0..d3 are D[g][2t], D[g][2t+1], D[g+8][2t], D[g+8][2t+1].
+inline fn mma16816(d: *[4]f32, a: [4]u32, b: [2]u32) void {
+    var d0 = d[0];
+    var d1 = d[1];
+    var d2 = d[2];
+    var d3 = d[3];
+    asm volatile ("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%[d0], %[d1], %[d2], %[d3]}, {%[a0], %[a1], %[a2], %[a3]}, {%[b0], %[b1]}, {%[d0], %[d1], %[d2], %[d3]};"
+        : [d0] "+f" (d0),
+          [d1] "+f" (d1),
+          [d2] "+f" (d2),
+          [d3] "+f" (d3),
+        : [a0] "r" (a[0]),
+          [a1] "r" (a[1]),
+          [a2] "r" (a[2]),
+          [a3] "r" (a[3]),
+          [b0] "r" (b[0]),
+          [b1] "r" (b[1]),
+    );
+    d.* = .{ d0, d1, d2, d3 };
+}
+
+/// y[token][row] = dot(W[row, :], x[token, :]) on tensor cores. A block owns `tc_rows` rows and `tc_tokens` tokens.
+/// Per round of `tc_round` weights along k, the block decodes its rows to f16 in shared memory (every format goes
+/// through the same block decoders as the other kernels), then walks the round in steps of `tc_step`, staging that
+/// slice of the activations as f16 and multiplying with `mma.sync`. Operands are rounded to f16; products accumulate
+/// in f32. Grid x = row tiles, grid y = token tiles.
+inline fn gemmTensor(comptime t: format.StorageType, w: [*]const u8, x: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) void {
+    const info = comptime blocks.info(t).?;
+    const unit = comptime if (info.elems < 32) 32 else info.elems;
+    const unit_bytes = comptime unit / info.elems * info.bytes;
+    const units_per_row = comptime tc_round / unit;
+    const row0 = bid() * tc_rows;
+    const tok0 = bidY() * tc_tokens;
+    const row_stride: usize = (@as(usize, k) / info.elems) * info.bytes;
+    const warp = tid() >> 5;
+    const lane = tid() & 31;
+    const g = lane >> 2;
+    const q = lane & 3;
+    const wr = (warp & 1) * 32;
+    const wc = (warp >> 1) * 32;
+
+    var acc: [2][4][4]f32 = undefined;
+    for (&acc) |*a| for (a) |*b| {
+        b.* = .{ 0, 0, 0, 0 };
+    };
+
+    var k0: u32 = 0;
+    while (k0 < k) : (k0 += tc_round) {
+        const len = @min(@as(u32, tc_round), k - k0);
+
+        // Decode this round of weights for all rows of the block.
+        var idx: u32 = tid();
+        while (idx < tc_rows * units_per_row) : (idx += tc_threads) {
+            const rr = idx / units_per_row;
+            const off: u32 = (idx % units_per_row) * unit;
+            var tmp: [unit]f32 = undefined;
+            if (row0 + rr < m and off < len) {
+                const src = w + @as(usize, row0 + rr) * row_stride + (@as(usize, k0 + off) / info.elems) * info.bytes;
+                decodeUnit(t, unit, src[0..unit_bytes], &tmp);
+            } else {
+                for (&tmp) |*v| v.* = 0;
+            }
+            const words = wordsOf(&tc_a) + (rr * tc_a_ld + off) / 2;
+            var e: usize = 0;
+            while (e < unit) : (e += 2) words[e / 2] = packHalves(tmp[e], tmp[e + 1]);
+        }
+
+        var step: u32 = 0;
+        while (step < len) : (step += tc_step) {
+            // Activations of tokens tok0.. for k in k0 + step .. + 32, as packed halves.
+            var p: u32 = tid();
+            while (p < tc_tokens * (tc_step / 2)) : (p += tc_threads) {
+                const tt = p / (tc_step / 2);
+                const kk = (p % (tc_step / 2)) * 2;
+                const tok = tok0 + tt;
+                var lo: f32 = 0;
+                var hi: f32 = 0;
+                if (tok < n and step + kk < len) {
+                    const base = @as(usize, tok) * k + k0 + step + kk;
+                    lo = x[base];
+                    hi = x[base + 1];
+                }
+                wordsOf(&tc_b)[(tt * tc_b_ld + kk) / 2] = packHalves(lo, hi);
+            }
+            barSync();
+
+            comptime var half_k = 0;
+            inline while (half_k < tc_step) : (half_k += 16) {
+                var af: [2][4]u32 = undefined;
+                inline for (0..2) |mi| {
+                    const r = wr + mi * 16 + g;
+                    const kc = step + half_k + q * 2;
+                    af[mi][0] = wordsOf(&tc_a)[(r * tc_a_ld + kc) / 2];
+                    af[mi][1] = wordsOf(&tc_a)[((r + 8) * tc_a_ld + kc) / 2];
+                    af[mi][2] = wordsOf(&tc_a)[(r * tc_a_ld + kc + 8) / 2];
+                    af[mi][3] = wordsOf(&tc_a)[((r + 8) * tc_a_ld + kc + 8) / 2];
+                }
+                inline for (0..4) |ni| {
+                    const c = wc + ni * 8 + g;
+                    const kc = half_k + q * 2;
+                    const bf = [2]u32{
+                        wordsOf(&tc_b)[(c * tc_b_ld + kc) / 2],
+                        wordsOf(&tc_b)[(c * tc_b_ld + kc + 8) / 2],
+                    };
+                    inline for (0..2) |mi| mma16816(&acc[mi][ni], af[mi], bf);
+                }
+            }
+            barSync(); // the staged activations are overwritten by the next step, the decoded weights by the next round
+        }
+    }
+
+    inline for (0..2) |mi| inline for (0..4) |ni| {
+        const r0 = row0 + wr + mi * 16 + g;
+        const c0 = tok0 + wc + ni * 8 + q * 2;
+        inline for (0..4) |i| {
+            const r = r0 + (i / 2) * 8;
+            const c = c0 + (i % 2);
+            if (r < m and c < n) y[@as(usize, c) * m + r] = acc[mi][ni][i];
+        }
+    };
+}
+
+fn GemmTensorKernel(comptime t: format.StorageType) type {
+    return struct {
+        fn run(w: [*]const u8, x: [*]const f32, y: [*]f32, k: u32, m: u32, n: u32) callconv(.kernel) void {
+            gemmTensor(t, w, x, y, k, m, n);
+        }
+    };
+}
+
+comptime {
+    if (has_tensor_cores) {
+        for (gemm_formats) |t| @export(&GemmTensorKernel(t).run, .{ .name = "gemm_tc_" ++ @tagName(t) });
+    }
+}
+
+// -- tensor core prompt attention (sm_80 and newer) ---------------------------------------------------------------------
+
+/// Positions of keys and values staged per step, and threads per block of the attention kernel.
+const fa_positions = 32;
+const fa_threads = 128;
+
+fn pairShuffleMax(v: f32) f32 {
+    var m = v;
+    inline for (.{ 1, 2 }) |off| {
+        const o = asm volatile ("shfl.sync.bfly.b32 %[r], %[v], %[o], 31, 0xffffffff;"
+            : [r] "=f" (-> f32),
+            : [v] "f" (m),
+              [o] "r" (@as(u32, off)),
+        );
+        m = @max(m, o);
+    }
+    return m;
+}
+
+fn quadShuffleSum(v: f32) f32 {
+    var m = v;
+    inline for (.{ 1, 2 }) |off| {
+        const o = asm volatile ("shfl.sync.bfly.b32 %[r], %[v], %[o], 31, 0xffffffff;"
+            : [r] "=f" (-> f32),
+            : [v] "f" (m),
+              [o] "r" (@as(u32, off)),
+        );
+        m += o;
+    }
+    return m;
+}
+
+/// Causal attention for a prompt on tensor cores (flash attention). A block is four warps; a warp owns 16 query rows of
+/// one head, a block 64 consecutive tokens of ONE sequence (the host launches this kernel only for such batches).
+/// Keys and values are staged 32 positions at a time (values transposed, so both operands of the second product are
+/// read as packed pairs). S = Q K^T and O += P V use `mma.sync` on f16 operands with f32 accumulation; the online
+/// softmax works on the accumulator registers directly (a row lives in the four lanes of a quad, so its maximum and
+/// sum are two shuffles) and O is rescaled in registers. Head sizes up to 128. Grid x = 64-token tiles, grid y = heads.
+inline fn flashAttention(
+    comptime hd: u32,
+    q: [*]const f32,
+    kptrs: [*]const u64,
+    vptrs: [*]const u64,
+    layer_off: u64,
+    slots: [*]const u32,
+    poss: [*]const u32,
+    out: [*]f32,
+    ctx: u32,
+    n_tokens: u32,
+    n_heads: u32,
+    group: u32,
+    scale: f32,
+) void {
+    const kld = hd + 8; // halves per staged key row
+    const vld = fa_positions + 8; // halves per staged (transposed) value row
+    const warp = tid() >> 5;
+    const lane = tid() & 31;
+    const g = lane >> 2;
+    const qd = lane & 3;
+    const h = bidY();
+    const t0 = bid() * 64;
+    const kvh = h / group;
+    const slot = slots[t0];
+    const pos0 = poss[t0];
+    const t_end = @min(t0 + 64, n_tokens);
+    const pos_last = poss[t_end - 1];
+    const ck: [*]const f16 = @ptrFromInt(kptrs[slot] + layer_off);
+    const cv: [*]const f16 = @ptrFromInt(vptrs[slot] + layer_off);
+    const kbase = ck + @as(usize, kvh) * ctx * hd;
+    const vbase = cv + @as(usize, kvh) * ctx * hd;
+
+    const ra = t0 + warp * 16 + g; // the two query rows this lane holds results for
+    const rb = ra + 8;
+    const qpos_a: i64 = if (ra < n_tokens) @as(i64, pos0) + (ra - t0) else -1;
+    const qpos_b: i64 = if (rb < n_tokens) @as(i64, pos0) + (rb - t0) else -1;
+    const warp_last: i64 = @as(i64, pos0) + (t0 + warp * 16 + 15 - t0);
+
+    // Queries, scaled, as A fragments for every 16-wide slice of the head.
+    var qf: [hd / 16][4]u32 = undefined;
+    inline for (0..hd / 16) |dk| {
+        const c = dk * 16 + qd * 2;
+        var v: [4][2]f32 = .{ .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } };
+        if (ra < n_tokens) {
+            const base = q + (@as(usize, ra) * n_heads + h) * hd;
+            v[0] = .{ base[c] * scale, base[c + 1] * scale };
+            v[2] = .{ base[c + 8] * scale, base[c + 9] * scale };
+        }
+        if (rb < n_tokens) {
+            const base = q + (@as(usize, rb) * n_heads + h) * hd;
+            v[1] = .{ base[c] * scale, base[c + 1] * scale };
+            v[3] = .{ base[c + 8] * scale, base[c + 9] * scale };
+        }
+        inline for (0..4) |i| qf[dk][i] = packHalves(v[i][0], v[i][1]);
+    }
+
+    var o: [hd / 8][4]f32 = undefined;
+    for (&o) |*a| a.* = .{ 0, 0, 0, 0 };
+    const neg_inf = -std.math.inf(f32);
+    var m_a: f32 = neg_inf;
+    var m_b: f32 = neg_inf;
+    var l_a: f32 = 0;
+    var l_b: f32 = 0;
+
+    var j0: u32 = 0;
+    while (j0 <= pos_last) : (j0 += fa_positions) {
+        barSync();
+        // Stage keys and values of positions j0 .. j0 + 31; zero past the last position of the batch, where the cache
+        // may hold anything (a probability of 0 times a NaN is NaN).
+        var e: u32 = tid();
+        while (e < fa_positions * (hd / 8)) : (e += fa_threads) {
+            const row = e / (hd / 8);
+            const c8 = (e % (hd / 8)) * 8;
+            const j = j0 + row;
+            var kv4: [4]u32 = .{ 0, 0, 0, 0 };
+            var vv4: [4]u32 = .{ 0, 0, 0, 0 };
+            if (j <= pos_last) {
+                const ks: [*]const u32 = @ptrCast(@alignCast(kbase + @as(usize, j) * hd + c8));
+                const vs: [*]const u32 = @ptrCast(@alignCast(vbase + @as(usize, j) * hd + c8));
+                kv4 = .{ ks[0], ks[1], ks[2], ks[3] };
+                vv4 = .{ vs[0], vs[1], vs[2], vs[3] };
+            }
+            const kd = wordsOf(&fa_k) + (row * kld + c8) / 2;
+            inline for (0..4) |i| kd[i] = kv4[i];
+            const vh: [*]addrspace(.shared) u16 = @ptrCast(&fa_vt);
+            inline for (0..4) |i| {
+                vh[(c8 + 2 * i) * vld + row] = @truncate(vv4[i]);
+                vh[(c8 + 2 * i + 1) * vld + row] = @truncate(vv4[i] >> 16);
+            }
+        }
+        barSync();
+        if (@as(i64, j0) > warp_last) continue;
+
+        var sacc: [4][4]f32 = undefined;
+        for (&sacc) |*a| a.* = .{ 0, 0, 0, 0 };
+        inline for (0..hd / 16) |dk| {
+            inline for (0..4) |ni| {
+                const row = ni * 8 + g;
+                const kc = dk * 16 + qd * 2;
+                const bf = [2]u32{ wordsOf(&fa_k)[(row * kld + kc) / 2], wordsOf(&fa_k)[(row * kld + kc + 8) / 2] };
+                mma16816(&sacc[ni], qf[dk], bf);
+            }
+        }
+
+        // Causal mask and online softmax of the two rows this lane holds columns of.
+        var mx_a: f32 = neg_inf;
+        var mx_b: f32 = neg_inf;
+        inline for (0..4) |ni| {
+            inline for (0..2) |c| {
+                const col: i64 = @as(i64, j0) + ni * 8 + qd * 2 + c;
+                if (col > qpos_a) sacc[ni][c] = neg_inf;
+                if (col > qpos_b) sacc[ni][2 + c] = neg_inf;
+                mx_a = @max(mx_a, sacc[ni][c]);
+                mx_b = @max(mx_b, sacc[ni][2 + c]);
+            }
+        }
+        mx_a = pairShuffleMax(mx_a);
+        mx_b = pairShuffleMax(mx_b);
+        const new_a = @max(m_a, mx_a);
+        const new_b = @max(m_b, mx_b);
+        // A row with nothing visible yet keeps m = -inf; its probabilities are 0 and nothing needs rescaling.
+        const corr_a: f32 = if (new_a == neg_inf) 1 else expf(m_a - new_a);
+        const corr_b: f32 = if (new_b == neg_inf) 1 else expf(m_b - new_b);
+        m_a = new_a;
+        m_b = new_b;
+        l_a *= corr_a;
+        l_b *= corr_b;
+        inline for (0..hd / 8) |nt| {
+            o[nt][0] *= corr_a;
+            o[nt][1] *= corr_a;
+            o[nt][2] *= corr_b;
+            o[nt][3] *= corr_b;
+        }
+        inline for (0..4) |ni| {
+            inline for (0..2) |c| {
+                const pa: f32 = if (new_a == neg_inf) 0 else expf(sacc[ni][c] - new_a);
+                const pb: f32 = if (new_b == neg_inf) 0 else expf(sacc[ni][2 + c] - new_b);
+                sacc[ni][c] = pa;
+                sacc[ni][2 + c] = pb;
+                l_a += pa;
+                l_b += pb;
+            }
+        }
+
+        // O += P V: the accumulator layout of two neighbouring 8-column tiles is the A fragment of a 16-wide slice.
+        inline for (0..2) |kc| {
+            const pf = [4]u32{
+                packHalves(sacc[2 * kc][0], sacc[2 * kc][1]),
+                packHalves(sacc[2 * kc][2], sacc[2 * kc][3]),
+                packHalves(sacc[2 * kc + 1][0], sacc[2 * kc + 1][1]),
+                packHalves(sacc[2 * kc + 1][2], sacc[2 * kc + 1][3]),
+            };
+            inline for (0..hd / 8) |nt| {
+                const row = nt * 8 + g;
+                const kcol = kc * 16 + qd * 2;
+                const bf = [2]u32{ wordsOf(&fa_vt)[(row * vld + kcol) / 2], wordsOf(&fa_vt)[(row * vld + kcol + 8) / 2] };
+                mma16816(&o[nt], pf, bf);
+            }
+        }
+    }
+
+    const sum_a = quadShuffleSum(l_a);
+    const sum_b = quadShuffleSum(l_b);
+    const inv_a: f32 = if (sum_a > 0) 1.0 / sum_a else 0;
+    const inv_b: f32 = if (sum_b > 0) 1.0 / sum_b else 0;
+    inline for (0..hd / 8) |nt| {
+        const c = nt * 8 + qd * 2;
+        if (ra < n_tokens) {
+            const dst = out + (@as(usize, ra) * n_heads + h) * hd + c;
+            dst[0] = o[nt][0] * inv_a;
+            dst[1] = o[nt][1] * inv_a;
+        }
+        if (rb < n_tokens) {
+            const dst = out + (@as(usize, rb) * n_heads + h) * hd + c;
+            dst[0] = o[nt][2] * inv_b;
+            dst[1] = o[nt][3] * inv_b;
+        }
+    }
+}
+
+var fa_k: [fa_positions * (128 + 8)]f16 addrspace(.shared) = undefined;
+var fa_vt: [128 * (fa_positions + 8)]f16 addrspace(.shared) = undefined;
+
+fn FlashKernel(comptime hd: u32) type {
+    return struct {
+        fn run(
+            q: [*]const f32,
+            kptrs: [*]const u64,
+            vptrs: [*]const u64,
+            layer_off: u64,
+            slots: [*]const u32,
+            poss: [*]const u32,
+            out: [*]f32,
+            ctx: u32,
+            n_tokens: u32,
+            n_heads: u32,
+            group: u32,
+            scale: f32,
+        ) callconv(.kernel) void {
+            flashAttention(hd, q, kptrs, vptrs, layer_off, slots, poss, out, ctx, n_tokens, n_heads, group, scale);
+        }
+    };
+}
+
+comptime {
+    if (has_tensor_cores) {
+        @export(&FlashKernel(64).run, .{ .name = "attention_tc_64" });
+        @export(&FlashKernel(128).run, .{ .name = "attention_tc_128" });
+    }
 }
 
 /// Storage types the device multiplies, in the order of the CPU's `vecdot.supported`.

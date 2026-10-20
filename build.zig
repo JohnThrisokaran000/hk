@@ -58,6 +58,22 @@ pub fn build(b: *std.Build) void {
             }),
         });
         hk_mod.addAnonymousImport("cuda_device_ptx", .{ .root_source_file = device_obj.getEmittedAsm() });
+        // The same device code for sm_80: it adds the tensor core kernels (`mma.sync.m16n8k16` needs sm_80). The driver
+        // is given this module on GPUs of compute capability 8.0 and up, the sm_70 one elsewhere.
+        const device_target80 = b.resolveTargetQuery(.{
+            .cpu_arch = .nvptx64,
+            .os_tag = .cuda,
+            .cpu_model = .{ .explicit = &std.Target.nvptx.cpu.sm_80 },
+        });
+        const device_obj80 = b.addObject(.{
+            .name = "hk_cuda_device_sm80",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cuda_device.zig"),
+                .target = device_target80,
+                .optimize = .fast,
+            }),
+        });
+        hk_mod.addAnonymousImport("cuda_device_ptx_sm80", .{ .root_source_file = device_obj80.getEmittedAsm() });
     }
 
     // Shared Library (DLL / .so / .dylib) for C ABI bindings (Python ctypes, C#, etc.)
