@@ -10,6 +10,7 @@ What it proves, on the machine it runs on:
   * a feature that does need numpy or torch fails with advice to install the extra, not with a bare traceback.
 It cannot run a wheel built for another platform; the release workflow runs it on a runner of each platform.
 """
+import glob
 import json
 import subprocess
 import sys
@@ -37,7 +38,11 @@ def run(cmd, **kw):
 
 
 def main() -> int:
-    wheel = Path(sys.argv[1]).resolve()
+    # PowerShell does not expand `dist/*.whl`, so the pattern is expanded here.
+    matches = sorted(glob.glob(sys.argv[1]))
+    if len(matches) != 1:
+        return fail(f"expected exactly one wheel matching {sys.argv[1]!r}, found {matches}")
+    wheel = Path(matches[0]).resolve()
     with tempfile.TemporaryDirectory() as tmp:
         env_dir = Path(tmp) / "venv"
         builder = venv.EnvBuilder(with_pip=True)
