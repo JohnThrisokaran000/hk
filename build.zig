@@ -44,10 +44,12 @@ pub fn build(b: *std.Build) void {
 
     addKernelLevels(b, hk_mod, build_opts, target, optimize, kernel_sel);
 
+    // Android's libc (bionic) has dlopen built in, and the GPU runtimes are opened with it. Untested: Zig cannot provide
+    // bionic, so this needs the NDK (`--libc`), which has not been available here.
+    if (target.result.abi.isAndroid()) hk_mod.link_libc = true;
+
     if (cuda_enabled) {
-        if (target.result.os.tag != .windows) {
-            hk_mod.linkSystemLibrary("dl", .{});
-        }
+        if (needsLibDl(target.result)) hk_mod.linkSystemLibrary("dl", .{});
         // Device code is Zig too (src/cuda_device.zig). Zig compiles it to PTX, which the host embeds and the driver
         // JIT-compiles for the installed GPU, so no CUDA toolkit is needed to build HK. sm_70 is the oldest
         // architecture with the warp shuffles the kernels use; newer GPUs JIT it forward.
@@ -84,9 +86,7 @@ pub fn build(b: *std.Build) void {
     }
 
     if (rocm_enabled) {
-        if (target.result.os.tag != .windows) {
-            hk_mod.linkSystemLibrary("dl", .{});
-        }
+        if (needsLibDl(target.result)) hk_mod.linkSystemLibrary("dl", .{});
         // The same device code (src/cuda_device.zig) compiled for AMD: one HSA code object for the generic gfx11 target,
         // which covers RDNA3 (gfx1100 to gfx1103) and RDNA3.5. The wave32 kernels also suit RDNA1/2 and RDNA4, which would
         // each need their own object (gfx10_3_generic, gfx12_generic); none is built or tested yet.
@@ -364,4 +364,9 @@ fn addKernelLevels(
         names.appendSlice(b.allocator, v.name) catch @panic("OOM");
     }
     build_opts.addOption([]const u8, "kernel_levels", names.items);
+}
+
+/// `dlopen` lives in a separate `libdl` on glibc; on Windows there is none, and on Android (bionic) it is part of libc.
+fn needsLibDl(t: std.Target) bool {
+    return t.os.tag != .windows and !t.abi.isAndroid();
 }
